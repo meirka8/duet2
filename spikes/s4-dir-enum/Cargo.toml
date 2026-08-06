@@ -1,0 +1,20 @@
+[package]
+name = "s4-dir-enum"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Phase 0 spike S-4: directory enumeration/stat throughput benchmark (headless, non-UI)."
+
+[[bin]]
+name = "s4-dir-enum"
+path = "src/main.rs"
+
+[dependencies]
+rustix = { version = "1.1", features = ["fs", "thread"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
