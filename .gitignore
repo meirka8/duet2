@@ -1,2 +1,10 @@
 /target
 Cargo.lock
+
+/spikes/s8-packaging/hello-gpui/target/
+/spikes/s8-packaging/*.flatpak
+/spikes/s8-packaging/.flatpak-builder/
+/spikes/s8-packaging/build-dir/
+/spikes/s8-packaging/repo/
+/spikes/s8-packaging/AppDir/
+/spikes/s8-packaging/*.AppImage
