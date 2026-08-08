@@ -9,7 +9,9 @@ name = "s2_clipboard"
 path = "src/main.rs"
 
 [dependencies]
-gpui = "0.2.2"
+smithay-client-toolkit = { version = "0.21.1", features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [profile.release]
 debug = true
