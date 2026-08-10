@@ -33,6 +33,14 @@ repository = "https://github.com/meirka8/duet2"
 [workspace.lints.clippy]
 all = "warn"
 
+[workspace.dependencies]
+# Shared across crates once they need them (§7.5 dependency policy: additions
+# noted in the ADR log; each entry below is anticipated by design.md §7.5/§9.1).
+serde = { version = "1.0", features = ["derive", "rc"] }
+bitflags = "2.6"
+thiserror = "2.0"
+proptest = "1.5"
+
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
 # debug_assert!-based check and is load-bearing for NFR-02, not decorative.

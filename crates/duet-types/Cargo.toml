@@ -12,3 +12,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
