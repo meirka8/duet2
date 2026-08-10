@@ -1,0 +1,32 @@
+// S-7 spike WIT: a deliberately minimal slice of the `content-plugin`
+// interface sketched in documentation/design.md §9.9. Only enough surface
+// to measure host<->guest call overhead and interruption behaviour --
+// not the real duet:plugin package (that lands with T-2.6.1).
+package duet:plugin-spike@0.1.0;
+
+interface content-plugin {
+    record field-def {
+        name: string,
+        kind: string,
+    }
+
+    variant field-value {
+        text(string),
+        integer(s64),
+        none,
+    }
+
+    /// List the columns this plugin can compute.
+    fields: func() -> list<field-def>;
+
+    /// Compute one field for one path. `field` is the index into fields().
+    /// The real interface takes a host-granted handle rather than a path;
+    /// this spike keeps `path` as a plain string because the round-trip
+    /// cost of the call boundary -- not capability plumbing -- is what's
+    /// under test here.
+    value: func(path: string, field: u32) -> result<field-value, string>;
+}
+
+world content-host {
+    export content-plugin;
+}
