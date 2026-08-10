@@ -12,3 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+nucleo-matcher = "0.3.1"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+toml = "1.1.4"
