@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "c2a19e7b-3464-437b-99c2-350abc51bad3",
+    "conversation_id": "agent-session-default",
+    "parent_id": null,
+    "timestamp": "2026-08-10T22:30:05Z",
+    "author": "agent",
+    "user_prompt": "T-2.1.1 (workspace skeleton) + T-2.1.2 (ADR-002 gpui-isolation lint)",
+    "model_name": "agent",
+    "model_cot": "Built the full Cargo workspace matching design.md §8.1's crate layout exactly (12 crates + duet-privileged helper + plugins-sdk), each as an empty-but-buildable skeleton — real trait/type definitions are separate downstream Phase 2 tasks, not this one. Key decisions: MSRV pinned to 1.97 (empirically the toolchain S-1's spike verified gpui 0.2.2 against, not a guess), Cargo.lock committed since duet is a binary app not a library (fixed a pre-existing .gitignore line that would have excluded it), CI as separate fmt/clippy/build+test/MSRV/dep-lint jobs. Wrote scripts/check-gpui-isolation.sh for T-2.1.2 and actually verified it catches a deliberate violation (added gpui to duet-index's Cargo.toml, confirmed the script fails, reverted) rather than trusting it blind, per this project's own testing discipline.",
+    "model_response": "Committed and pushed to feature/phase-2-T-2.1.1, which now serves as this phase's integration branch — subsequent Phase 2 task branches merge from it rather than from main, since main won't get the workspace until the consolidated G2 gate PR (same pattern as Phase 0/1). Next: T-2.2.1 (duet-types) is the next blocking dependency (T-2.2.2 and T-2.5.1 both need it); T-2.4.1 and T-2.6.1 have no dependency on it and can run in parallel.",
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}

@@ -1,0 +1,17 @@
+{
+  "interaction": {
+    "id": "04e0300e-2c39-4a8b-8462-a0462b4898d9",
+    "conversation_id": "agent-session-default",
+    "parent_id": null,
+    "timestamp": "2026-08-10T22:44:23Z",
+    "author": "agent",
+    "user_prompt": "T-2.2.1: define duet-types (VPath, MountId, EntryId, Metadata, Caps, MetaPatch, error taxonomy)",
+    "model_name": "agent",
+    "model_cot": "Delegated to backend-rust subagent on feature/phase-2-T-2.2.1 (off feature/phase-2-T-2.1.1). Key design choice worth remembering: MountId ended up as a self-describing Root{scheme,authority}/Nested{scheme,parent:Arc<VPath>} rather than a bare integer handle, because §9.1's VPath sketch demands Display/FromStr round-tripping without a live mount table to resolve an opaque id against — an opaque MountId would make VPath::to_string()/parse() lossy or require threading a registry through parsing. Also added hand-rolled percent-encoding (pct.rs) so real filenames/hosts containing !, %, :, @ don't collide with the path grammar's own separators when nesting (zip:zip:file://...!/...!/...).",
+    "model_response": "2048 proptest cases per property all pass (round-trip + no-panic-on-garbage-input), including nested-archive paths and reserved-character filenames. clippy -D warnings and fmt clean, 22 tests total. This unblocks T-2.2.2 (FileSystem trait) and T-2.5.1 (panel model), both starting next off this branch.",
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": []
+}
