@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Hello GPUI (Duet S-8 spike)
+Comment=Minimal GPUI window used to spike Flatpak/AppImage packaging
+Exec=hello_gpui
+Icon=org.duet.HelloGpui
+Categories=Utility;
+Terminal=false
