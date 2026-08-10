@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/duet-types",
+    "crates/duet-vfs",
+    "crates/duet-ops",
+    "crates/duet-index",
+    "crates/duet-search",
+    "crates/duet-meta",
+    "crates/duet-commands",
+    "crates/duet-config",
+    "crates/duet-plugin",
+    "crates/duet-platform",
+    "crates/duet-widgets",
+    "crates/duet-ui",
+    "crates/duet",
+    "helpers/duet-privileged",
+    "plugins-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Pinned to the toolchain the Phase 0 spikes (S-1 in particular, which builds
+# gpui 0.2.2 directly) were empirically verified against. Bump only as a
+# deliberate task per design.md ADR-003's compile-and-smoke-gate process, not
+# implicitly by upgrading the local toolchain.
+rust-version = "1.97"
+license = "MIT"
+authors = ["Duet contributors"]
+repository = "https://github.com/meirka8/duet2"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.dev]
+# debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
+# debug_assert!-based check and is load-bearing for NFR-02, not decorative.
+debug-assertions = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

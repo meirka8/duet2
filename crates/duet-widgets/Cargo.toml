@@ -1,0 +1,14 @@
+[package]
+name = "duet-widgets"
+description = "GPUI facade over gpui-component (isolation layer for R-G7). ONLY this crate and duet-ui may depend on gpui/gpui-component -- ADR-002."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
