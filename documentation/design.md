@@ -100,6 +100,11 @@ Also worth an explicit answer, because reviewers will ask: **why not contribute 
 
 Requirement IDs are stable and referenced by every task in `task.md`. Priority: **P0** = 1.0 blocker, **P1** = 1.0 target, **P2** = post-1.0.
 
+**T-1.2.1 review pass (2026-08-11):** every requirement below was walked against the four personas in §3. Substantive review is available in full at `docs/acceptance-sketches.md` alongside each P0 sketch, since "how would we know this works" and "does this actually serve a persona" turned out to be the same exercise in practice — writing a concrete test for a requirement that had no real persona behind it kept surfacing that fact naturally. Two corrections came out of this pass:
+
+- **The NFR table below had no `Pri` column at all** — a direct violation of this task's own AC ("no requirement without a priority"). Added, with each target justified against G-1/G-3 (latency and data-safety as non-negotiable, per §4.1) or explicitly marked lower.
+- No functional requirement was deleted. Everything currently listed traces to at least one of P1–P4 without strain — this is a fairly disciplined draft already (which tracks: §5's competitive analysis, written from real domain knowledge of the prior-art tools, was already doing double duty as the "why does this exist" check T-1.1.1 would otherwise have forced). The one item flagged as under-scoped for its persona rather than over-scoped is NFR-11 (accessibility): keyboard-completeness is load-bearing for P1 *and* P3 and reads more like a P0 than the table's lack of a priority column previously implied — see its new entry below.
+
 ### 6.1 Functional — panels and navigation (FR-NAV)
 
 | ID | Requirement | Pri |
@@ -110,12 +115,13 @@ Requirement IDs are stable and referenced by every task in `task.md`. Priority: 
 | FR-NAV-04 | Column modes: Full (name, ext, size, date, attrs), Brief (multi-column names), Thumbnails, Tree. Per-tab, persisted. | P0/P1 |
 | FR-NAV-05 | Columns are configurable sets (add/remove/reorder/width), including plugin-provided columns; named layouts switchable by keyboard. | P1 |
 | FR-NAV-06 | Sorting by any column, ascending/descending, directories-first policy configurable, natural (version) sort for numeric runs, locale-aware collation. | P0 |
-| FR-NAV-07 | Quick search within a panel: typing letters jumps to matching entry; a modifier-prefixed mode filters the panel instead of jumping. | P0 |
+| FR-NAV-07 | Quick search within a panel: typing letters jumps to matching entry; a modifier-prefixed mode filters the panel instead of jumping. Match algorithm and reset semantics specified in FR-NAV-13. | P0 |
 | FR-NAV-08 | History (back/forward) per tab, and a directory hotlist (bookmarks) with keyboard-invoked overlay. | P0 |
 | FR-NAV-09 | Breadcrumb path bar that is also an editable path input; typing a path with completion navigates. | P1 |
 | FR-NAV-10 | Branch view (flat recursive listing of the current subtree), with and without hidden files. | P1 |
 | FR-NAV-11 | Drive/mount bar listing local block devices, removable media, and active network mounts; mount/unmount/eject actions. | P1 |
 | FR-NAV-12 | Directory tree panel synchronised with the active panel, optional. | P1 |
+| FR-NAV-13 | **Quick-search jump uses fuzzy subsequence matching, not plain prefix matching**, on the visible (post-filter/-sort) entry names. On the first character typed with the panel focused (no modifier held, not captured by a bound command, not while an editable field has focus), Duet enters *search regime*: every subsequent character is appended to a query buffer and re-scores all entries; the cursor jumps to the highest-scoring match, with entries physically nearer the current cursor row breaking ties in favour of the smaller visual jump. Search regime is exited (buffer cleared) by: **Escape**, an idle timeout (default 1200 ms since the last keystroke, configurable in `settings.toml`), the cursor being moved by a non-search command (arrows, PgUp/Dn, Home/End, mouse click), or the panel losing focus. While active, an unmissable but non-blocking indicator is shown (e.g. an inline pill anchored to the panel's footer or near the cursor row) displaying the literal typed query and the match's ordinal position among all matches (e.g. `find: rmr (2/5)`); it disappears the instant regime exits. This is distinct from the modifier-prefixed *filter* mode in FR-NAV-07, which hides non-matching rows rather than moving the cursor — filter mode keeps its own match-count indicator per T-4.3.3's existing AC and is unaffected by this requirement. | P0 |
 
 ### 6.2 Functional — selection (FR-SEL)
 
@@ -204,20 +210,20 @@ Requirement IDs are stable and referenced by every task in `task.md`. Priority: 
 
 ### 6.8 Non-functional (NFR)
 
-| ID | Requirement | Target | Measurement |
-|---|---|---|---|
-| NFR-01 | Cold start to interactive | ≤ 150 ms | `hyperfine` on warm page cache, instrumented "first frame with real listing" marker |
-| NFR-02 | Keystroke-to-pixel latency | p50 ≤ 6 ms, p99 ≤ 12 ms | In-process frame instrumentation; cross-checked with a high-speed camera once |
-| NFR-03 | Directory listing, 100k entries | first paint ≤ 100 ms, fully sorted ≤ 400 ms | Bench harness on tmpfs and ext4 |
-| NFR-04 | Directory listing, 1M entries | usable (scrollable, sortable) ≤ 3 s, no UI stall > 16 ms | Bench harness |
-| NFR-05 | Scroll performance | sustained monitor refresh rate on 1M rows | Frame-time histogram, no frame > 8.3 ms at 120 Hz |
-| NFR-06 | Memory | ≤ 150 MB RSS with two panes × 100k entries and thumbnails off | `/proc/self/status` sampling in bench |
-| NFR-07 | Copy throughput | ≥ 95% of `cp` for large files; ≥ 80% of `cp -a` for 100k small files | Bench against coreutils on the same disk |
-| NFR-08 | Data integrity | zero loss/corruption across the crash-injection suite | §14.4 suite must pass 100% |
-| NFR-09 | Binary size | ≤ 40 MB stripped, ≤ 25 MB for the core without bundled archive codecs | CI check |
-| NFR-10 | Startup dependencies | runs on a minimal Wayland or X11 session with no GTK/Qt/KDE runtime | Container test matrix |
-| NFR-11 | Accessibility | keyboard-complete (no mouse-only actions); screen-reader support is a documented gap with a tracked plan | Manual audit; §17 OQ-4 |
-| NFR-12 | Crash rate | < 0.1% of sessions in beta telemetry (opt-in only) | Optional crash reporter |
+| ID | Requirement | Target | Measurement | Pri |
+|---|---|---|---|---|
+| NFR-01 | Cold start to interactive | ≤ 150 ms | `hyperfine` on warm page cache, instrumented "first frame with real listing" marker | P0 |
+| NFR-02 | Keystroke-to-pixel latency | p50 ≤ 6 ms, p99 ≤ 12 ms | In-process frame instrumentation; cross-checked with a high-speed camera once | P0 |
+| NFR-03 | Directory listing, 100k entries | first paint ≤ 100 ms, fully sorted ≤ 400 ms | Bench harness on tmpfs and ext4 | P0 |
+| NFR-04 | Directory listing, 1M entries | usable (scrollable, sortable) ≤ 3 s, no UI stall > 16 ms | Bench harness | P0 |
+| NFR-05 | Scroll performance | sustained monitor refresh rate on 1M rows | Frame-time histogram, no frame > 8.3 ms at 120 Hz | P0 |
+| NFR-06 | Memory | ≤ 150 MB RSS with two panes × 100k entries and thumbnails off | `/proc/self/status` sampling in bench | P0 |
+| NFR-07 | Copy throughput | ≥ 95% of `cp` for large files; ≥ 80% of `cp -a` for 100k small files | Bench against coreutils on the same disk | P0 |
+| NFR-08 | Data integrity | zero loss/corruption across the crash-injection suite | §14.4 suite must pass 100% | P0 |
+| NFR-09 | Binary size | ≤ 40 MB stripped, ≤ 25 MB for the core without bundled archive codecs | CI check | P1 |
+| NFR-10 | Startup dependencies | runs on a minimal Wayland or X11 session with no GTK/Qt/KDE runtime | Container test matrix | P0 |
+| NFR-11 | Accessibility | **keyboard-complete (no mouse-only actions) is P0** — load-bearing for both P1 (TC refugee, keyboard-first by definition) and P3 (developer, "sub-frame latency... doesn't break flow" implies never reaching for a mouse); screen-reader support is a documented gap with a tracked plan (P2, tracked as R-G4/B-1) | Manual audit; §17 OQ-4 | P0 (keyboard) / P2 (screen-reader) |
+| NFR-12 | Crash rate | < 0.1% of sessions in beta telemetry (opt-in only) | Optional crash reporter | P2 |
 
 ## 7. Technology selection
 
@@ -434,6 +440,7 @@ DirectoryModel {
 - **Sorting.** Locale-aware collation with a natural-numeric mode, precomputed sort keys for the active column so comparisons are integer or byte-slice compares. Stable across refreshes so the cursor doesn't jump.
 - **Watching.** `notify`/inotify with a 50 ms debounce and coalescing; `IN_Q_OVERFLOW` triggers a full rescan; network and FUSE mounts fall back to interval polling with a configurable period. Backends that lack `WATCH` get polling from this layer, not from the backend.
 - **Directory sizes.** Computing a directory's recursive size is an explicit, cancellable background job (Space key, or "calculate all"), with results cached by `(dev, ino, mtime)` and invalidated by watch events.
+- **Quick-search regime (FR-NAV-13).** A small piece of transient state on the tab (query buffer, last-keystroke timestamp, active flag), not part of `DirectoryModel` itself since it's UI-session state, not data. Scoring reuses a fuzzy-subsequence matcher (`nucleo` — the same crate family Zed/GPUI's own fuzzy finder already depends on transitively, so no new dependency weight — or `fuzzy-matcher` as a lighter fallback) run over the current `order` slice's visible names on every keystroke; O(entries) per keystroke is fine at panel scale (even 1M rows is a cheap linear scan for a subsequence matcher, unlike a full sort). The idle-timeout reset is a simple `cx.spawn` timer reset on each keystroke, cancelled on exit-regime.
 
 ### 9.3 `duet-ops` — the operation engine
 
@@ -736,9 +743,280 @@ If this is one person's evenings, cut to **M2 + archives-read-only** and ship th
 | OQ-7 | Native/Wine plugin bridge — worth it, or does it poison the security model? | Post-1.0 | — |
 | OQ-8 | Name and visual identity | G5 | — |
 
-## Appendix A — Full default keymap
+## Appendix A — Default keymap
 
-*(To be completed in T-1.4.2 against Total Commander 11 and Double Commander 1.1 as references. The extract in §9.4 is the committed subset; the appendix must enumerate every binding, its TC provenance, and any deliberate deviation with a rationale — deviations are the thing P1 users will file bugs about, so each one needs a written defence.)*
+**Source and provenance.** This appendix is generated from `docs/keymap-tc.csv` (T-1.4.1), 151 bindings covering Total Commander 11's function-key bar, Ctrl/Alt/Shift F-key variants, navigation, selection, panel management, tabs, view modes and sorting, tools (search/compare/sync/archives), global and menu-equivalent shortcuts, and the viewer/editor/dialog contexts. **Provenance caveat, stated honestly:** T-1.1.1's week of hands-on TC 11 usage under Wine was explicitly skipped for this pass (see the deviation note at the top of Phase 1 in `task.md`) — there was no running TC install to verify against. Every row was built from long-standing, well-documented TC domain knowledge and is tagged `known` (high confidence, well-established), `inferred` (plausible from TC's general design/feature history but not hand-checked), or `uncertain` (genuine doubt about the exact chord or its existence, flagged rather than guessed). Of the 151 rows, **102 are `known`, 27 `inferred`, and 22 `uncertain`.** Every `inferred`/`uncertain` row must be spot-checked against a real TC 11 install before this table is treated as authoritative for implementation — that check is not yet done.
+
+**Adoption policy (per G-2).** `design.md` §4.1 commits: *"Selection model, function-key bar, command line, panel semantics, and default keymap match TC 11 behaviour unless a Linux convention makes that actively wrong."* P1 (§3, "the TC refugee") is the primary persona and treats a wrong default binding as a bug. Applying that policy across all 151 bindings produced **zero cases requiring an actual key remap.** Every apparent conflict resolves one of three ways: (1) the collision dissolves once GPUI's context-predicate system (§9.4) scopes the binding to `panel` vs. `cmdline`/text-field focus, so both TC's file-level meaning and the universal text-editing meaning coexist on the same chord; (2) TC's own binding already happens to match the Linux convention, so there is nothing to resolve; or (3) TC's binding is kept and the resulting friction is documented for the onboarding/help surface rather than fixed by changing the key, because changing it would violate P1's core need. That last category is not a deviation — it's an *adopt-with-eyes-open*, and it's called out below because P1's contract ("a wrong default keybinding is a bug, not a preference") cuts both ways: getting a TC default *right* by keeping something a Linux user finds surprising is exactly as important as getting it wrong would be.
+
+### A.1 The three required conflicts (per `task.md` T-1.4.2's AC)
+
+#### A.1.1 Ctrl+C / Ctrl+V / Ctrl+X
+
+**TC behaviour:** modern TC versions bind `Ctrl+C`/`Ctrl+V` to copying/pasting files via the OS clipboard as a URI list, and `Ctrl+X` to a clipboard "cut" (move-on-paste). Confidence: `inferred` — the general capability is well attested, but the precise semantics (does cut immediately mark the source for deletion, or only on successful paste?) were not confidently recalled.
+
+**Resolution: Adopt, with mandatory context-scoping — no deviation.** The apparent "Linux users expect text clipboard semantics" conflict is a false alarm once the binding is scoped correctly:
+
+- **`panel` context** (file list has focus): `Ctrl+C`/`Ctrl+V`/`Ctrl+X` operate on the *file* clipboard (`clipboard.copy_files` / `clipboard.paste_files` / `clipboard.cut_files`), matching both TC's own behaviour and the identical convention already used by Nautilus, Dolphin, and every other Linux file manager (see the `text/uri-list` clipboard integration already committed in §9.10). There is no conflict here at all — TC and Linux file managers converge on the same idiom.
+- **`cmdline`/text-field context** (command line, rename field, path bar, search box): the same chords perform ordinary text copy/cut/paste (`text.copy`/`text.paste`/`text.cut`), which is what every Linux (and TC) text field does regardless of the app around it.
+
+This requires the keymap engine to dispatch on focus, which §9.4 already designs for (`context = "panel"` vs. predicate terms). No new architecture is needed — this appendix is the reason that context system exists. The alternate clipboard triad (`Ctrl+Ins`/`Shift+Ins`/`Shift+Delete`) is included in the table for the same text-field context, since it is a universal, independent-of-TC Windows/X11 convention worth preserving; note `Shift+Delete` is deliberately *not* ambiguous in practice because `panel` and `cmdline` are mutually exclusive focus states — the permanent-file-delete meaning (§A.3, F8 cluster) never fires while a text field has focus.
+
+#### A.1.2 Ctrl+W
+
+**TC behaviour:** `Ctrl+W` closes the active tab (`tab.close`), per the seed table already committed in §9.4. Confidence: `known`.
+
+**Resolution: Adopt as-is — no conflict, no deviation.** TC itself adopted the by-now-universal browser convention (`Ctrl+T`/`Ctrl+W` for new/close tab) when it added tabs. Linux users' expectation and TC's actual default are the same binding. This is the one case in the required set where there was never a real disagreement to resolve — it's included here only because `task.md` asked for it to be *explicitly* addressed, not left as an unstated assumption.
+
+#### A.1.3 F10
+
+**TC behaviour:** `F10` activates/focuses the main menu bar. Confidence: `known`, but for an unusual reason — this is not TC application code; it is the standard Win32 system accelerator that every classic Windows app inherits for free (the same mechanism `Alt` alone triggers). TC does nothing to override it.
+
+**Resolution: Adopt (bind to `menu.activate`), with a documented caveat rather than a key change.** There is no Linux desktop-environment or window-manager convention that reserves `F10` globally, so G-2's "unless a Linux convention makes that actively wrong" clause does not fire — but two adjacent facts are worth recording so a future contributor doesn't rediscover them the hard way:
+
+1. **Midnight Commander (`mc`)**, which shares TC's Norton Commander lineage and is the base for Duet's alternate `mc.toml` keymap (§9.4), binds `F10` to **Quit**. A user whose muscle memory comes from `mc` rather than TC will hit `F10` expecting to quit and instead get a menu activation. This is exactly why `mc.toml` exists as a separate base keymap rather than a single blended default — `tc.toml` gets TC's `F10`, `mc.toml` gets `mc`'s. No action needed beyond keeping the base-keymap separation real (not just declared).
+2. **GNOME Terminal and several other GTK-based terminal emulators intercept `F10` for their own menu bar activation**, a long-standing, well-documented annoyance independent of any app running inside them. Because Duet ships an embedded terminal (P3 persona, §3), a user who presses `F10` while focus is inside that embedded terminal's own terminal view may see the terminal's menu behaviour rather than Duet's, depending on how the embedded terminal widget claims key events. This is a focus-scoping detail for the terminal integration to get right, not a keymap deviation — flagged here so it lands in test coverage for the terminal feature when it's built, rather than surfacing as a confusing bug report later.
+
+### A.2 A related conflict `task.md` didn't ask for, but should have: Ctrl+A
+
+Not in the required set, but too significant to leave out given P1's "wrong default is a bug" contract, and squarely inside this reviewer's remit (muscle-memory protection). **TC behaviour:** `Ctrl+A` at the panel level opens **Change Attributes** (a chmod-like dialog) — *not* "select all," which is what `Ctrl+A` means almost everywhere else, including inside TC's own text fields. Confidence: `known` — this is the single most-cited "gotcha" keybinding in TC's own user community.
+
+**Resolution: Adopt TC's binding exactly at the panel level — this is the case the whole exercise exists to protect.** A naive Linux-first implementation would "fix" this by binding `Ctrl+A` to select-all, which would be *exactly* the kind of change P1's persona description calls a bug: TC users' fingers expect Change Attributes here, and select-all already has its own TC-native, equally muscle-memorized binding (`Ctrl+Num+`, unconditional select-all, distinct from the mask-prompting `Num+`). The context-scoping from §A.1.1 does the rest of the work: inside any text field, `Ctrl+A` means `text.select_all` exactly as expected, because that's a different context than `panel`. Net effect: zero accidental chmod dialogs from text editing, zero broken muscle memory for P1 in the file list. **Recommendation for a later UX task (not a keymap change):** because the failure mode here is a surprising modal dialog rather than a silent no-op, it's worth a one-time, dismissible first-run tooltip the first time a *new* user (not detected as a TC-experienced one) presses `Ctrl+A` in a panel — cheap to build, meaningfully reduces the "is this broken?" moment for persona P3/P4 users who don't have TC muscle memory to fall back on.
+
+### A.3 Adopted-as-is friction points worth flagging (not required, included for completeness)
+
+Two more TC defaults will surprise anyone whose keyboard reflexes come from GNOME/GTK apps or browsers rather than TC, and both are kept per G-2/P1 with the same reasoning as Ctrl+A:
+
+- **F2 = Refresh, not Rename.** Nearly every other Linux (and Windows Explorer-lineage) file manager binds `F2` to rename. TC put rename on `Shift+F6` instead and gave `F2`/`Ctrl+R` to refresh. Kept as-is: P1's fingers already expect `F2` = refresh; changing it would just move the surprise onto the primary persona instead of removing it.
+- **F5 = Copy, not Refresh.** Browsers and most GTK file managers bind `F5` to refresh. In TC (and therefore Duet), `F5` starts a file **copy** — a much higher-stakes mismatch than Ctrl+A's, since an instinctive `F5` tap here can move real data rather than just pop a harmless dialog. Kept as-is for the same P1 reason. **This is the strongest argument in the whole appendix for the copy/move confirmation dialog needing an unmissable, high-contrast preview of what's about to happen** (file count, total size, source → destination) before any bytes move, rather than a generic "Copy 3 items?" — a design already implied by NFR-11's keyboard-complete dialog contract in §9.5 but worth restating here as the concrete reason it matters for this specific key.
+
+Both are marked `Adopt, friction flagged` in the table below rather than `Adopt` plain, so they stay visible to whoever builds the onboarding flow and the F1 help content in T-11.2.1.
+
+### A.4 Additions beyond TC (net-new bindings; not in `docs/keymap-tc.csv` because they are not TC bindings)
+
+These three are Duet-only additions layered on top of the TC-faithful base, chosen because they occupy chords TC does **not** claim at the panel level (so nothing gets clobbered) and each maps to an extremely well-established, near-universal Linux desktop convention:
+
+| Key | Command | Rationale |
+|---|---|---|
+| `Ctrl+H` | `panel.toggle_hidden` | Universal GTK/Nautilus/Thunar/PCManFM convention for toggling hidden-file visibility. TC's own binding for this is `uncertain` in the source table (best guess `Ctrl+F8`, unverified) — Duet ships `Ctrl+H` as the reliable primary and keeps `Ctrl+F8` as a secondary alias once/if verified, rather than leaving the feature bound only to an unconfirmed chord. |
+| `Ctrl+L` | `cmdline.focus_path` | Universal browser/Nautilus convention for jumping to a location/address bar. TC does not bind bare `Ctrl+L` to anything at the panel level. |
+| `F11` | `window.toggle_fullscreen` | Universal Linux desktop convention for fullscreen toggle. Not bound by TC by default. |
+
+None of these override existing P1 muscle memory, since TC never claimed the chords in the first place — they're pure additions, not deviations, and are listed here rather than in `docs/keymap-tc.csv` because that file is scoped to TC's *own* keymap, not Duet's superset.
+
+### A.5 Implementation note: the numpad dependency
+
+Not a Linux-convention conflict and not scoped by T-1.4.2, but adjacent enough to record: TC's selection model leans heavily on the numeric keypad (`Num+`/`Num-`/`Num*`, `Ctrl+Num+`/`Ctrl+Num-`). Many modern laptops ship without a physical numpad. This is a hardware-ergonomics problem common to every OS TC-alikes run on, not a Linux-specific one, so it doesn't belong in the deviation analysis above — but the config schema (T-1.6.1, `keymap.toml`) should ship documented non-numpad fallback bindings for the selection-by-mask/invert/select-all family, since "the selection keys don't work on my laptop" is a predictable support-burden item otherwise.
+
+### A.6 Full binding table
+
+Every row below is sourced directly from `docs/keymap-tc.csv`; the **Duet decision** column defaults to **Adopt** and only deviates in wording where §A.1–§A.3 above argue for it. No row in this table represents an actual keybinding change from TC's default — see §A.1's summary of why that outcome held across all 151 bindings.
+
+##### A.6.1 File operations
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| F3 | panel | `view.open` | Open the file under the cursor (or selection) in the internal/external viewer (Lister) | known | Adopt | Core TC function-key; F1-F8 bar unchanged since Norton Commander lineage |
+| F4 | panel | `edit.open` | Open the file under the cursor in the configured editor (internal or external) | known | Adopt |  |
+| Shift+F4 | panel | `ops.new_file` | Create a new empty file (prompts for a name) and open it in the editor | known | Adopt | Complement to F7 mkdir |
+| F5 | panel | `ops.copy` | Copy selected files/dirs to the other panel's directory, or to a typed path; opens a copy dialog | known | **Adopt**, friction flagged -> §A.3 |  |
+| Shift+F5 | panel | `ops.copy_same_dir` | Copy selected files into the SAME directory, prompting for a new name (e.g. 'file copy.txt') | known | Adopt |  |
+| F6 | panel | `ops.move_or_rename` | Move (or rename, if target dir unchanged) selected files/dirs via a dialog pre-filled with current name/path | known | Adopt |  |
+| Shift+F6 | panel | `ops.rename_in_place` | Rename the file/dir under cursor in place (no move dialog; target directory fixed to current) | known | Adopt |  |
+| F7 | panel | `ops.mkdir` | Create a new directory; accepts nested path segments to create a tree in one go | known | Adopt |  |
+| F8 | panel | `ops.delete` | Delete selected files/dirs (moves to Recycle Bin if enabled, else prompts for permanent delete) | known | Adopt |  |
+| Delete | panel | `ops.delete` | Same as F8 | known | Adopt |  |
+| Shift+F8 | panel | `ops.delete_permanent` | Delete selected files/dirs permanently, bypassing the Recycle Bin | known | Adopt |  |
+| Shift+Delete | panel | `ops.delete_permanent` | Same as Shift+F8 | known | Adopt |  |
+| F2 | panel | `panel.reread` | Refresh (reread) the active panel's directory listing from disk | known | **Adopt**, friction flagged -> §A.3 |  |
+| Ctrl+R | panel | `panel.reread` | Alternate hotkey for Refresh, same as F2 | known | **Adopt**, friction flagged -> §A.3 |  |
+| Ctrl+A | panel | `ops.change_attributes` | Open the Change Attributes (chmod-like) dialog for the selection -- NOT 'select all' | known | **Adopt**, friction flagged -> §A.3 | Single most-cited keybinding 'gotcha' in TC; see design.md Appendix A deviation discussion |
+| Alt+F5 | panel | `archive.pack` | Pack the selection into a new archive (opens the Pack dialog: format, name, target) | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+F9 | panel | `archive.unpack` | Unpack (extract) the archive under the cursor to a chosen target directory | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+F6 | panel | `archive.test` | Test the integrity of the archive under the cursor | inferred | Adopt | TC groups Pack/Unpack/Test around Alt+F5/F6/F9; the precise F6-vs-F9 split needs hands-on confirmation |
+| Alt+Enter | panel | `file.properties` | Open the OS-native Properties dialog for the selection | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+Shift+Enter | panel | `file.properties_totalcmd` | Open TC's own multi-file properties / occupied-space summary (distinct from the OS dialog on Alt+Enter) | uncertain | Adopt | Recalled but the exact modifier chord is not fully certain; verify by hand |
+| Ctrl+Enter | panel | `cmdline.insert_name` | Insert the name of the file under cursor into the command line | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+Shift+Enter | panel | `cmdline.insert_path` | Insert the full path of the file under cursor into the command line | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+P | panel | `cmdline.insert_current_path` | Insert the active panel's current directory path into the command line | inferred | Adopt |  |
+| Ctrl+Z | global | `ops.undo` | Undo the last undoable file operation (rename, move, mkdir; not overwrite-copy) | inferred | Adopt | TC added Undo in a fairly recent version; exact undoable scope not hand-verified |
+| Enter | panel | `archive.browse_as_dir` | Pressing Enter (or double-click) on a recognised archive opens it as a virtual directory for browsing inside | known | Adopt |  |
+
+##### A.6.2 Navigation
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Tab | panel | `focus.other_panel` | Switch keyboard focus between left and right panel | known | Adopt | Matches design.md section 9.4 seed table |
+| Enter | panel | `nav.open_or_enter` | Open the file under cursor (execute/associated app) or enter the directory under cursor | known | Adopt |  |
+| Backspace | panel | `nav.parent` | Go up to the parent directory | known | Adopt |  |
+| Ctrl+PgUp | panel | `nav.parent` | Go up to the parent directory (same as Backspace) | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+PgDn | panel | `nav.enter_dir` | Enter the directory under the cursor (same as Enter on a directory) | known | Adopt |  |
+| Ctrl+\ | panel | `nav.root` | Jump to the root of the active drive | known | Adopt | Matches design.md section 9.4 seed table; backslash is the literal key |
+| Ctrl+D | panel | `hotlist.open` | Open the Directory Hotlist popup (favourites list with add/organize) | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+Left | panel | `nav.history_back` | Go back in per-panel directory navigation history | inferred | Adopt | Browser-style history nav was added in a later TC version; default binding believed but not hand-verified |
+| Alt+Right | panel | `nav.history_forward` | Go forward in per-panel directory navigation history | inferred | Adopt |  |
+| Alt+F1 | panel | `drive.change_left` | Open a drive-selector popup for the LEFT panel, regardless of which panel is active | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+F2 | panel | `drive.change_right` | Open a drive-selector popup for the RIGHT panel, regardless of which panel is active | known | Adopt | Matches design.md section 9.4 seed table |
+| Up | panel | `nav.cursor_up` | Move cursor up one row | known | Adopt |  |
+| Down | panel | `nav.cursor_down` | Move cursor down one row | known | Adopt |  |
+| Left | panel | `nav.cursor_left_or_collapse` | In tree/brief multi-column view, move cursor left / collapse | inferred | Adopt |  |
+| Right | panel | `nav.cursor_right_or_expand` | In tree/brief multi-column view, move cursor right / expand | inferred | Adopt |  |
+| Home | panel | `nav.cursor_top` | Move cursor to first entry | known | Adopt |  |
+| End | panel | `nav.cursor_bottom` | Move cursor to last entry | known | Adopt |  |
+| PgUp | panel | `nav.page_up` | Move cursor up one page | known | Adopt |  |
+| PgDn | panel | `nav.page_down` | Move cursor down one page | known | Adopt |  |
+| [a-z0-9] | panel | `nav.quick_search` | Typing a printable character while a panel has focus starts incremental quick-search, jumping to/filtering matching filenames | known | Adopt | Direct descendant of Norton Commander's find-as-you-type |
+| Ctrl+S | panel | `nav.quick_search_start` | Explicitly open the Quick Search bar | inferred | Adopt |  |
+| Alt+Shift+P | panel | `nav.quick_filter_toggle` | Toggle Quick Filter mode (narrows the listing to matches, rather than just moving the cursor) | uncertain | Adopt | Existence of quick-filter is solid; the exact default chord is not confidently verified |
+| Ctrl+Home | panel | `nav.cursor_top` | Possible alternate for Home (jump to first entry) | uncertain | Adopt | May be redundant with plain Home; not certain TC binds this separately |
+| Ctrl+End | panel | `nav.cursor_bottom` | Possible alternate for End (jump to last entry) | uncertain | Adopt | May be redundant with plain End; not certain TC binds this separately |
+| Num Enter | panel | `nav.open_or_enter` | Numeric-keypad Enter behaves the same as the main Enter key | known | Adopt |  |
+
+##### A.6.3 Selection
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Ins | panel | `sel.toggle_and_advance` | Toggle selection of the entry under cursor and move cursor to next entry | known | Adopt | Matches design.md section 9.4 seed table |
+| Space | panel | `sel.toggle_and_size` | Toggle selection of entry under cursor; if it's a directory, also computes and shows its size | known | Adopt | Matches design.md section 9.4 seed table |
+| Num + | panel | `sel.by_mask` | Select files matching a wildcard mask (prompts, defaults to *.*) | known | Adopt | Matches design.md section 9.4 seed table; numeric-keypad plus |
+| Num - | panel | `unsel.by_mask` | Deselect files matching a wildcard mask | known | Adopt | Matches design.md section 9.4 seed table |
+| Num * | panel | `sel.invert` | Invert the current selection | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+Num + | panel | `sel.all` | Select all files and directories unconditionally (no mask prompt) | known | Adopt |  |
+| Ctrl+Num - | panel | `unsel.all` | Deselect everything unconditionally | known | Adopt |  |
+| Shift+Up | panel | `sel.extend_up` | Extend range selection upward one row (Explorer-style range select, layered on TC's cursor/selection split per FR-SEL-01) | known | Adopt |  |
+| Shift+Down | panel | `sel.extend_down` | Extend range selection downward one row | known | Adopt |  |
+| Shift+PgUp | panel | `sel.extend_page_up` | Extend range selection up one page | known | Adopt |  |
+| Shift+PgDn | panel | `sel.extend_page_down` | Extend range selection down one page | known | Adopt |  |
+| Shift+Home | panel | `sel.extend_top` | Extend range selection to the first entry | known | Adopt |  |
+| Shift+End | panel | `sel.extend_bottom` | Extend range selection to the last entry | known | Adopt |  |
+| Shift+Num + | panel | `sel.by_same_ext` | Select all files sharing the extension of the entry under cursor | uncertain | Adopt | Recalled loosely from the Mark menu; not confidently distinguished from plain Num+ mask-select |
+
+##### A.6.4 Panel management
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Ctrl+U | panel | `panel.swap` | Swap the contents (paths) of the left and right panel | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+Right | panel | `panel.push_to_other` | Copy the active panel's current directory path to the OTHER (inactive) panel | known | Adopt | Matches design.md section 9.4 seed table's 'Ctrl+<-/->'; directionality needs verification |
+| Ctrl+Left | panel | `panel.pull_from_other` | Copy the OTHER (inactive) panel's current directory path into the active panel | known | Adopt | Mirror of Ctrl+Right; see note above |
+| Ctrl+B | panel | `panel.branch_view` | Toggle Branch View: flatten the current directory and all subdirectories into one listing | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+Q | panel | `panel.quick_view` | Toggle Quick View mode: the inactive panel becomes a live preview of the cursor position in the active panel | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+F10 | panel | `panel.toggle_tree` | Toggle a directory-tree view in place of the file list | uncertain | Adopt | Recalled but exact modifier not confidently verified -- may be Alt+F10 instead |
+
+##### A.6.5 Tabs
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Ctrl+T | panel | `tab.new` | Open a new tab (duplicate of current directory) in the active panel | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+W | panel | `tab.close` | Close the active tab | known | **Adopt**, converges with Linux -> §A.1.2 | Matches design.md section 9.4 seed table; also happens to match the Linux/browser convention -- see Appendix A |
+| Ctrl+Shift+T | panel | `tab.reopen_closed` | Reopen the most recently closed tab | inferred | Adopt | Plausible by analogy with browsers; exact default chord not hand-verified |
+| Ctrl+Tab | panel | `tab.next` | Switch to the next tab in the active panel | known | Adopt |  |
+| Ctrl+Shift+Tab | panel | `tab.prev` | Switch to the previous tab in the active panel | known | Adopt |  |
+| Ctrl+1..Ctrl+9 | panel | `tab.switch_to_n` | Switch directly to tab N | uncertain | Adopt | May actually collide with the Ctrl+1..Ctrl+9 view-mode bindings below in real TC; the two need reconciling by hand |
+
+##### A.6.6 View modes and sorting
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Ctrl+1 | panel | `view.mode_brief` | Switch active panel to Brief view (filenames only, multi-column) | known | Adopt |  |
+| Ctrl+2 | panel | `view.mode_full` | Switch active panel to Full view (name, size, date, attributes columns) | known | Adopt |  |
+| Ctrl+3 | panel | `view.mode_wide` | Switch active panel to Wide view (filenames only, single column, larger) | known | Adopt |  |
+| Ctrl+4..Ctrl+9 | panel | `view.mode_custom_n` | Switch to a user-customisable column view (additional slots) | inferred | Adopt | Existence of customisable view slots is well known; exact key range not hand-verified, may collide with tab-switch-by-number |
+| Ctrl+F3 | panel | `sort.by_name` | Sort the active panel by name | uncertain | Adopt | Sort-by-field hotkeys exist under TC's Show menu but the exact Ctrl+F-number-to-field mapping needs hands-on verification |
+| Ctrl+F4 | panel | `sort.by_ext` | Sort the active panel by extension | uncertain | Adopt | See note on Ctrl+F3 |
+| Ctrl+F5 | panel | `sort.by_date` | Sort the active panel by date/time | uncertain | Adopt | See note on Ctrl+F3 |
+| Ctrl+F6 | panel | `sort.by_size` | Sort the active panel by size | uncertain | Adopt | See note on Ctrl+F3 |
+| Ctrl+F7 | panel | `sort.unsorted` | Disable sorting (directory / unsorted order) | uncertain | Adopt | See note on Ctrl+F3 |
+| Ctrl+F8 | panel | `panel.toggle_hidden` | Toggle display of hidden and system files/directories | uncertain | Adopt | Best-recollection guess; may instead be Show-menu-only with no default accelerator. Duet also adds Ctrl+H as a Linux-convention alias regardless -- see Appendix A |
+| Ctrl+F1 | global | `toolbar.toggle_large_icons` | Toggle the button bar's large-icon display mode | uncertain | Adopt | Loosely recalled; not hand-verified |
+| Ctrl+F2 | global | `toolbar.toggle_small_icons` | Toggle the button bar's small-icon display mode | uncertain | Adopt | Loosely recalled; not hand-verified |
+
+##### A.6.7 Tools (search, compare, sync, archives)
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Alt+F7 | panel | `tool.search` | Open the Find Files dialog (name/content search, feeds results back as a synthetic panel listing) | known | Adopt | Matches design.md section 9.4 seed table |
+| Ctrl+M | panel | `tool.multi_rename` | Open the Multi-Rename Tool for the selection | known | Adopt | Matches design.md section 9.4 seed table |
+| Alt+F8 | panel | `cmdline.history` | Show the command line's recall history as a dropdown | inferred | Adopt |  |
+| (none) | panel | `tool.compare_by_content` | Compare two selected files byte-by-byte (opens a diff/compare view) | known | Adopt | No default keyboard accelerator in stock TC -- toolbar/menu only |
+| (none) | panel | `tool.synchronize_dirs` | Open Synchronize Directories (two-pane diff/sync tool) | known | Adopt | No default keyboard accelerator in stock TC -- toolbar/menu only |
+| (none) | panel | `tool.compare_dirs` | Compare the two panels' directory contents, highlighting files that differ or are missing on one side | known | Adopt | No default keyboard accelerator in stock TC |
+| (none) | panel | `tools.open_terminal` | Open a system command-prompt/terminal window at the active panel's current directory | known | Adopt | No default keyboard accelerator in stock TC; highly relevant to Duet's embedded terminal (P3 persona) |
+| (none) | global | `config.options` | Open the Options/Preferences dialog | known | Adopt | No default keyboard accelerator in stock TC |
+| Ctrl+N | panel | `ftp.new_connection` | Open the 'New FTP/SFTP connection' dialog | uncertain | Adopt | Recalled loosely from the Net menu; default accelerator not confidently verified |
+
+##### A.6.8 Global / menu-equivalent / text-field shortcuts
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| F1 | global | `help.show` | Open context-sensitive help | known | Adopt |  |
+| F10 | global | `menu.activate` | Activate/focus the main menu bar (standard Win32 system accelerator -- same mechanism as pressing Alt; not TC application code) | known | **Adopt**, caveat noted -> §A.1.3 | See design.md Appendix A -- explicit conflict discussion vs Linux terminal-emulator F10 usage and the mc-lineage 'F10=Quit' convention |
+| F9 | panel | `tbd.f9_unverified` | Default TC 11 behaviour for bare F9 could not be confidently recalled -- historically sometimes unused on the function-key bar | uncertain | Adopt | Explicitly flagged gap rather than guessed; needs hands-on verification |
+| Alt+F4 | global | `app.quit` | Quit Total Commander | known | Adopt |  |
+| Alt | global | `menu.activate` | Activate/focus the main menu bar (alternate to F10) | known | Adopt |  |
+| Shift+F10 | global | `menu.context` | Open the context menu for the item under cursor (Windows-standard 'Application key' equivalent, not TC-specific) | known | Adopt |  |
+| Esc | global | `dlg.cancel` | Cancel the current dialog / clear the command line / close an overlay | known | Adopt |  |
+| Enter | global | `dlg.confirm` | Confirm the dialog's default action | known | Adopt |  |
+| Alt+F | global | `menu.open_files_menu` | Open the 'Files' top-level menu (standard Win32 mnemonic underline) | known | Adopt | Not TC-specific; other top-level menu mnemonics follow the same convention but individual letters were not all verified |
+| Ctrl+C | panel | `clipboard.copy_files` | Copy selected files/dirs to the OS clipboard as a file list (paste elsewhere with Ctrl+V, including into other file managers) | inferred | **Adopt**, context-scoped -> §A.1.1 | TC added OS-clipboard file copy/paste in a fairly recent version; exact version/behaviour not hand-verified. One of the three required conflict resolutions -- see design.md Appendix A |
+| Ctrl+V | panel | `clipboard.paste_files` | Paste files from the OS clipboard into the active panel's directory (copy, or move if the source was cut) | inferred | **Adopt**, context-scoped -> §A.1.1 | See Ctrl+C note |
+| Ctrl+X | panel | `clipboard.cut_files` | Mark selected files for a clipboard 'cut' (move-on-paste rather than copy-on-paste) | inferred | **Adopt**, context-scoped -> §A.1.1 | Least certain of the three -- TC's cut/paste-as-move semantics for files were not confidently recalled in full detail |
+| Ctrl+C | cmdline | `text.copy` | Standard text-copy inside the command line / rename field / any editable text control | known | **Adopt**, context-scoped -> §A.1.1 | Ordinary OS text-edit accelerator, not TC-specific |
+| Ctrl+V | cmdline | `text.paste` | Standard text-paste inside the command line / rename field / any editable text control | known | **Adopt**, context-scoped -> §A.1.1 |  |
+| Ctrl+X | cmdline | `text.cut` | Standard text-cut inside the command line / rename field / any editable text control | known | **Adopt**, context-scoped -> §A.1.1 |  |
+| Ctrl+A | cmdline | `text.select_all` | Select all text within an editable text field (path bar, rename field, search box) -- standard OS text-edit accelerator, distinct from the panel-level Ctrl+A (Change Attributes) | known | **Adopt**, context-scoped -> §A.1.1 / A.2 | Directly resolves the Ctrl+A ambiguity via context-scoping -- ties to design.md Appendix A discussion |
+| Up | cmdline | `cmdline.history_prev` | Recall the previous command-line entry from history | known | Adopt |  |
+| Down | cmdline | `cmdline.history_next` | Recall the next command-line entry from history | known | Adopt |  |
+| Esc | cmdline | `cmdline.clear` | Clear the command line text | known | Adopt |  |
+| Ctrl+Ins | cmdline | `text.copy` | Alternate Windows/X11 text-copy accelerator inside an editable text field | known | **Adopt**, context-scoped -> §A.1.1 | Classic alternate clipboard triad (Ctrl+Ins/Shift+Ins/Shift+Del); universal text-edit convention, not TC-specific |
+| Shift+Ins | cmdline | `text.paste` | Alternate text-paste accelerator inside an editable text field | known | **Adopt**, context-scoped -> §A.1.1 |  |
+| Shift+Delete | cmdline | `text.cut` | Alternate text-cut accelerator inside an editable text field -- distinct from the panel-level Shift+Delete (permanent file delete) purely by context | known | **Adopt**, context-scoped -> §A.1.1 | Good illustration of why context-scoping (design.md section 9.4) matters: same chord, different meaning by focus |
+| Home | cmdline | `text.cursor_line_start` | Move text cursor to the start of the command-line text -- distinct from the panel-level Home (cursor to first entry) | known | Adopt |  |
+| End | cmdline | `text.cursor_line_end` | Move text cursor to the end of the command-line text -- distinct from the panel-level End (cursor to last entry) | known | Adopt |  |
+| Ctrl+Left | cmdline | `text.word_left` | Move text cursor one word left -- distinct from the panel-level Ctrl+Left (pull path from other panel) | known | Adopt |  |
+| Ctrl+Right | cmdline | `text.word_right` | Move text cursor one word right -- distinct from the panel-level Ctrl+Right (push path to other panel) | known | Adopt |  |
+| Alt+Down | cmdline | `cmdline.open_history_dropdown` | Open the command line's history as a dropdown (standard Windows combo-box convention) | uncertain | Adopt | Presence of this exact chord in TC's command line not confidently verified |
+
+##### A.6.9 Viewer (Lister) context
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| F3 | viewer | `viewer.close` | Close the internal viewer (Lister) and return focus to the panel | inferred | Adopt | Also plausible that F3 opens the NEXT file for viewing rather than closing; TC's Lister historically overloads F3 -- needs hands-on disambiguation |
+| Esc | viewer | `viewer.close` | Close the internal viewer | known | Adopt |  |
+| Ctrl+F | viewer | `viewer.find` | Find text within the viewed file | known | Adopt | Standard text-viewer convention TC follows |
+| Ctrl+G | viewer | `viewer.goto_offset` | Go to a specific byte offset (hex mode) or line (text mode) | inferred | Adopt |  |
+| Space | viewer | `viewer.page_down` | Scroll one page down (or forward, in binary/hex mode) | known | Adopt |  |
+| Backspace | viewer | `viewer.page_up` | Scroll one page up | inferred | Adopt |  |
+| Ctrl+PgDn | viewer | `viewer.next_file` | Load the next file in the panel into the viewer without closing it | inferred | Adopt | Well-loved TC feature (browse files without leaving the viewer); exact chord recalled with only moderate confidence |
+| Ctrl+PgUp | viewer | `viewer.prev_file` | Load the previous file in the panel into the viewer | inferred | Adopt |  |
+| W | viewer | `viewer.toggle_wrap` | Toggle line wrap in text mode | uncertain | Adopt | Classic Lister behaviour from the DOS era; not confirmed present with this exact key in TC 11's Lister |
+| Ctrl+1 | viewer | `viewer.mode_text` | Switch viewer to Text mode | uncertain | Adopt |  |
+| Ctrl+2 | viewer | `viewer.mode_hex` | Switch viewer to Hex mode | uncertain | Adopt |  |
+| Ctrl+3 | viewer | `viewer.mode_binary` | Switch viewer to Binary/ASCII-table mode | uncertain | Adopt |  |
+
+##### A.6.10 Editor context
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Ctrl+S | editor | `editor.save` | Save the file being edited | known | Adopt | Standard text-editor convention |
+| Ctrl+Z | editor | `editor.undo` | Undo last edit | known | Adopt |  |
+| Ctrl+Y | editor | `editor.redo` | Redo | inferred | Adopt |  |
+| Ctrl+F | editor | `editor.find` | Find text | known | Adopt |  |
+| Ctrl+H | editor | `editor.replace` | Find and replace | inferred | Adopt | Standard convention; TC's internal editor is minimal and may or may not implement this |
+| Ctrl+G | editor | `editor.goto_line` | Go to a specific line number | inferred | Adopt |  |
+| Esc | editor | `editor.close_prompt` | Close the editor (prompts to save if modified) | known | Adopt |  |
+
+##### A.6.11 Dialog context
+
+| Key | Context | TC command | TC behaviour | Confidence | Duet decision | Notes |
+|---|---|---|---|---|---|---|
+| Alt+Y | dialog | `dlg.overwrite_yes` | In the file-exists conflict dialog: overwrite this file | inferred | Adopt |  |
+| Alt+A | dialog | `dlg.overwrite_all` | Overwrite all remaining conflicts without asking again | inferred | Adopt |  |
+| Alt+N | dialog | `dlg.overwrite_no` | Skip this file | inferred | Adopt |  |
+| Esc | dialog | `dlg.overwrite_no` | Skip this file / cancel the conflict prompt | known | Adopt |  |
+| Alt+S | dialog | `dlg.overwrite_skip_all` | Skip all remaining conflicts | inferred | Adopt |  |
+| Alt+R | dialog | `dlg.rename` | Rename the incoming file instead of overwriting | inferred | Adopt |  |
+| Tab | dialog | `dlg.next_field` | Move focus to the next field/button in a dialog | known | Adopt |  |
+| Shift+Tab | dialog | `dlg.prev_field` | Move focus to the previous field/button in a dialog | known | Adopt |  |
 
 ## Appendix B — Glossary
 

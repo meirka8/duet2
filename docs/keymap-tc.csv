@@ -1,0 +1,152 @@
+key_combo,command_name,category,context,description,confidence,notes
+F3,view.open,file_ops,panel,Open the file under the cursor (or selection) in the internal/external viewer (Lister),known,Core TC function-key; F1-F8 bar unchanged since Norton Commander lineage
+F4,edit.open,file_ops,panel,Open the file under the cursor in the configured editor (internal or external),known,
+Shift+F4,ops.new_file,file_ops,panel,Create a new empty file (prompts for a name) and open it in the editor,known,Complement to F7 mkdir
+F5,ops.copy,file_ops,panel,"Copy selected files/dirs to the other panel's directory, or to a typed path; opens a copy dialog",known,
+Shift+F5,ops.copy_same_dir,file_ops,panel,"Copy selected files into the SAME directory, prompting for a new name (e.g. 'file copy.txt')",known,
+F6,ops.move_or_rename,file_ops,panel,"Move (or rename, if target dir unchanged) selected files/dirs via a dialog pre-filled with current name/path",known,
+Shift+F6,ops.rename_in_place,file_ops,panel,Rename the file/dir under cursor in place (no move dialog; target directory fixed to current),known,
+F7,ops.mkdir,file_ops,panel,Create a new directory; accepts nested path segments to create a tree in one go,known,
+F8,ops.delete,file_ops,panel,"Delete selected files/dirs (moves to Recycle Bin if enabled, else prompts for permanent delete)",known,
+Delete,ops.delete,file_ops,panel,Same as F8,known,
+Shift+F8,ops.delete_permanent,file_ops,panel,"Delete selected files/dirs permanently, bypassing the Recycle Bin",known,
+Shift+Delete,ops.delete_permanent,file_ops,panel,Same as Shift+F8,known,
+F2,panel.reread,file_ops,panel,Refresh (reread) the active panel's directory listing from disk,known,
+Ctrl+R,panel.reread,file_ops,panel,"Alternate hotkey for Refresh, same as F2",known,
+Ctrl+A,ops.change_attributes,file_ops,panel,Open the Change Attributes (chmod-like) dialog for the selection -- NOT 'select all',known,Single most-cited keybinding 'gotcha' in TC; see design.md Appendix A deviation discussion
+Alt+F5,archive.pack,file_ops,panel,"Pack the selection into a new archive (opens the Pack dialog: format, name, target)",known,Matches design.md section 9.4 seed table
+Alt+F9,archive.unpack,file_ops,panel,Unpack (extract) the archive under the cursor to a chosen target directory,known,Matches design.md section 9.4 seed table
+Alt+F6,archive.test,file_ops,panel,Test the integrity of the archive under the cursor,inferred,TC groups Pack/Unpack/Test around Alt+F5/F6/F9; the precise F6-vs-F9 split needs hands-on confirmation
+Alt+Enter,file.properties,file_ops,panel,Open the OS-native Properties dialog for the selection,known,Matches design.md section 9.4 seed table
+Alt+Shift+Enter,file.properties_totalcmd,file_ops,panel,Open TC's own multi-file properties / occupied-space summary (distinct from the OS dialog on Alt+Enter),uncertain,Recalled but the exact modifier chord is not fully certain; verify by hand
+Ctrl+Enter,cmdline.insert_name,file_ops,panel,Insert the name of the file under cursor into the command line,known,Matches design.md section 9.4 seed table
+Ctrl+Shift+Enter,cmdline.insert_path,file_ops,panel,Insert the full path of the file under cursor into the command line,known,Matches design.md section 9.4 seed table
+Ctrl+P,cmdline.insert_current_path,file_ops,panel,Insert the active panel's current directory path into the command line,inferred,
+Ctrl+Z,ops.undo,file_ops,global,"Undo the last undoable file operation (rename, move, mkdir; not overwrite-copy)",inferred,TC added Undo in a fairly recent version; exact undoable scope not hand-verified
+Enter,archive.browse_as_dir,file_ops,panel,Pressing Enter (or double-click) on a recognised archive opens it as a virtual directory for browsing inside,known,
+Tab,focus.other_panel,navigation,panel,Switch keyboard focus between left and right panel,known,Matches design.md section 9.4 seed table
+Enter,nav.open_or_enter,navigation,panel,Open the file under cursor (execute/associated app) or enter the directory under cursor,known,
+Backspace,nav.parent,navigation,panel,Go up to the parent directory,known,
+Ctrl+PgUp,nav.parent,navigation,panel,Go up to the parent directory (same as Backspace),known,Matches design.md section 9.4 seed table
+Ctrl+PgDn,nav.enter_dir,navigation,panel,Enter the directory under the cursor (same as Enter on a directory),known,
+Ctrl+\,nav.root,navigation,panel,Jump to the root of the active drive,known,Matches design.md section 9.4 seed table; backslash is the literal key
+Ctrl+D,hotlist.open,navigation,panel,Open the Directory Hotlist popup (favourites list with add/organize),known,Matches design.md section 9.4 seed table
+Alt+Left,nav.history_back,navigation,panel,Go back in per-panel directory navigation history,inferred,Browser-style history nav was added in a later TC version; default binding believed but not hand-verified
+Alt+Right,nav.history_forward,navigation,panel,Go forward in per-panel directory navigation history,inferred,
+Alt+F1,drive.change_left,navigation,panel,"Open a drive-selector popup for the LEFT panel, regardless of which panel is active",known,Matches design.md section 9.4 seed table
+Alt+F2,drive.change_right,navigation,panel,"Open a drive-selector popup for the RIGHT panel, regardless of which panel is active",known,Matches design.md section 9.4 seed table
+Up,nav.cursor_up,navigation,panel,Move cursor up one row,known,
+Down,nav.cursor_down,navigation,panel,Move cursor down one row,known,
+Left,nav.cursor_left_or_collapse,navigation,panel,"In tree/brief multi-column view, move cursor left / collapse",inferred,
+Right,nav.cursor_right_or_expand,navigation,panel,"In tree/brief multi-column view, move cursor right / expand",inferred,
+Home,nav.cursor_top,navigation,panel,Move cursor to first entry,known,
+End,nav.cursor_bottom,navigation,panel,Move cursor to last entry,known,
+PgUp,nav.page_up,navigation,panel,Move cursor up one page,known,
+PgDn,nav.page_down,navigation,panel,Move cursor down one page,known,
+[a-z0-9],nav.quick_search,navigation,panel,"Typing a printable character while a panel has focus starts incremental quick-search, jumping to/filtering matching filenames",known,Direct descendant of Norton Commander's find-as-you-type
+Ctrl+S,nav.quick_search_start,navigation,panel,Explicitly open the Quick Search bar,inferred,
+Alt+Shift+P,nav.quick_filter_toggle,navigation,panel,"Toggle Quick Filter mode (narrows the listing to matches, rather than just moving the cursor)",uncertain,Existence of quick-filter is solid; the exact default chord is not confidently verified
+Ins,sel.toggle_and_advance,selection,panel,Toggle selection of the entry under cursor and move cursor to next entry,known,Matches design.md section 9.4 seed table
+Space,sel.toggle_and_size,selection,panel,"Toggle selection of entry under cursor; if it's a directory, also computes and shows its size",known,Matches design.md section 9.4 seed table
+Num +,sel.by_mask,selection,panel,"Select files matching a wildcard mask (prompts, defaults to *.*)",known,Matches design.md section 9.4 seed table; numeric-keypad plus
+Num -,unsel.by_mask,selection,panel,Deselect files matching a wildcard mask,known,Matches design.md section 9.4 seed table
+Num *,sel.invert,selection,panel,Invert the current selection,known,Matches design.md section 9.4 seed table
+Ctrl+Num +,sel.all,selection,panel,Select all files and directories unconditionally (no mask prompt),known,
+Ctrl+Num -,unsel.all,selection,panel,Deselect everything unconditionally,known,
+Shift+Up,sel.extend_up,selection,panel,"Extend range selection upward one row (Explorer-style range select, layered on TC's cursor/selection split per FR-SEL-01)",known,
+Shift+Down,sel.extend_down,selection,panel,Extend range selection downward one row,known,
+Shift+PgUp,sel.extend_page_up,selection,panel,Extend range selection up one page,known,
+Shift+PgDn,sel.extend_page_down,selection,panel,Extend range selection down one page,known,
+Shift+Home,sel.extend_top,selection,panel,Extend range selection to the first entry,known,
+Shift+End,sel.extend_bottom,selection,panel,Extend range selection to the last entry,known,
+Ctrl+U,panel.swap,panel_mgmt,panel,Swap the contents (paths) of the left and right panel,known,Matches design.md section 9.4 seed table
+Ctrl+Right,panel.push_to_other,panel_mgmt,panel,Copy the active panel's current directory path to the OTHER (inactive) panel,known,Matches design.md section 9.4 seed table's 'Ctrl+<-/->'; directionality needs verification
+Ctrl+Left,panel.pull_from_other,panel_mgmt,panel,Copy the OTHER (inactive) panel's current directory path into the active panel,known,Mirror of Ctrl+Right; see note above
+Ctrl+B,panel.branch_view,panel_mgmt,panel,Toggle Branch View: flatten the current directory and all subdirectories into one listing,known,Matches design.md section 9.4 seed table
+Ctrl+Q,panel.quick_view,panel_mgmt,panel,Toggle Quick View mode: the inactive panel becomes a live preview of the cursor position in the active panel,known,Matches design.md section 9.4 seed table
+Ctrl+F10,panel.toggle_tree,panel_mgmt,panel,Toggle a directory-tree view in place of the file list,uncertain,Recalled but exact modifier not confidently verified -- may be Alt+F10 instead
+Ctrl+T,tab.new,tabs,panel,Open a new tab (duplicate of current directory) in the active panel,known,Matches design.md section 9.4 seed table
+Ctrl+W,tab.close,tabs,panel,Close the active tab,known,Matches design.md section 9.4 seed table; also happens to match the Linux/browser convention -- see Appendix A
+Ctrl+Shift+T,tab.reopen_closed,tabs,panel,Reopen the most recently closed tab,inferred,Plausible by analogy with browsers; exact default chord not hand-verified
+Ctrl+Tab,tab.next,tabs,panel,Switch to the next tab in the active panel,known,
+Ctrl+Shift+Tab,tab.prev,tabs,panel,Switch to the previous tab in the active panel,known,
+Ctrl+1..Ctrl+9,tab.switch_to_n,tabs,panel,Switch directly to tab N,uncertain,May actually collide with the Ctrl+1..Ctrl+9 view-mode bindings below in real TC; the two need reconciling by hand
+Ctrl+1,view.mode_brief,view_modes,panel,"Switch active panel to Brief view (filenames only, multi-column)",known,
+Ctrl+2,view.mode_full,view_modes,panel,"Switch active panel to Full view (name, size, date, attributes columns)",known,
+Ctrl+3,view.mode_wide,view_modes,panel,"Switch active panel to Wide view (filenames only, single column, larger)",known,
+Ctrl+4..Ctrl+9,view.mode_custom_n,view_modes,panel,Switch to a user-customisable column view (additional slots),inferred,"Existence of customisable view slots is well known; exact key range not hand-verified, may collide with tab-switch-by-number"
+Ctrl+F3,sort.by_name,view_modes,panel,Sort the active panel by name,uncertain,Sort-by-field hotkeys exist under TC's Show menu but the exact Ctrl+F-number-to-field mapping needs hands-on verification
+Ctrl+F4,sort.by_ext,view_modes,panel,Sort the active panel by extension,uncertain,See note on Ctrl+F3
+Ctrl+F5,sort.by_date,view_modes,panel,Sort the active panel by date/time,uncertain,See note on Ctrl+F3
+Ctrl+F6,sort.by_size,view_modes,panel,Sort the active panel by size,uncertain,See note on Ctrl+F3
+Ctrl+F7,sort.unsorted,view_modes,panel,Disable sorting (directory / unsorted order),uncertain,See note on Ctrl+F3
+Ctrl+F8,panel.toggle_hidden,view_modes,panel,Toggle display of hidden and system files/directories,uncertain,Best-recollection guess; may instead be Show-menu-only with no default accelerator. Duet also adds Ctrl+H as a Linux-convention alias regardless -- see Appendix A
+Ctrl+F1,toolbar.toggle_large_icons,view_modes,global,Toggle the button bar's large-icon display mode,uncertain,Loosely recalled; not hand-verified
+Ctrl+F2,toolbar.toggle_small_icons,view_modes,global,Toggle the button bar's small-icon display mode,uncertain,Loosely recalled; not hand-verified
+Alt+F7,tool.search,tools,panel,"Open the Find Files dialog (name/content search, feeds results back as a synthetic panel listing)",known,Matches design.md section 9.4 seed table
+Ctrl+M,tool.multi_rename,tools,panel,Open the Multi-Rename Tool for the selection,known,Matches design.md section 9.4 seed table
+Alt+F8,cmdline.history,tools,panel,Show the command line's recall history as a dropdown,inferred,
+(none),tool.compare_by_content,tools,panel,Compare two selected files byte-by-byte (opens a diff/compare view),known,No default keyboard accelerator in stock TC -- toolbar/menu only
+(none),tool.synchronize_dirs,tools,panel,Open Synchronize Directories (two-pane diff/sync tool),known,No default keyboard accelerator in stock TC -- toolbar/menu only
+(none),tool.compare_dirs,tools,panel,"Compare the two panels' directory contents, highlighting files that differ or are missing on one side",known,No default keyboard accelerator in stock TC
+(none),tools.open_terminal,tools,panel,Open a system command-prompt/terminal window at the active panel's current directory,known,No default keyboard accelerator in stock TC; highly relevant to Duet's embedded terminal (P3 persona)
+(none),config.options,tools,global,Open the Options/Preferences dialog,known,No default keyboard accelerator in stock TC
+Ctrl+N,ftp.new_connection,tools,panel,Open the 'New FTP/SFTP connection' dialog,uncertain,Recalled loosely from the Net menu; default accelerator not confidently verified
+F1,help.show,menu_equiv,global,Open context-sensitive help,known,
+F10,menu.activate,menu_equiv,global,Activate/focus the main menu bar (standard Win32 system accelerator -- same mechanism as pressing Alt; not TC application code),known,See design.md Appendix A -- explicit conflict discussion vs Linux terminal-emulator F10 usage and the mc-lineage 'F10=Quit' convention
+F9,tbd.f9_unverified,menu_equiv,panel,Default TC 11 behaviour for bare F9 could not be confidently recalled -- historically sometimes unused on the function-key bar,uncertain,Explicitly flagged gap rather than guessed; needs hands-on verification
+Alt+F4,app.quit,menu_equiv,global,Quit Total Commander,known,
+Alt,menu.activate,menu_equiv,global,Activate/focus the main menu bar (alternate to F10),known,
+Shift+F10,menu.context,menu_equiv,global,"Open the context menu for the item under cursor (Windows-standard 'Application key' equivalent, not TC-specific)",known,
+Esc,dlg.cancel,menu_equiv,global,Cancel the current dialog / clear the command line / close an overlay,known,
+Enter,dlg.confirm,menu_equiv,global,Confirm the dialog's default action,known,
+Alt+F,menu.open_files_menu,menu_equiv,global,Open the 'Files' top-level menu (standard Win32 mnemonic underline),known,Not TC-specific; other top-level menu mnemonics follow the same convention but individual letters were not all verified
+Ctrl+C,clipboard.copy_files,menu_equiv,panel,"Copy selected files/dirs to the OS clipboard as a file list (paste elsewhere with Ctrl+V, including into other file managers)",inferred,TC added OS-clipboard file copy/paste in a fairly recent version; exact version/behaviour not hand-verified. One of the three required conflict resolutions -- see design.md Appendix A
+Ctrl+V,clipboard.paste_files,menu_equiv,panel,"Paste files from the OS clipboard into the active panel's directory (copy, or move if the source was cut)",inferred,See Ctrl+C note
+Ctrl+X,clipboard.cut_files,menu_equiv,panel,Mark selected files for a clipboard 'cut' (move-on-paste rather than copy-on-paste),inferred,Least certain of the three -- TC's cut/paste-as-move semantics for files were not confidently recalled in full detail
+Ctrl+C,text.copy,menu_equiv,cmdline,Standard text-copy inside the command line / rename field / any editable text control,known,"Ordinary OS text-edit accelerator, not TC-specific"
+Ctrl+V,text.paste,menu_equiv,cmdline,Standard text-paste inside the command line / rename field / any editable text control,known,
+Ctrl+X,text.cut,menu_equiv,cmdline,Standard text-cut inside the command line / rename field / any editable text control,known,
+Ctrl+A,text.select_all,menu_equiv,cmdline,"Select all text within an editable text field (path bar, rename field, search box) -- standard OS text-edit accelerator, distinct from the panel-level Ctrl+A (Change Attributes)",known,Directly resolves the Ctrl+A ambiguity via context-scoping -- ties to design.md Appendix A discussion
+Up,cmdline.history_prev,menu_equiv,cmdline,Recall the previous command-line entry from history,known,
+Down,cmdline.history_next,menu_equiv,cmdline,Recall the next command-line entry from history,known,
+Esc,cmdline.clear,menu_equiv,cmdline,Clear the command line text,known,
+F3,viewer.close,viewer,viewer,Close the internal viewer (Lister) and return focus to the panel,inferred,Also plausible that F3 opens the NEXT file for viewing rather than closing; TC's Lister historically overloads F3 -- needs hands-on disambiguation
+Esc,viewer.close,viewer,viewer,Close the internal viewer,known,
+Ctrl+F,viewer.find,viewer,viewer,Find text within the viewed file,known,Standard text-viewer convention TC follows
+Ctrl+G,viewer.goto_offset,viewer,viewer,Go to a specific byte offset (hex mode) or line (text mode),inferred,
+Space,viewer.page_down,viewer,viewer,"Scroll one page down (or forward, in binary/hex mode)",known,
+Backspace,viewer.page_up,viewer,viewer,Scroll one page up,inferred,
+Ctrl+PgDn,viewer.next_file,viewer,viewer,Load the next file in the panel into the viewer without closing it,inferred,Well-loved TC feature (browse files without leaving the viewer); exact chord recalled with only moderate confidence
+Ctrl+PgUp,viewer.prev_file,viewer,viewer,Load the previous file in the panel into the viewer,inferred,
+W,viewer.toggle_wrap,viewer,viewer,Toggle line wrap in text mode,uncertain,Classic Lister behaviour from the DOS era; not confirmed present with this exact key in TC 11's Lister
+Ctrl+1,viewer.mode_text,viewer,viewer,Switch viewer to Text mode,uncertain,
+Ctrl+2,viewer.mode_hex,viewer,viewer,Switch viewer to Hex mode,uncertain,
+Ctrl+3,viewer.mode_binary,viewer,viewer,Switch viewer to Binary/ASCII-table mode,uncertain,
+Ctrl+S,editor.save,editor,editor,Save the file being edited,known,Standard text-editor convention
+Ctrl+Z,editor.undo,editor,editor,Undo last edit,known,
+Ctrl+Y,editor.redo,editor,editor,Redo,inferred,
+Ctrl+F,editor.find,editor,editor,Find text,known,
+Ctrl+H,editor.replace,editor,editor,Find and replace,inferred,Standard convention; TC's internal editor is minimal and may or may not implement this
+Ctrl+G,editor.goto_line,editor,editor,Go to a specific line number,inferred,
+Esc,editor.close_prompt,editor,editor,Close the editor (prompts to save if modified),known,
+Alt+Y,dlg.overwrite_yes,dialog,dialog,In the file-exists conflict dialog: overwrite this file,inferred,
+Alt+A,dlg.overwrite_all,dialog,dialog,Overwrite all remaining conflicts without asking again,inferred,
+Alt+N,dlg.overwrite_no,dialog,dialog,Skip this file,inferred,
+Esc,dlg.overwrite_no,dialog,dialog,Skip this file / cancel the conflict prompt,known,
+Alt+S,dlg.overwrite_skip_all,dialog,dialog,Skip all remaining conflicts,inferred,
+Alt+R,dlg.rename,dialog,dialog,Rename the incoming file instead of overwriting,inferred,
+Tab,dlg.next_field,dialog,dialog,Move focus to the next field/button in a dialog,known,
+Shift+Tab,dlg.prev_field,dialog,dialog,Move focus to the previous field/button in a dialog,known,
+Ctrl+Ins,text.copy,menu_equiv,cmdline,Alternate Windows/X11 text-copy accelerator inside an editable text field,known,"Classic alternate clipboard triad (Ctrl+Ins/Shift+Ins/Shift+Del); universal text-edit convention, not TC-specific"
+Shift+Ins,text.paste,menu_equiv,cmdline,Alternate text-paste accelerator inside an editable text field,known,
+Shift+Delete,text.cut,menu_equiv,cmdline,Alternate text-cut accelerator inside an editable text field -- distinct from the panel-level Shift+Delete (permanent file delete) purely by context,known,"Good illustration of why context-scoping (design.md section 9.4) matters: same chord, different meaning by focus"
+Home,text.cursor_line_start,menu_equiv,cmdline,Move text cursor to the start of the command-line text -- distinct from the panel-level Home (cursor to first entry),known,
+End,text.cursor_line_end,menu_equiv,cmdline,Move text cursor to the end of the command-line text -- distinct from the panel-level End (cursor to last entry),known,
+Ctrl+Left,text.word_left,menu_equiv,cmdline,Move text cursor one word left -- distinct from the panel-level Ctrl+Left (pull path from other panel),known,
+Ctrl+Right,text.word_right,menu_equiv,cmdline,Move text cursor one word right -- distinct from the panel-level Ctrl+Right (push path to other panel),known,
+Alt+Down,cmdline.open_history_dropdown,menu_equiv,cmdline,Open the command line's history as a dropdown (standard Windows combo-box convention),uncertain,Presence of this exact chord in TC's command line not confidently verified
+Shift+Num +,sel.by_same_ext,selection,panel,Select all files sharing the extension of the entry under cursor,uncertain,Recalled loosely from the Mark menu; not confidently distinguished from plain Num+ mask-select
+Ctrl+Home,nav.cursor_top,navigation,panel,Possible alternate for Home (jump to first entry),uncertain,May be redundant with plain Home; not certain TC binds this separately
+Ctrl+End,nav.cursor_bottom,navigation,panel,Possible alternate for End (jump to last entry),uncertain,May be redundant with plain End; not certain TC binds this separately
+Num Enter,nav.open_or_enter,navigation,panel,Numeric-keypad Enter behaves the same as the main Enter key,known,
