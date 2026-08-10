@@ -1,0 +1,16 @@
+[package]
+name = "s3_dragdrop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "s3_dragdrop"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+
+[profile.release]
+debug = true

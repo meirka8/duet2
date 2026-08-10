@@ -1,0 +1,17 @@
+[package]
+name = "s1_virtualised_table"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "s1_virtualised_table"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+rayon = "1.12.0"
+
+[profile.release]
+debug = true

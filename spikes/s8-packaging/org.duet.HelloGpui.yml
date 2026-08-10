@@ -1,0 +1,59 @@
+app-id: org.duet.HelloGpui
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: hello_gpui
+
+# Deliberately NOT org.gnome.Platform / org.kde.Platform: Duet renders its own
+# UI via GPUI and does not want a GTK or Qt/KDE runtime dependency, per
+# design.md 4.2 non-goals. This spike's whole point is proving a bare
+# org.freedesktop.Platform base (no toolkit) is sufficient to run a GPUI app.
+finish-args:
+  # Wayland is the primary target; X11 fallback kept for portability (gpui's
+  # linux backend can use either, see ldd/strings findings in S-8.md).
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU access for the Vulkan/GL renderer GPUI's blade-graphics backend uses.
+  - --device=dri
+  # No filesystem, network, or D-Bus access requested at *run* time: this
+  # hello-world does not touch files or the network, so we keep the runtime
+  # sandbox as tight as possible and let later Duet work request only what
+  # it actually needs.
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+modules:
+  - name: hello_gpui
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/hello_gpui/cargo-home
+      # GOTCHA (see S-8.md): the org.freedesktop.Sdk.Extension.rust-stable
+      # in this runtime is 1.89.0. Building against gpui 0.2.2 pulls fresh
+      # crates from crates.io (no vendoring done for this spike), which
+      # requires network access inside the build sandbox -- flatpak-builder
+      # denies network by default. --share=network opts back in. A
+      # Flathub-eligible manifest would instead vendor dependencies
+      # (`cargo vendor` + a `generated-sources.json`-style source list) for
+      # a fully offline, reproducible build; that is out of scope for this
+      # timeboxed spike and noted as a follow-up.
+      build-args:
+        - --share=network
+    build-commands:
+      - cd hello-gpui && cargo build --release
+      - install -Dm755 hello-gpui/target/release/hello_gpui /app/bin/hello_gpui
+      - install -Dm644 org.duet.HelloGpui.desktop /app/share/applications/org.duet.HelloGpui.desktop
+      - install -Dm644 org.duet.HelloGpui.png /app/share/icons/hicolor/256x256/apps/org.duet.HelloGpui.png
+    sources:
+      - type: dir
+        path: hello-gpui
+        dest: hello-gpui
+        skip:
+          - target
+      - type: file
+        path: org.duet.HelloGpui.desktop
+      - type: file
+        path: org.duet.HelloGpui.png

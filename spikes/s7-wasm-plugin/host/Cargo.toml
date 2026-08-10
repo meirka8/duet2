@@ -1,0 +1,16 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/bench.rs"
+
+[[bin]]
+name = "interrupt"
+path = "src/interrupt.rs"
+
+[dependencies]
+wasmtime = { version = "47", features = ["component-model"] }
+anyhow = "1"

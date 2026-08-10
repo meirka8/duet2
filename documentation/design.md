@@ -253,7 +253,7 @@ GPUI is a hybrid immediate/retained-mode, GPU-accelerated Rust UI framework from
 | GTK4 (gtk-rs) | Great integration, `GtkColumnView` is virtualised. Loses the differentiator: it will feel like other GTK apps, and GTK's input-to-paint path is not the target. |
 | Tauri/Electron | Rejected on NFR-01/02/06 grounds. |
 
-**ADR-001: Use GPUI + gpui-component for the shell.** Accepted, conditional on Phase 0 spikes S-1…S-6 (see `task.md` §Phase 0). If S-2 (clipboard) or S-3 (drag and drop) fail with no tractable workaround, the decision is revisited at G0 — with Iced the most likely substitute, and the cost bounded by ADR-002.
+**ADR-001: Use GPUI + gpui-component for the shell.** **Accepted, unconditionally, at G0 (2026-08-10).** All Phase 0 spikes (S-1…S-8) are complete; neither kill criterion fired — see `documentation/spikes/G0-feasibility-report.md` for the full consolidation. S-2 (clipboard) and S-3 (drag-and-drop) both found real gaps in GPUI's native API surface, but both have costed, tractable workarounds well inside the ~10-day threshold that would have triggered a revisit (5–7 days and "defer outbound to P1" respectively) — the Iced fallback is not invoked. Two items carry forward as open validation work rather than architecture risk: NFR-05's 120Hz frame-time target is unverified (no 120Hz display was available during Phase 0) and must be re-checked on real hardware before T-4.2.1 signs off; §7.4 R-G10/R-G11 track this.
 
 **ADR-002: The core is UI-framework-agnostic.** No crate below `duet-ui` may depend on `gpui`. Cross-layer communication is by plain Rust types, channels, and a small `Executor` trait the shell implements. Consequence: swapping the shell costs the UI crates only (~25% of the codebase), and the core is testable headlessly and reusable from a future TUI or CLI.
 
@@ -261,17 +261,21 @@ GPUI is a hybrid immediate/retained-mode, GPU-accelerated Rust UI framework from
 
 ### 7.4 GPUI risk register (specific, not generic)
 
+**Updated post-G0 (2026-08-10) with measured findings from `documentation/spikes/S-1.md`…`S-8.md`, consolidated in `documentation/spikes/G0-feasibility-report.md`.** Rows marked *(measured)* have moved from anticipated risk to known, costed fact.
+
 | ID | Risk | Impact | Mitigation |
 |---|---|---|---|
-| R-G1 | Pre-1.0 breaking changes churn the UI layer | Medium, recurring | ADR-003 pinning; `gpui-compat` shim; UI layer kept thin |
-| R-G2 | Clipboard cannot carry `text/uri-list` and the GNOME/KDE cut markers | **High — FR-CFG-05 is P0** | Spike S-2. Fallback: own the clipboard at the protocol layer (`wl_data_device` via smithay-client-toolkit; `x11rb` selections) alongside GPUI's window, or upstream a MIME-generic clipboard API |
-| R-G3 | Cross-application drag and drop absent or one-directional | High — FR-CFG-06 | Spike S-3. Same fallback shape as R-G2. Degrade to P1-deferred if only intra-app DnD is achievable for 1.0 |
-| R-G4 | No accessibility tree (AT-SPI) | Medium — NFR-11 | Ship keyboard-complete; document the gap; investigate AccessKit's AT-SPI adapter and, if viable, upstream to GPUI post-1.0 |
-| R-G5 | Font/icon/cursor theme integration weaker than native toolkits | Low–Medium | Read fontconfig for the UI font, XDG icon theme for icons, XCursor for cursors; verify on the compositor matrix |
-| R-G6 | HiDPI, fractional scaling, multi-monitor mixed-DPI defects | Medium | Test matrix in §14.5; these are known-hard on Wayland and must be tested continuously, not at the end |
-| R-G7 | `gpui-component` is a single-maintainer-ish community project tracking a moving upstream | Medium | Vendor a pinned copy; keep our usage inside a `duet-widgets` façade so a fork or replacement is local |
-| R-G8 | IME/complex text input in the path bar and rename fields | Low–Medium | Test CJK IME early (S-6); it is the kind of thing discovered too late |
-| R-G9 | Native file/folder chooser needed for some flows | Low | Use `xdg-desktop-portal` via zbus; also acceptable to use Duet's own chooser |
+| R-G1 | Pre-1.0 breaking changes churn the UI layer | Medium, recurring | ADR-003 pinning; `gpui-compat` shim; UI layer kept thin. Not exercised by Phase 0 (single-version pin throughout) — status unchanged. |
+| R-G2 | *(measured)* Clipboard cannot carry `text/uri-list` and the GNOME/KDE cut markers | **Confirmed — GPUI's `ClipboardItem`/`ClipboardEntry` API has no custom-MIME-type path at all, and the Wayland backend only ever offers plain text for clipboard (as opposed to drag-and-drop, where `text/uri-list` is already wired).** | S-2 built and self-verified a `smithay-client-toolkit`/`wl_data_device` fallback that round-trips `text/uri-list` + `x-special/gnome-copied-files` + `application/x-kde-cutselection` correctly. **Estimated integration cost: 5–7 engineer-days** (Wayland only; X11/`x11rb` support is the largest unbudgeted remainder). Feed into T-5.3.3's estimate. |
+| R-G3 | *(measured)* Cross-application drag and drop absent or one-directional | **Confirmed one-directional.** Inbound (external app → Duet) is fully implemented natively in gpui 0.2.2 on both Wayland (`wl_data_device`) and X11 (XDND) — works with zero extra code via `on_drop::<ExternalPaths>()`. Outbound (Duet → external app) has no source/start-drag implementation anywhere in the crate. | S-3's source-level analysis (not a live test — see G0 report) is conclusive: inbound needs no mitigation. Outbound is **deferred to P1** per this row's own documented fallback; recommended path is an upstream `gpui` contribution (the connection is already owned cleanly on GPUI's side) rather than a second independently-driven Wayland connection, which risks corrupting GPUI's own event loop. |
+| R-G4 | No accessibility tree (AT-SPI) | Medium — NFR-11 | Ship keyboard-complete; document the gap; investigate AccessKit's AT-SPI adapter and, if viable, upstream to GPUI post-1.0. Not exercised by Phase 0. |
+| R-G5 | Font/icon/cursor theme integration weaker than native toolkits | Low–Medium | Read fontconfig for the UI font, XDG icon theme for icons, XCursor for cursors; verify on the compositor matrix. Not exercised by Phase 0. |
+| R-G6 | HiDPI, fractional scaling, multi-monitor mixed-DPI defects | Medium | Test matrix in §14.5; these are known-hard on Wayland and must be tested continuously, not at the end. Not exercised by Phase 0. |
+| R-G7 | `gpui-component` is a single-maintainer-ish community project tracking a moving upstream | Medium | Vendor a pinned copy; keep our usage inside a `duet-widgets` façade so a fork or replacement is local. Not exercised by Phase 0 (only one version used throughout). |
+| R-G8 | *(partially measured)* IME/complex text input in the path bar and rename fields | Low–Medium, plus **one confirmed real gap**: `gpui-component` 0.5.1's `Input` lays out RTL text (Arabic/Hebrew tested) in pure logical order with no BiDi visual reordering. | S-6: 4000-char paste, emoji/ZWJ/skin-tone/flag sequences, and IME marked-text plumbing (`replace_and_mark_text_in_range`) all pass headlessly via `gpui::TestAppContext`. GPUI's IME support is real (Wayland `zwp_text_input_v3`, X11 XIM, XKB compose-table dead keys), not stubbed. RTL BiDi gap needs an owner decision (fix upstream, or accept as documented 1.0 limitation) before T-4.3.4. Live multi-keystroke CJK composition is *structurally* untestable by any automated harness — it's IME-engine-mediated, several process hops from GPUI — and remains deferred to T-4.3.4's manual acceptance pass, not merely postponed for convenience. |
+| R-G9 | Native file/folder chooser needed for some flows | Low | Use `xdg-desktop-portal` via zbus; also acceptable to use Duet's own chooser. Not exercised by Phase 0. |
+| R-G10 | *(new, from S-1)* `gpui-component`'s own initialization cost (font enumeration via cosmic-text, theme init) consumes ~248MB RSS **before any application window, data, or table exists** | Medium — eats ~83% of NFR-06's 300MB single-pane budget before Duet's own data structures are counted | Not previously anticipated as its own risk (§7.4 originally treated RSS purely as a data-scaling concern). Needs either an NFR-06 renegotiation acknowledging this floor, or an investigation into whether `gpui-component`'s init cost can be reduced (e.g. lazy font enumeration). Track before T-4.1.1/T-4.2.1. |
+| R-G11 | *(new, from S-1)* NFR-05 (sub-8.3ms frame time at 120Hz) has **not been empirically validated** — every display available during Phase 0 was capped at 60Hz | Medium — this is the product's core differentiator, currently resting on an assumption | S-1's harness (`spikes/s1-virtualised-table/`) measured GPUI's own per-cell render cost at ~60µs/frame (well under budget) but could not measure true end-to-end display-refresh frame time. Re-run S-1's harness on genuine 120Hz hardware before T-4.2.1's AC is signed off — do not treat this as passed by default. |
 
 ### 7.5 Language and dependency policy
 
@@ -590,8 +594,8 @@ The plugin never receives a filesystem path it can open. It receives *handles* t
 | Concern | Approach | Risk |
 |---|---|---|
 | Trash | Direct freedesktop trash-spec implementation: `~/.local/share/Trash/{files,info}`, `$topdir/.Trash/$uid` or `$topdir/.Trash-$uid` for other mounts, correct `.trashinfo` with relative paths | Low |
-| Clipboard | `text/uri-list` + `x-special/gnome-copied-files` + `application/x-kde-cutselection` | **R-G2 — spike S-2** |
-| DnD | Wayland `wl_data_device` / X11 XDND, both directions | **R-G3 — spike S-3** |
+| Clipboard | `text/uri-list` + `x-special/gnome-copied-files` + `application/x-kde-cutselection`, via `smithay-client-toolkit` (not GPUI's native clipboard API — see R-G2) | **R-G2 — measured at G0, 5–7 day cost** |
+| DnD | Wayland `wl_data_device` / X11 XDND — **inbound only for 1.0**; outbound deferred to P1 | **R-G3 — measured at G0, inbound native, outbound absent** |
 | Mounts | `udisks2` over zbus for block devices; parse `/proc/self/mountinfo` for the live picture; surface GVFS mounts under `/run/user/$UID/gvfs` | Low |
 | Elevation | polkit action + a tiny D-Bus-activated helper exposing only `copy/move/delete/chmod/chown` on validated paths — never `pkexec duet` | Medium (§13) |
 | Open URI / portals | `xdg-desktop-portal` via zbus for `OpenURI`, `Trash` fallback, and screenshot-free file chooser when embedding demands it | Low |
@@ -706,7 +710,7 @@ A continuous benchmark suite (`benches/`) runs in CI on a fixed runner with a ge
 
 | ID | Milestone | Contents | Gate |
 |---|---|---|---|
-| **M0** | Feasibility | Phase 0 spikes; ADR-001 confirmed or revised | G0 |
+| **M0** | Feasibility | Phase 0 spikes; ADR-001 confirmed or revised | **G0 — passed 2026-08-10, ADR-001 confirmed. See `documentation/spikes/G0-feasibility-report.md`.** |
 | **M1** | Walking skeleton | Two panels, local VFS, listing, navigation, keymap, palette; no operations | — |
 | **M2** | Alpha | All FR-NAV/SEL P0, FR-OPS P0, viewer, search, trash, clipboard; data-safety suite green | G3 |
 | **M3** | Beta | Archives, remote backends, plugin system, multi-rename, sync, thumbnails | G4 |
@@ -751,7 +755,7 @@ If this is one person's evenings, cut to **M2 + archives-read-only** and ship th
 
 | ADR | Title | Status |
 |---|---|---|
-| ADR-001 | GPUI + gpui-component for the shell | Accepted, conditional on G0 |
+| ADR-001 | GPUI + gpui-component for the shell | **Accepted, unconditionally (G0 passed 2026-08-10)** |
 | ADR-002 | UI-framework-agnostic core | Accepted |
 | ADR-003 | Pin GPUI, isolate churn behind a compat shim | Accepted |
 | ADR-004 | WASM component plugins over native `.so` | Accepted |
