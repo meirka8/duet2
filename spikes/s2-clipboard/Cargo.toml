@@ -1,0 +1,17 @@
+[package]
+name = "s2_clipboard"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "s2_clipboard"
+path = "src/main.rs"
+
+[dependencies]
+smithay-client-toolkit = { version = "0.21.1", features = ["calloop"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
+[profile.release]
+debug = true
