@@ -100,6 +100,11 @@ Also worth an explicit answer, because reviewers will ask: **why not contribute 
 
 Requirement IDs are stable and referenced by every task in `task.md`. Priority: **P0** = 1.0 blocker, **P1** = 1.0 target, **P2** = post-1.0.
 
+**T-1.2.1 review pass (2026-08-11):** every requirement below was walked against the four personas in §3. Substantive review is available in full at `docs/acceptance-sketches.md` alongside each P0 sketch, since "how would we know this works" and "does this actually serve a persona" turned out to be the same exercise in practice — writing a concrete test for a requirement that had no real persona behind it kept surfacing that fact naturally. Two corrections came out of this pass:
+
+- **The NFR table below had no `Pri` column at all** — a direct violation of this task's own AC ("no requirement without a priority"). Added, with each target justified against G-1/G-3 (latency and data-safety as non-negotiable, per §4.1) or explicitly marked lower.
+- No functional requirement was deleted. Everything currently listed traces to at least one of P1–P4 without strain — this is a fairly disciplined draft already (which tracks: §5's competitive analysis, written from real domain knowledge of the prior-art tools, was already doing double duty as the "why does this exist" check T-1.1.1 would otherwise have forced). The one item flagged as under-scoped for its persona rather than over-scoped is NFR-11 (accessibility): keyboard-completeness is load-bearing for P1 *and* P3 and reads more like a P0 than the table's lack of a priority column previously implied — see its new entry below.
+
 ### 6.1 Functional — panels and navigation (FR-NAV)
 
 | ID | Requirement | Pri |
@@ -205,20 +210,20 @@ Requirement IDs are stable and referenced by every task in `task.md`. Priority: 
 
 ### 6.8 Non-functional (NFR)
 
-| ID | Requirement | Target | Measurement |
-|---|---|---|---|
-| NFR-01 | Cold start to interactive | ≤ 150 ms | `hyperfine` on warm page cache, instrumented "first frame with real listing" marker |
-| NFR-02 | Keystroke-to-pixel latency | p50 ≤ 6 ms, p99 ≤ 12 ms | In-process frame instrumentation; cross-checked with a high-speed camera once |
-| NFR-03 | Directory listing, 100k entries | first paint ≤ 100 ms, fully sorted ≤ 400 ms | Bench harness on tmpfs and ext4 |
-| NFR-04 | Directory listing, 1M entries | usable (scrollable, sortable) ≤ 3 s, no UI stall > 16 ms | Bench harness |
-| NFR-05 | Scroll performance | sustained monitor refresh rate on 1M rows | Frame-time histogram, no frame > 8.3 ms at 120 Hz |
-| NFR-06 | Memory | ≤ 150 MB RSS with two panes × 100k entries and thumbnails off | `/proc/self/status` sampling in bench |
-| NFR-07 | Copy throughput | ≥ 95% of `cp` for large files; ≥ 80% of `cp -a` for 100k small files | Bench against coreutils on the same disk |
-| NFR-08 | Data integrity | zero loss/corruption across the crash-injection suite | §14.4 suite must pass 100% |
-| NFR-09 | Binary size | ≤ 40 MB stripped, ≤ 25 MB for the core without bundled archive codecs | CI check |
-| NFR-10 | Startup dependencies | runs on a minimal Wayland or X11 session with no GTK/Qt/KDE runtime | Container test matrix |
-| NFR-11 | Accessibility | keyboard-complete (no mouse-only actions); screen-reader support is a documented gap with a tracked plan | Manual audit; §17 OQ-4 |
-| NFR-12 | Crash rate | < 0.1% of sessions in beta telemetry (opt-in only) | Optional crash reporter |
+| ID | Requirement | Target | Measurement | Pri |
+|---|---|---|---|---|
+| NFR-01 | Cold start to interactive | ≤ 150 ms | `hyperfine` on warm page cache, instrumented "first frame with real listing" marker | P0 |
+| NFR-02 | Keystroke-to-pixel latency | p50 ≤ 6 ms, p99 ≤ 12 ms | In-process frame instrumentation; cross-checked with a high-speed camera once | P0 |
+| NFR-03 | Directory listing, 100k entries | first paint ≤ 100 ms, fully sorted ≤ 400 ms | Bench harness on tmpfs and ext4 | P0 |
+| NFR-04 | Directory listing, 1M entries | usable (scrollable, sortable) ≤ 3 s, no UI stall > 16 ms | Bench harness | P0 |
+| NFR-05 | Scroll performance | sustained monitor refresh rate on 1M rows | Frame-time histogram, no frame > 8.3 ms at 120 Hz | P0 |
+| NFR-06 | Memory | ≤ 150 MB RSS with two panes × 100k entries and thumbnails off | `/proc/self/status` sampling in bench | P0 |
+| NFR-07 | Copy throughput | ≥ 95% of `cp` for large files; ≥ 80% of `cp -a` for 100k small files | Bench against coreutils on the same disk | P0 |
+| NFR-08 | Data integrity | zero loss/corruption across the crash-injection suite | §14.4 suite must pass 100% | P0 |
+| NFR-09 | Binary size | ≤ 40 MB stripped, ≤ 25 MB for the core without bundled archive codecs | CI check | P1 |
+| NFR-10 | Startup dependencies | runs on a minimal Wayland or X11 session with no GTK/Qt/KDE runtime | Container test matrix | P0 |
+| NFR-11 | Accessibility | **keyboard-complete (no mouse-only actions) is P0** — load-bearing for both P1 (TC refugee, keyboard-first by definition) and P3 (developer, "sub-frame latency... doesn't break flow" implies never reaching for a mouse); screen-reader support is a documented gap with a tracked plan (P2, tracked as R-G4/B-1) | Manual audit; §17 OQ-4 | P0 (keyboard) / P2 (screen-reader) |
+| NFR-12 | Crash rate | < 0.1% of sessions in beta telemetry (opt-in only) | Optional crash reporter | P2 |
 
 ## 7. Technology selection
 
