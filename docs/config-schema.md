@@ -103,7 +103,7 @@ restore_selection_after_operation = true
 
 [navigation]
 quick_search_mode            = "jump"   # jump | filter
-quick_search_idle_timeout_ms = 1000     # 200-5000; resets the typed buffer after this much idle time
+quick_search_idle_timeout_ms = 1200     # 200-5000; resets the typed buffer after this much idle time (FR-NAV-13 default)
 history_size                  = 100      # per-tab back/forward history depth, 10-1000
 branch_view_show_hidden       = false
 
@@ -174,7 +174,7 @@ Validated with Python's `tomllib` — parses cleanly.
 | `selection.mouse_mode` | enum | `"windows"` | `windows` \| `norton` \| `none` | FR-SEL-06: left-click-select vs. right-click-select vs. mouse never changes selection. |
 | `selection.restore_selection_after_operation` | bool | `true` | — | FR-SEL-04. |
 | `navigation.quick_search_mode` | enum | `"jump"` | `jump` \| `filter` | FR-NAV-07: typed letters jump to a match, or (modifier-prefixed by default, this key changes the unprefixed default) filter the panel. |
-| `navigation.quick_search_idle_timeout_ms` | int | `1000` | 200–5000 | Idle time after the last keystroke before the typed quick-search buffer resets. |
+| `navigation.quick_search_idle_timeout_ms` | int | `1200` | 200–5000 | Idle time after the last keystroke before the typed quick-search buffer resets, per FR-NAV-13's default. Jump mode also uses fuzzy subsequence matching (not plain prefix) per FR-NAV-13 — this key only controls the reset timing, not the match algorithm. |
 | `navigation.history_size` | int | `100` | 10–1000 | Per-tab back/forward history depth (FR-NAV-08). |
 | `navigation.branch_view_show_hidden` | bool | `false` | — | Hidden-file visibility specifically inside branch view (FR-NAV-10), independent of `panels.show_hidden`. |
 | `operations.verify_after_copy` | bool | `false` | — | Global default for FR-OPS-08 post-copy checksum verification; overridable per job. |
