@@ -110,12 +110,13 @@ Requirement IDs are stable and referenced by every task in `task.md`. Priority: 
 | FR-NAV-04 | Column modes: Full (name, ext, size, date, attrs), Brief (multi-column names), Thumbnails, Tree. Per-tab, persisted. | P0/P1 |
 | FR-NAV-05 | Columns are configurable sets (add/remove/reorder/width), including plugin-provided columns; named layouts switchable by keyboard. | P1 |
 | FR-NAV-06 | Sorting by any column, ascending/descending, directories-first policy configurable, natural (version) sort for numeric runs, locale-aware collation. | P0 |
-| FR-NAV-07 | Quick search within a panel: typing letters jumps to matching entry; a modifier-prefixed mode filters the panel instead of jumping. | P0 |
+| FR-NAV-07 | Quick search within a panel: typing letters jumps to matching entry; a modifier-prefixed mode filters the panel instead of jumping. Match algorithm and reset semantics specified in FR-NAV-13. | P0 |
 | FR-NAV-08 | History (back/forward) per tab, and a directory hotlist (bookmarks) with keyboard-invoked overlay. | P0 |
 | FR-NAV-09 | Breadcrumb path bar that is also an editable path input; typing a path with completion navigates. | P1 |
 | FR-NAV-10 | Branch view (flat recursive listing of the current subtree), with and without hidden files. | P1 |
 | FR-NAV-11 | Drive/mount bar listing local block devices, removable media, and active network mounts; mount/unmount/eject actions. | P1 |
 | FR-NAV-12 | Directory tree panel synchronised with the active panel, optional. | P1 |
+| FR-NAV-13 | **Quick-search jump uses fuzzy subsequence matching, not plain prefix matching**, on the visible (post-filter/-sort) entry names. On the first character typed with the panel focused (no modifier held, not captured by a bound command, not while an editable field has focus), Duet enters *search regime*: every subsequent character is appended to a query buffer and re-scores all entries; the cursor jumps to the highest-scoring match, with entries physically nearer the current cursor row breaking ties in favour of the smaller visual jump. Search regime is exited (buffer cleared) by: **Escape**, an idle timeout (default 1200 ms since the last keystroke, configurable in `settings.toml`), the cursor being moved by a non-search command (arrows, PgUp/Dn, Home/End, mouse click), or the panel losing focus. While active, an unmissable but non-blocking indicator is shown (e.g. an inline pill anchored to the panel's footer or near the cursor row) displaying the literal typed query and the match's ordinal position among all matches (e.g. `find: rmr (2/5)`); it disappears the instant regime exits. This is distinct from the modifier-prefixed *filter* mode in FR-NAV-07, which hides non-matching rows rather than moving the cursor — filter mode keeps its own match-count indicator per T-4.3.3's existing AC and is unaffected by this requirement. | P0 |
 
 ### 6.2 Functional — selection (FR-SEL)
 
@@ -434,6 +435,7 @@ DirectoryModel {
 - **Sorting.** Locale-aware collation with a natural-numeric mode, precomputed sort keys for the active column so comparisons are integer or byte-slice compares. Stable across refreshes so the cursor doesn't jump.
 - **Watching.** `notify`/inotify with a 50 ms debounce and coalescing; `IN_Q_OVERFLOW` triggers a full rescan; network and FUSE mounts fall back to interval polling with a configurable period. Backends that lack `WATCH` get polling from this layer, not from the backend.
 - **Directory sizes.** Computing a directory's recursive size is an explicit, cancellable background job (Space key, or "calculate all"), with results cached by `(dev, ino, mtime)` and invalidated by watch events.
+- **Quick-search regime (FR-NAV-13).** A small piece of transient state on the tab (query buffer, last-keystroke timestamp, active flag), not part of `DirectoryModel` itself since it's UI-session state, not data. Scoring reuses a fuzzy-subsequence matcher (`nucleo` — the same crate family Zed/GPUI's own fuzzy finder already depends on transitively, so no new dependency weight — or `fuzzy-matcher` as a lighter fallback) run over the current `order` slice's visible names on every keystroke; O(entries) per keystroke is fine at panel scale (even 1M rows is a cheap linear scan for a subsequence matcher, unlike a full sort). The idle-timeout reset is a simple `cx.spawn` timer reset on each keystroke, cancelled on exit-regime.
 
 ### 9.3 `duet-ops` — the operation engine
 
