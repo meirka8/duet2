@@ -12,3 +12,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+duet-types = { path = "../duet-types" }
+roaring = "0.11.4"
