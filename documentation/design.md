@@ -24,7 +24,7 @@
 |---|---|---|---|
 | G0 | Feasibility report | All Phase 0 spikes green or mitigated | Author |
 | G1 | This document, §4–§6 frozen | Requirements baselined, IDs assigned | Author |
-| G2 | This document, §7–§13 frozen | Architecture + interfaces baselined | Author |
+| G2 | This document, §7–§13 frozen | Architecture + interfaces baselined | **Passed 2026-08-11 — see `documentation/G2-gate-report.md`** |
 | G3 | Alpha build | FR-CORE-\* complete, data-loss suite passing | Author |
 | G4 | Beta build | FR-VFS-\*, FR-PLUG-\* complete | Author |
 | G5 | 1.0 release | All P0/P1 requirements, packaging done | Author |
@@ -264,6 +264,17 @@ GPUI is a hybrid immediate/retained-mode, GPU-accelerated Rust UI framework from
 **ADR-002: The core is UI-framework-agnostic.** No crate below `duet-ui` may depend on `gpui`. Cross-layer communication is by plain Rust types, channels, and a small `Executor` trait the shell implements. Consequence: swapping the shell costs the UI crates only (~25% of the codebase), and the core is testable headlessly and reusable from a future TUI or CLI.
 
 **ADR-003: Pin GPUI to a specific version and update deliberately.** Given documented breaking changes, pin an exact version, keep a `gpui-compat` shim module for anything churn-prone, and schedule bumps as explicit tasks with a compile-and-smoke gate rather than picking them up implicitly.
+
+**ADR-004: Plugins are WebAssembly components, not native `.so`/`.dll` loading.** **Accepted, finalized at G2 (2026-08-11)** — S-7's spike (`documentation/spikes/S-7.md`) measured host↔guest call overhead at 0.76–1.16µs median across six runs, 60–130x under the 100µs budget FR-PLUG-06 needs for a per-row content-plugin call, and confirmed epoch-based interruption actually kills a runaway `loop {}` guest in ~2s without destabilizing the host process. Both of S-7's AC items passed with wide margin, so nothing about WASM's performance ceiling threatens FR-PLUG-01's "no ambient filesystem or network authority" security model or FR-PLUG-06's misbehaving-plugin isolation — the two things a native `.so` (in-process, full ambient authority, a panic takes down the host) structurally cannot provide. `plugins-sdk/wit/` (T-2.6.1) already defines and validates all five plugin-class interfaces against this decision; there is no remaining design question here, only implementation (Phase 8).
+
+**ADR-005: Duet owns its trash, clipboard, and mount integration directly rather than depending on GIO/GVFS.** **Accepted, finalized at G2 (2026-08-11)** — this was "Proposed" pending S-2's clipboard spike, which is now in: GPUI's native clipboard API cannot carry custom MIME types at all (confirmed at both the type and Wayland-backend level, `documentation/spikes/S-2.md`), so *some* direct protocol-level ownership was already forced regardless of GIO. Given that, going the rest of the way — trash via a direct freedesktop trash-spec implementation (§9.10) rather than `gio_file_trash`, mounts via `udisks2`/`zbus` rather than `GVolumeMonitor` — avoids a second, heavier dependency (GLib/GIO) for a problem already solved at the protocol level for clipboard, and keeps `duet-platform` honestly reflecting what it does (talks to `wl_data_device`, freedesktop specs, and D-Bus interfaces directly) rather than wrapping a GNOME-specific abstraction that itself wraps those same things. The cost — reimplementing what GIO gives for free — is real but bounded and already partly paid: S-2's `smithay-client-toolkit` prototype is the pattern the rest of `duet-platform` follows.
+
+**ADR-006 / OQ-5: Hybrid — `opendal` for S3/WebDAV/FTP, hand-rolled for SFTP and SMB.** **Decided at G2 (2026-08-11).** Not a strict either/or: `design.md` §7.5's dependency list already separated `russh`/`libssh2` (SFTP) from `opendal` (S3/WebDAV/FTP breadth) before this ADR was formally written, and that split holds up under scrutiny rather than being an oversight to resolve one way —
+- **S3, WebDAV, FTP/FTPS via `opendal`**: these are exactly the protocols where `opendal` earns its dependency weight — broad, actively-maintained backend coverage Duet has no differentiated reason to reimplement, and FR-VFS-04's P1 priority means engineering time is better spent on the operation engine (Phase 5, the actual differentiator) than re-solving S3 multipart upload semantics. `opendal`'s own `Operator` abstraction is *not* exposed directly through `duet-vfs`; each protocol gets a thin `FileSystem` adapter (T-7.1.x) translating `opendal`'s capability/error model into Duet's own (`Caps` bitflags, `ErrorKind` taxonomy, `AsyncWriteCommit`'s write-then-atomic-publish split) — `opendal` is an implementation detail behind `duet-vfs`'s existing trait (T-2.2.2), never a leak into the rest of the app.
+- **SFTP via `russh`, hand-rolled `FileSystem` adapter**: SFTP is P1 and, per persona P2 ("the power sysadmin... over SSH"), a primary workflow rather than a nice-to-have — worth the extra control over connection pooling, resumable uploads (`APPEND_RESUME` capability), and host-key/TOFU handling (§13) that a generic abstraction would make harder to get exactly right. `opendal` support for SFTP has also historically lagged its S3/WebDAV/FTP support in maturity, reinforcing the split rather than complicating it.
+- **SMB, hand-rolled**: no mature pure-Rust `opendal` SMB backend exists as of this writing; a hand-rolled or FFI-wrapped (`libsmbclient`) adapter is the only real option regardless of this ADR's outcome.
+
+This closes OQ-5 (§17) and resolves it as the owner-less "G2" deadline required.
 
 ### 7.4 GPUI risk register (specific, not generic)
 
@@ -738,7 +749,7 @@ If this is one person's evenings, cut to **M2 + archives-read-only** and ship th
 | OQ-2 | Cross-application DnD on Wayland — feasible within GPUI, or protocol-level work? | G0 | S-3 |
 | OQ-3 | `gpui-component`'s Table at 1M rows — does it hold, and is its delegate API workable for SoA data? | G0 | S-1 |
 | OQ-4 | AT-SPI accessibility: is AccessKit integration tractable, and should we upstream it? | G4 | — |
-| OQ-5 | Own the remote-protocol stack, or lean on `opendal` for breadth and accept its abstraction? | G2 | — |
+| OQ-5 | Own the remote-protocol stack, or lean on `opendal` for breadth and accept its abstraction? | G2 | **Decided — ADR-006, §7.3: hybrid** |
 | OQ-6 | Flatpak permission posture (§15) | G5 | — |
 | OQ-7 | Native/Wine plugin bridge — worth it, or does it poison the security model? | Post-1.0 | — |
 | OQ-8 | Name and visual identity | G5 | — |
@@ -1036,6 +1047,6 @@ Every row below is sourced directly from `docs/keymap-tc.csv`; the **Duet decisi
 | ADR-001 | GPUI + gpui-component for the shell | **Accepted, unconditionally (G0 passed 2026-08-10)** |
 | ADR-002 | UI-framework-agnostic core | Accepted |
 | ADR-003 | Pin GPUI, isolate churn behind a compat shim | Accepted |
-| ADR-004 | WASM component plugins over native `.so` | Accepted |
-| ADR-005 | Own the trash/clipboard/mount integration rather than depend on GIO | Proposed |
-| ADR-006 | `opendal` vs. hand-rolled remote backends | Open (OQ-5) |
+| ADR-004 | WASM component plugins over native `.so` | **Accepted, finalized (G2, 2026-08-11) — S-7 confirmed 60–130x call-overhead margin** |
+| ADR-005 | Own the trash/clipboard/mount integration rather than depend on GIO | **Accepted, finalized (G2, 2026-08-11) — forced anyway by S-2's clipboard finding** |
+| ADR-006 | `opendal` vs. hand-rolled remote backends | **Decided (G2, 2026-08-11) — hybrid: opendal for S3/WebDAV/FTP, hand-rolled for SFTP/SMB** |

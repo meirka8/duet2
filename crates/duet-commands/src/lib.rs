@@ -45,15 +45,21 @@
 //! predicate evaluator can be driven by *any* UI framework, including none
 //! (a headless test harness, or a future CLI).
 //!
-//! # `duet-types` note
+//! # `duet-types` note (resolved at G2 consolidation)
 //!
-//! `crates/duet-types` (T-2.2.1) is still an empty skeleton on this branch
-//! (built in parallel on a sibling branch), so error/id types that would
-//! eventually live there (e.g. a shared `duet_types::Error`) are defined
-//! locally here for now: [`CommandIdError`], [`CommandError`],
-//! [`DuplicateCommandError`], [`keymap::KeyParseError`],
-//! [`PredicateParseError`]. `// TODO: replace with duet_types::X once
-//! T-2.2.1 lands` follow-up applies to all of them.
+//! This crate was built in parallel with T-2.2.1 (`duet-types`), before
+//! `duet_types::{ErrorKind, VfsError}` existed, so [`CommandIdError`],
+//! [`CommandError`], [`DuplicateCommandError`], [`keymap::KeyParseError`],
+//! and [`PredicateParseError`] were left as local types with a "replace
+//! once T-2.2.1 lands" TODO. Checked at G2 consolidation, now that both
+//! exist side by side: `duet_types::ErrorKind`/`VfsError` classify
+//! *filesystem/VFS* failures (`Retryable`/`Permission`/`Space`/`NotFound`/
+//! `Conflict`/`Fatal`, each carrying a `VPath`) — a different problem
+//! domain from parse errors and duplicate-registration errors, which have
+//! no filesystem path or retry semantics to speak of. These types
+//! **correctly stay local**; the TODO was itself the byproduct of `duet-
+//! types` being empty at the time, not a real shared-type gap. No
+//! reconciliation needed.
 
 mod command;
 mod id;
