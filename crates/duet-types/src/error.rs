@@ -22,6 +22,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::path::VPath;
 
 /// Linux errno values duet-types classifies by. Hand-rolled (not `libc`)
@@ -52,7 +54,14 @@ pub mod errno {
 }
 
 /// The six-way classification every VFS/ops failure is bucketed into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+///
+/// `Serialize`/`Deserialize` (added for T-2.3.1) are load-bearing, not
+/// decorative: `duet-ops`'s crash-safe journal and `JobReport` persist a
+/// classified error summary (kind + message + path) to disk/across the
+/// event stream, and design.md §9.3 is explicit that the taxonomy defined
+/// here is what those consumers must reuse rather than redefine. A plain
+/// C-like enum costs nothing extra to make serializable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, thiserror::Error)]
 pub enum ErrorKind {
     /// Transient: EINTR, EAGAIN, a dropped connection mid-request. Safe to
     /// retry with backoff.

@@ -12,3 +12,13 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+duet-types = { path = "../duet-types" }
+serde.workspace = true
+
+[dev-dependencies]
+# Only `duet-ops`'s own tests need a concrete wire format to round-trip
+# through (T-2.3.1's AC: "a hand-written plan ... serialises and
+# deserialises"); JSON is the obvious choice and is already precedented by
+# spikes/s5-copy-ladder. Not promoted to [workspace.dependencies] since no
+# other crate needs it yet.
+serde_json = "1"
