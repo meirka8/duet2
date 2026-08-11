@@ -77,11 +77,11 @@ impl FileSystem for LocalFs {
     }
 
     async fn open_read(&self, p: &VPath) -> Result<Box<dyn AsyncReadSeek>> {
-        Err(not_yet_implemented(p, "T-3.1.4"))
+        super::rw::open_read(p).map(|f| Box::new(f) as Box<dyn AsyncReadSeek>)
     }
 
-    async fn open_write(&self, p: &VPath, _o: WriteOpts) -> Result<Box<dyn AsyncWriteCommit>> {
-        Err(not_yet_implemented(p, "T-3.1.4"))
+    async fn open_write(&self, p: &VPath, o: WriteOpts) -> Result<Box<dyn AsyncWriteCommit>> {
+        super::rw::open_write(p, o).map(|h| Box::new(h) as Box<dyn AsyncWriteCommit>)
     }
 
     async fn create_dir(&self, p: &VPath, mode: Option<Mode>) -> Result<()> {

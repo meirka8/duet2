@@ -26,6 +26,7 @@ mod fs;
 mod guard;
 mod pathutil;
 mod readdir;
+mod rw;
 mod statx;
 mod traverse;
 
