@@ -27,6 +27,7 @@ mod guard;
 mod pathutil;
 mod readdir;
 mod statx;
+mod traverse;
 
 pub use fs::LocalFs;
 pub use guard::{assert_not_ui_thread, is_ui_thread, mark_ui_thread, unmark_ui_thread};

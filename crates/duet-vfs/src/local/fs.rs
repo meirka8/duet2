@@ -93,7 +93,7 @@ impl FileSystem for LocalFs {
 
     async fn remove(&self, p: &VPath, kind: RemoveKind) -> Result<()> {
         match kind {
-            RemoveKind::Recursive => Err(not_yet_implemented(p, "T-3.1.3")),
+            RemoveKind::Recursive => super::traverse::remove_recursive(p),
             RemoveKind::File | RemoveKind::EmptyDir => {
                 super::guard::assert_not_ui_thread();
                 let path = real_path(p);
