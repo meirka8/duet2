@@ -24,6 +24,7 @@
 
 mod fs;
 mod guard;
+mod meta;
 mod pathutil;
 mod readdir;
 mod rw;

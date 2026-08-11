@@ -57,7 +57,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # `FICLONE`, `copy_file_range`, and `*at`-relative syscalls directly rather
 # than going through `std::fs`). Pinned to the version S-4's spike already
 # benchmarked against real hardware (documentation/spikes/S-4.md).
-rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
 # Parallel batched `statx` (T-3.1.2), per S-4's finding that 12-16 threads
 # captures the achievable win and an unbounded pool is not needed.
 rayon = "1.12"

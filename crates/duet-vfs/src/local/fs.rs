@@ -22,21 +22,6 @@ use super::statx;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalFs;
 
-/// Placeholder for `FileSystem` methods this WBS slice hasn't reached yet.
-/// Returns a classified `Fatal` error naming the owning task rather than
-/// `unimplemented!()`/`todo!()`, so a caller exercising the whole trait
-/// (e.g. the conformance suite, T-3.1.8, mid-build) gets a normal `Result`
-/// to assert on instead of a panic.
-fn not_yet_implemented(p: &VPath, owning_task: &str) -> Box<VfsError> {
-    Box::new(
-        VfsError::new(
-            ErrorKind::Fatal,
-            format!("LocalFs: not yet implemented (lands in {owning_task})"),
-        )
-        .with_path(p.clone()),
-    )
-}
-
 #[async_trait]
 impl FileSystem for LocalFs {
     fn scheme(&self) -> &'static str {
@@ -67,13 +52,17 @@ impl FileSystem for LocalFs {
     async fn stat(&self, p: &VPath, follow: bool) -> Result<Metadata> {
         use crate::ListFields;
         let path = real_path(p);
-        statx::stat_one(
+        let mut md = statx::stat_one(
             CWD,
             path.to_str().unwrap_or_default(),
             ListFields::all(),
             follow,
         )
-        .map_err(|e| super::pathutil::rustix_err("statx", p, e))
+        .map_err(|e| super::pathutil::rustix_err("statx", p, e))?;
+        // T-3.1.5: statx has no concept of xattrs/ACL/SELinux label;
+        // enrich separately.
+        super::meta::enrich(&mut md, &path, ListFields::all());
+        Ok(md)
     }
 
     async fn open_read(&self, p: &VPath) -> Result<Box<dyn AsyncReadSeek>> {
@@ -123,8 +112,8 @@ impl FileSystem for LocalFs {
             .map_err(|e| super::pathutil::rustix_err("renameat2", from, e))
     }
 
-    async fn set_meta(&self, p: &VPath, _m: &MetaPatch) -> Result<()> {
-        Err(not_yet_implemented(p, "T-3.1.5"))
+    async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
+        super::meta::set_meta(p, m)
     }
 
     fn watch(&self, p: &VPath) -> Result<BoxStream<'_, ChangeEvent>> {
