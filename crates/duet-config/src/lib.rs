@@ -47,14 +47,20 @@
 //! it does its own I/O entirely off-thread and calls back with an already
 //! -deserialized value.
 
+/// `connections.toml` loading (remote backend profiles).
 pub mod connections;
 mod document;
 mod error;
 mod io;
+/// `keymap.toml` / `keymaps/*.toml` loading.
 pub mod keymap;
+/// Schema-versioned migration registry.
 pub mod migrate;
+/// XDG config path resolution.
 pub mod paths;
+/// `settings.toml` loading: the fully typed, primary config file.
 pub mod settings;
+/// `themes/*.toml` loading (color/spacing token files).
 pub mod theme;
 mod watch;
 
