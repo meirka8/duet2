@@ -29,6 +29,7 @@ mod entry_store;
 mod filter;
 mod model;
 mod name_arena;
+mod poll;
 mod sort;
 mod watch;
 
@@ -37,6 +38,10 @@ pub use entry_store::{EntryFlags, EntryStore};
 pub use filter::{FilterSpec, Mask, SavedFilter, SavedFilters};
 pub use model::{DirectoryModel, SelectionStats};
 pub use name_arena::{NameArena, NameSpan};
+pub use poll::{
+    AdaptivePoller, DirFingerprint, LocalDirPoller, PollConfig, PollStats, PollableDir,
+    needs_polling,
+};
 pub use sort::{SortColumn, SortOptions, Sorter};
 pub use watch::{DirWatcher, RecursiveMode, WatchUpdate};
 
