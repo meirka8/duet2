@@ -16,6 +16,7 @@ members = [
     "crates/duet",
     "helpers/duet-privileged",
     "plugins-sdk",
+    "benches",
 ]
 
 [workspace.package]
@@ -53,6 +54,17 @@ async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# T-3.3.4's corpus generator (`benches/`): seeded, index-local RNG draws so
+# generation is both deterministic-from-a-seed and safely parallelizable
+# (each entry's attributes depend only on `(seed, index)`, never on shared
+# mutable RNG state) -- see `benches/src/corpus.rs`.
+rand = "0.9"
+# Parallel corpus materialization at the 100k/1M scales (design.md's "notable
+# intended dependency" list already anticipates rayon for bulk fs work).
+rayon = "1.10"
+# T-3.3.4's benchmark harness. `harness = false` on every `[[bench]]` below;
+# criterion drives its own `main`/reporting instead of libtest's bench harness.
+criterion = "0.8"
 
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
