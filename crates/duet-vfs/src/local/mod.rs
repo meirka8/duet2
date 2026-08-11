@@ -22,6 +22,11 @@
 //! nothing in `duet-vfs` calls it itself). See `guard`'s module doc comment
 //! for the full mechanism and the zero-release-overhead argument.
 
+mod fs;
 mod guard;
+mod pathutil;
+mod readdir;
+mod statx;
 
+pub use fs::LocalFs;
 pub use guard::{assert_not_ui_thread, is_ui_thread, mark_ui_thread, unmark_ui_thread};

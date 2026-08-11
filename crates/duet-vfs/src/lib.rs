@@ -28,6 +28,7 @@ pub use dir_entry::DirEntry;
 pub use fs::FileSystem;
 pub use io::{AsyncReadSeek, AsyncWriteCommit, CommitOutcome};
 pub use list_opts::{ListFields, ListOpts};
+pub use local::LocalFs;
 pub use null::NullFs;
 pub use ops::{RemoveKind, RenameFlags};
 pub use watch::ChangeEvent;
