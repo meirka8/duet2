@@ -33,7 +33,7 @@ mod poll;
 mod sort;
 mod watch;
 
-pub use diff::{DirDiffBatch, DirEntryDiff};
+pub use diff::{DiffEntry, DirDiffBatch, DirEntryDiff, compute_diff};
 pub use entry_store::{EntryFlags, EntryStore};
 pub use filter::{FilterSpec, Mask, SavedFilter, SavedFilters};
 pub use model::{DirectoryModel, SelectionStats};

@@ -52,3 +52,7 @@ notify = { version = "8.2", default-features = false }
 # the shipped binary (dev-dependency only, never compiled into the
 # library or `duet` binary).
 tempfile = "3.27"
+# T-3.2.7's property test (random mutation sequences over compute_diff).
+# Already a workspace dependency (see root Cargo.toml, used the same way
+# by duet-types); dev-only here too.
+proptest.workspace = true

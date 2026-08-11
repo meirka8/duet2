@@ -131,6 +131,7 @@ dependencies = [
  "duet-types",
  "icu_collator",
  "notify",
+ "proptest",
  "rayon",
  "roaring",
  "tempfile",
