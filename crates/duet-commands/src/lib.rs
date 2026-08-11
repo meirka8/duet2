@@ -27,12 +27,35 @@
 //!   quick-search, kept consistent rather than picking a second fuzzy
 //!   matcher).
 //!
-//! Command *bodies* (real `CommandHandler` closures wired to
-//! `duet-ops`/`duet-index`/etc.) and the full 307-command catalogue
-//! registration are T-3.3.2's job ("Command registry + keymap parser +
-//! context predicate evaluator", Phase 3, AC: "200 commands register; the
-//! TC keymap loads; binding conflicts produce diagnostics with file/line").
-//! This crate is what T-3.3.2 builds on top of.
+//! # T-3.3.2 scope (Phase 3, complete)
+//!
+//! T-3.3.2 ("Command registry + keymap parser + context predicate
+//! evaluator", AC: "200 commands register; the TC keymap loads; binding
+//! conflicts produce diagnostics with file/line") builds on the above:
+//!
+//! - [`catalogue`]: parses `docs/commands.md`'s command table directly
+//!   (`include_str!`, so the registered catalogue can never drift from the
+//!   document) and registers all 302 of its concrete entries (the other 5
+//!   are documented plugin placeholder-classes, not real commands -- see
+//!   [`catalogue`]'s doc comment) via [`catalogue::register_builtin_commands`].
+//!   Every registered command's handler is a placeholder that returns
+//!   [`CommandError::HandlerFailed`] rather than doing anything -- wiring
+//!   real bodies to `duet-ops`/`duet-index` is later work.
+//! - [`keymap::tc_csv`]: loads `docs/keymap-tc.csv`'s 151-row TC keymap
+//!   survey, translating TC key/context spelling into this crate's grammar
+//!   and expanding its two range rows (`"Ctrl+1..Ctrl+9"` etc.) into literal
+//!   bindings so [`keymap::resolve_with_locations`]'s existing conflict
+//!   detection can catch the real collision the source data itself flags.
+//!   Verifying (rather than assuming, per the task brief) that every
+//!   binding's command resolves against the catalogue turned up a real
+//!   finding: roughly half of the CSV's unique command names are not in the
+//!   finalised catalogue -- see [`keymap::ResolvedKeymap::unknown_commands`]
+//!   and `keymap::tc_csv`'s tests.
+//! - [`keymap::resolve_with_locations`] / [`keymap::KeymapLayer`]: the
+//!   location-tracking generalisation of [`keymap::resolve`], so
+//!   [`keymap::KeymapDiagnostic`] can point at a real file/line instead of
+//!   always being `None` (the `SourceLocation` field [`keymap::resolve`]
+//!   itself leaves unpopulated, for plain TOML loads with no span tracking).
 //!
 //! # ADR-002: no GPUI dependency
 //!
@@ -61,6 +84,7 @@
 //! types` being empty at the time, not a real shared-type gap. No
 //! reconciliation needed.
 
+pub mod catalogue;
 mod command;
 mod id;
 pub mod keymap;
@@ -68,6 +92,10 @@ pub mod palette;
 pub mod predicate;
 mod registry;
 
+pub use catalogue::{
+    CatalogueEntry, CatalogueParseError, CatalogueRegistrationError, parse_catalogue,
+    register_builtin_commands,
+};
 pub use command::{
     ArgField, ArgKind, ArgValue, ArgsSchema, Command, CommandArgs, CommandCategory, CommandContext,
     CommandError, CommandHandler, CommandResult,
