@@ -15,6 +15,8 @@
 //! from `duet-types`), which is what makes it testable headless and
 //! reusable from `duet-ui` without a window.
 
+#[cfg(test)]
+mod alloc_track;
 mod diff;
 mod entry_store;
 mod model;
@@ -24,3 +26,12 @@ pub use diff::{DirDiffBatch, DirEntryDiff};
 pub use entry_store::{EntryFlags, EntryStore};
 pub use model::{DirectoryModel, SortColumn};
 pub use name_arena::{NameArena, NameSpan};
+
+/// Installed only for the crate's own unit-test binary (`cargo test -p
+/// duet-index`), never for normal builds -- see `alloc_track`'s doc
+/// comment. T-3.2.1's AC ("verified with a counting allocator") needs this
+/// wired at the binary root so `entry_store::tests` can gate tracking
+/// around just the measured phase.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_track::CountingAllocator = alloc_track::CountingAllocator;

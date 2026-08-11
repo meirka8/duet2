@@ -415,6 +415,104 @@ mod tests {
         assert_eq!(store.extended(id).unwrap().uid, Some(1000));
     }
 
+    /// T-3.2.1's AC, verified rather than documented: pushing 1M entries
+    /// with names under 24 bytes must not perform per-entry heap
+    /// allocations. Uses the `alloc_track` counting allocator installed
+    /// crate-wide for `cfg(test)` (see `lib.rs`).
+    ///
+    /// The push loop *does* allocate -- `NameArena` slabs flush at 64 KiB
+    /// (`SLAB_TARGET_BYTES`) and each flush both boxes the finished slab
+    /// and starts a fresh `String` for the next one (see
+    /// `name_arena.rs`'s `flush_slab`). That is expected, bounded, and not
+    /// "per entry": at ~16 B/name average (the synthetic names here are
+    /// 10-13 B) a 64 KiB slab holds ~4,000-6,000 names, so 1M entries
+    /// flush on the order of a few hundred times, not a million. The AC
+    /// text itself calls this out ("only during arena slab growth, which
+    /// is expected and bounded") -- this test asserts that bound
+    /// explicitly (a generous 2,000-event ceiling, well above the ~250-500
+    /// slab flushes expected, to avoid flaking on allocator/name-length
+    /// details while still catching a real regression to per-entry
+    /// allocation, which would blow the budget by 3-4 orders of
+    /// magnitude).
+    ///
+    /// `EntryStore::with_capacity` is used deliberately: this test targets
+    /// the interning path specifically, not `Vec` growth reallocation
+    /// (which is a separate, already-understood cost `with_capacity`
+    /// exists to avoid and which a real `read_dir` caller who knows an
+    /// approximate entry count would also avoid).
+    #[test]
+    fn push_1m_entries_under_24_bytes_has_bounded_allocations() {
+        const N: usize = 1_000_000;
+
+        let mut store = EntryStore::with_capacity(N);
+        let names: Vec<String> = (0..N).map(|i| format!("file_{i:07}.txt")).collect();
+        assert!(
+            names.iter().all(|n| n.len() < 24),
+            "test fixture invariant: names must be under 24 bytes"
+        );
+
+        let (_, snapshot) = crate::alloc_track::measure(|| {
+            for name in &names {
+                store.push(name, &brief(EntryKind::File, 0));
+            }
+        });
+
+        assert_eq!(store.len(), N);
+        // Sanity: growth reallocation is excluded by with_capacity, so the
+        // only expected allocator traffic is NameArena slab flushes
+        // (Box<str> allocation) and the interleaved String growth of
+        // `building` between flushes (bounded by SLAB_TARGET_BYTES, not by
+        // N). Neither scales with entry count once slab size is fixed.
+        assert!(
+            snapshot.total_events() < 2_000,
+            "expected a bounded number of allocation events from arena \
+             slab growth (not one per entry); got {snapshot:?} over {N} \
+             pushes -- this likely means a per-entry allocation crept back \
+             in (e.g. a String temporary, a Vec without with_capacity, or \
+             a Box<Metadata> being allocated on the brief-metadata path)"
+        );
+        // Bytes moved through the allocator should track the arena's own
+        // content (~13 B/name average here -> ~13 MB of name bytes, each
+        // byte crossing the allocator exactly once as its slab is boxed),
+        // not N times some larger per-entry constant. Budget generously at
+        // 4x the raw name-byte total to absorb slab-boundary rounding
+        // without masking an actual regression to per-entry allocation,
+        // which would blow this up by 1-2 further orders of magnitude.
+        let raw_name_bytes: usize = names.iter().map(|n| n.len()).sum();
+        let alloc_budget = (raw_name_bytes * 4) as u64;
+        assert!(
+            snapshot.alloc_bytes < alloc_budget,
+            "allocator moved {} bytes ({} allocs, {} reallocs, {} frees \
+             reclaiming {} bytes) for {N} pushes totalling {raw_name_bytes} \
+             raw name bytes -- expected at most {alloc_budget} bytes from \
+             bounded slab-sized buffers (each name byte crossing the \
+             allocator ~once via slab boxing), not something scaling with \
+             a larger per-entry constant",
+            snapshot.alloc_bytes,
+            snapshot.alloc_count,
+            snapshot.realloc_count,
+            snapshot.dealloc_count,
+            snapshot.dealloc_bytes
+        );
+
+        // T-3.2.1's companion size AC: "1M entries <= 120 MB". Same store,
+        // same 1M pushes above -- `approx_bytes` sums every SoA column plus
+        // the name arena (see the struct doc comment's byte-budget table),
+        // so this is checking accountable bytes, not process RSS (RSS also
+        // includes allocator fragmentation/slack, which isn't this crate's
+        // to control).
+        const BUDGET_BYTES: usize = 120 * 1024 * 1024;
+        let bytes = store.approx_bytes();
+        assert!(
+            bytes <= BUDGET_BYTES,
+            "1M entries used {} bytes ({:.1} MB), exceeding the {}-byte \
+             (120 MB) T-3.2.1 budget",
+            bytes,
+            bytes as f64 / (1024.0 * 1024.0),
+            BUDGET_BYTES
+        );
+    }
+
     #[test]
     fn fixed_column_width_matches_documented_budget() {
         // Sanity-checks the "34 B fixed total" arithmetic in the doc

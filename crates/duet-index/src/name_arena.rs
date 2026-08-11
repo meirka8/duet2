@@ -77,7 +77,15 @@ impl NameArena {
         NameArena {
             slabs: Vec::new(),
             slab_starts: vec![0],
-            building: String::new(),
+            // Reserved up front to `SLAB_TARGET_BYTES` rather than left to
+            // grow by doubling: a `String` that starts at 0 and doubles up
+            // to 64 KiB reallocates ~12 times per slab (T-3.2.1's counting-
+            // allocator test caught this: ~3,000 reallocs across ~250
+            // slabs for 1M entries, all avoidable). Reserving the known
+            // target up front turns that into exactly one allocation per
+            // slab, which is what the "bounded, not per-entry" AC is
+            // actually asking for.
+            building: String::with_capacity(SLAB_TARGET_BYTES),
         }
     }
 
@@ -125,7 +133,17 @@ impl NameArena {
         if self.building.is_empty() {
             return;
         }
-        let finished = std::mem::take(&mut self.building);
+        // `mem::replace` with a freshly-reserved `String`, not
+        // `mem::take` (which would leave the next `building` at capacity
+        // 0): every slab after the first needs the same one-allocation-
+        // per-slab treatment `new()` gives the first one, or `intern`
+        // would fall back to doubling-growth reallocations for slabs 2..n
+        // -- exactly the per-slab (not per-entry, but still avoidable)
+        // allocation traffic the capacity reservation in `new()` exists to
+        // eliminate. See T-3.2.1's allocation-counting test, which is what
+        // caught this.
+        let finished =
+            std::mem::replace(&mut self.building, String::with_capacity(SLAB_TARGET_BYTES));
         // `slab_starts.last()` is already `finished`'s start (it's a fixed
         // breakpoint, set the last time this ran, or at construction —
         // never mutated by `intern`; see the field doc comment). The new
