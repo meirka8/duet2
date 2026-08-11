@@ -205,7 +205,14 @@ impl From<std::io::Error> for VfsError {
 
 /// The crate-wide `Result` alias used throughout the VFS/ops stack (see
 /// design.md §9.1's `FileSystem` trait, which uses bare `Result<T>`).
-pub type Result<T, E = VfsError> = std::result::Result<T, E>;
+///
+/// The error is boxed (`Box<VfsError>`, not `VfsError` directly) because
+/// `VfsError` carries a `VPath` plus an optional source error and comes out
+/// to ~144 bytes — large enough that clippy's `result_large_err` correctly
+/// flags every `FileSystem` method paying that cost in the stack size of its
+/// `Result` even on the (far more common) `Ok` path. `?` continues to work
+/// unchanged: `Box<T>: From<T>` is a std blanket impl.
+pub type Result<T, E = Box<VfsError>> = std::result::Result<T, E>;
 
 #[cfg(test)]
 mod tests {

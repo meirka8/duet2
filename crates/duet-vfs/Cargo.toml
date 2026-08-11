@@ -12,3 +12,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+duet-types = { path = "../duet-types" }
+bitflags.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util"] }

@@ -40,6 +40,19 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 bitflags = "2.6"
 thiserror = "2.0"
 proptest = "1.5"
+# `duet-vfs`'s `FileSystem` trait (T-2.2.2, design.md §9.1) must be object
+# -safe: the mount table is `MountId -> Arc<dyn FileSystem>` (§9.1). Native
+# async-fn-in-trait is not object-safe (it desugars to a `-> impl Future`
+# return, which trait objects can't erase); `async-trait` desugars to a
+# boxed-future shape instead, which is. Used deliberately over native AFIT.
+async-trait = "0.1"
+# Only the io traits (`AsyncRead`/`AsyncWrite`/`AsyncSeek`) and stream/box
+# combinators are needed at the trait-definition layer -- no runtime ("rt"),
+# no fs/net backends. Keeps `duet-vfs` itself free of a Tokio runtime
+# dependency; backends (Phase 3+) pull in the runtime features they need.
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a

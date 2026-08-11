@@ -1,11 +1,34 @@
 // SPDX-License-Identifier: MIT
 //! FileSystem trait, registry, mount table, path resolution.
 //!
-//! Phase 2 (T-2.1.1) skeleton: this crate compiles as an empty workspace
-//! member. Trait and type definitions land in their own dedicated Phase 2
-//! tasks (see documentation/task.md) -- this file is intentionally close to
-//! empty until then.
+//! T-2.2.2 (design.md §9.1): the `FileSystem` trait plus its supporting
+//! types (`ListOpts`/`ListFields`, `WriteOpts`/`Mode`, `DirEntry`,
+//! `RemoveKind`, `RenameFlags`, `ChangeEvent`, `CopyOutcome`,
+//! `AsyncReadSeek`, `AsyncWriteCommit`) and a trivial `NullFs`
+//! implementation proving the trait shape is usable. The mount table and
+//! path-resolution logic that consumes this trait land in later Phase 2/6
+//! tasks (see documentation/task.md).
+
+mod copy;
+mod dir_entry;
+mod fs;
+mod io;
+mod list_opts;
+mod null;
+mod ops;
+mod watch;
+mod write_opts;
 
 pub mod archive;
 pub mod local;
 pub mod remote;
+
+pub use copy::CopyOutcome;
+pub use dir_entry::DirEntry;
+pub use fs::FileSystem;
+pub use io::{AsyncReadSeek, AsyncWriteCommit, CommitOutcome};
+pub use list_opts::{ListFields, ListOpts};
+pub use null::NullFs;
+pub use ops::{RemoveKind, RenameFlags};
+pub use watch::ChangeEvent;
+pub use write_opts::{Mode, WriteOpts};
