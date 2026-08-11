@@ -5,17 +5,9 @@ use roaring::RoaringBitmap;
 
 use crate::diff::DirDiffBatch;
 use crate::entry_store::EntryStore;
+use crate::sort::{self, SortKeys, SortOptions, Sorter};
 
-/// Which column drives the current sort, for [`DirectoryModel::sort_by`]
-/// (T-3.2.2's actual comparator/collation work is out of scope here --
-/// this is just the selector shape the Phase 2 API needs to exist).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortColumn {
-    Name,
-    Size,
-    Modified,
-    Kind,
-}
+pub use crate::sort::SortColumn;
 
 /// The panel model a single tab owns (design.md §9.2):
 ///
@@ -38,8 +30,27 @@ pub enum SortColumn {
 /// filtered view) that has no entry to point the cursor at. Modeling that
 /// as `None` is more honest than picking a magic in-band value and hoping
 /// nothing ever collides with it.
+///
+/// A second deviation, added by T-3.2.2/T-3.2.3: `order` is not stored
+/// directly as sketched above. It is derived from `full_order` (every live
+/// entry, sorted) by applying the active filter (T-3.2.3). Splitting the
+/// two is what lets a filter change recompute `order` (an `O(n)` scan)
+/// without re-sorting, and a sort change reuse the same filter without
+/// re-deriving it from scratch -- see `sort.rs`'s module doc comment and
+/// `filter.rs`'s (T-3.2.3) for the full reasoning.
 pub struct DirectoryModel {
     entries: EntryStore,
+    sorter: Sorter,
+    sort_options: SortOptions,
+    /// Precomputed per-column sort keys for `entries`, built for
+    /// `sort_options.column`. `None` only before the first sort (a freshly
+    /// populated, never-sorted model shows push order via `full_order`
+    /// falling back to identity -- see `resort`'s doc comment).
+    sort_keys: Option<SortKeys>,
+    /// Every live (non-tombstoned) entry, in the active sort order,
+    /// filter-independent. T-3.2.3's filtering derives `order` from this
+    /// without touching `sort_keys` or re-sorting.
+    full_order: Vec<u32>,
     /// Indices into `entries` (equivalently, `EntryId::index()` values),
     /// in the current sorted-and-filtered display order. This is what the
     /// virtualized table renders through; row `r` on screen is
@@ -62,6 +73,10 @@ impl DirectoryModel {
     pub fn new() -> Self {
         DirectoryModel {
             entries: EntryStore::new(),
+            sorter: Sorter::new(),
+            sort_options: SortOptions::default(),
+            sort_keys: None,
+            full_order: Vec::new(),
             order: Vec::new(),
             selection: RoaringBitmap::new(),
             cursor: None,
@@ -71,6 +86,17 @@ impl DirectoryModel {
 
     pub fn entries(&self) -> &EntryStore {
         &self.entries
+    }
+
+    /// Mutable access to the underlying store, for population/watch-driven
+    /// updates. Callers that push/remove entries through this must call
+    /// [`Self::sort_by`] (or a future incremental-update path) afterward to
+    /// bring `order`/`full_order` back in sync -- this method does not do
+    /// so implicitly, since a caller streaming many chunks in (design.md
+    /// §9.2's "one flush per frame, max") wants to batch several pushes
+    /// before paying for one resort, not resort after every single push.
+    pub fn entries_mut(&mut self) -> &mut EntryStore {
+        &mut self.entries
     }
 
     /// The current sorted-and-filtered render order. Length is the
@@ -92,6 +118,10 @@ impl DirectoryModel {
         self.generation
     }
 
+    pub fn sort_options(&self) -> SortOptions {
+        self.sort_options
+    }
+
     /// Read access to the currently visible names in display order, keyed
     /// by their stable id -- what FR-NAV-13's quick-search regime scores
     /// against on every keystroke (design.md §9.2: "Scoring reuses a
@@ -107,13 +137,47 @@ impl DirectoryModel {
         })
     }
 
-    /// Re-sorts (and re-filters, if a filter is active) `order` by the
-    /// given column. This is T-3.2.2's comparator/collation work
-    /// (natural-numeric mode, locale collation, directories-first) --
-    /// deliberately unimplemented here since T-2.5.1 owes the shape, not
-    /// the sorting algorithm.
-    pub fn sort_by(&mut self, _column: SortColumn, _ascending: bool) {
-        todo!("T-3.2.2: locale-aware column sort with precomputed sort keys")
+    /// Re-sorts (and re-applies the active filter to) `order` by the given
+    /// column. T-3.2.2's AC: locale-aware collation with a natural-numeric
+    /// mode and a directories-first grouping (see `sort.rs`), driven by
+    /// precomputed per-column keys so the comparator never re-derives a
+    /// collation key or re-reads a raw name mid-sort.
+    pub fn sort_by(&mut self, column: SortColumn, ascending: bool) {
+        self.sort_options.column = column;
+        self.sort_options.ascending = ascending;
+        self.resort();
+    }
+
+    /// Toggles the directories-first grouping policy (design.md §9.2:
+    /// "directories-first policy" -- T-3.2.2's AC calls this out as
+    /// "configurable" explicitly) and re-sorts to apply it.
+    pub fn set_dirs_first(&mut self, dirs_first: bool) {
+        self.sort_options.dirs_first = dirs_first;
+        self.resort();
+    }
+
+    /// Recomputes `sort_keys`/`full_order`/`order` from scratch for the
+    /// current `sort_options`. `O(n)` key generation (parallelized across
+    /// the name column, see `Sorter::build_keys`) plus an `O(n log n)`
+    /// stable sort over the precomputed keys.
+    ///
+    /// Filtering is not yet wired in here (T-3.2.3 lands it): until then,
+    /// `order` is always a full clone of `full_order`. T-3.2.3 replaces
+    /// that last step with the filter-application scan without touching
+    /// anything above it in this function.
+    fn resort(&mut self) {
+        let keys = self
+            .sorter
+            .build_keys(&self.entries, self.sort_options.column);
+        let mut full_order: Vec<u32> = (0..self.entries.len() as u32)
+            .filter(|&ix| !self.entries.is_tombstoned(EntryId::new(ix)))
+            .collect();
+        sort::sort_order(&mut full_order, &keys, self.sort_options);
+
+        self.order = full_order.clone();
+        self.full_order = full_order;
+        self.sort_keys = Some(keys);
+        self.generation += 1;
     }
 
     /// Applies a diff batch produced elsewhere (e.g. by the T-3.2.7
@@ -167,15 +231,13 @@ mod tests {
     #[test]
     fn ordered_names_follows_order_not_push_sequence() {
         let mut model = DirectoryModel::new();
-        let a = model
-            .entries
+        model
+            .entries_mut()
             .push("b_second", &Metadata::minimal(EntryKind::File));
-        let b = model
-            .entries
+        model
+            .entries_mut()
             .push("a_first", &Metadata::minimal(EntryKind::File));
-        // Simulate a completed sort by hand (sort_by itself is todo!()):
-        // display order is [b, a] even though push order was [a, b].
-        model.order = vec![b.index(), a.index()];
+        model.sort_by(SortColumn::Name, true);
 
         let names: Vec<_> = model.ordered_names().map(|(_, n)| n.to_string()).collect();
         assert_eq!(names, vec!["a_first", "b_second"]);
@@ -184,15 +246,50 @@ mod tests {
     #[test]
     fn selection_keyed_by_entry_id_survives_reorder() {
         let mut model = DirectoryModel::new();
-        let a = model.entries.push("a", &Metadata::minimal(EntryKind::File));
-        let b = model.entries.push("b", &Metadata::minimal(EntryKind::File));
-        model.order = vec![a.index(), b.index()];
+        let a = model
+            .entries_mut()
+            .push("z", &Metadata::minimal(EntryKind::File));
+        let b = model
+            .entries_mut()
+            .push("a", &Metadata::minimal(EntryKind::File));
         model.selection.insert(b.index());
 
-        // Reorder happens (hand-simulated, since sort_by is todo!()).
-        model.order = vec![b.index(), a.index()];
-
+        // Name-ascending puts b ("a") before a ("z").
+        model.sort_by(SortColumn::Name, true);
+        assert_eq!(model.order(), &[b.index(), a.index()]);
         assert!(model.selection().contains(b.index()));
         assert!(!model.selection().contains(a.index()));
+
+        // Re-sorting descending flips display order; selection (by
+        // EntryId, not position) is untouched.
+        model.sort_by(SortColumn::Name, false);
+        assert_eq!(model.order(), &[a.index(), b.index()]);
+        assert!(model.selection().contains(b.index()));
+        assert!(!model.selection().contains(a.index()));
+    }
+
+    #[test]
+    fn sort_by_bumps_generation() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("a", &Metadata::minimal(EntryKind::File));
+        let gen0 = model.generation();
+        model.sort_by(SortColumn::Name, true);
+        assert_eq!(model.generation(), gen0 + 1);
+    }
+
+    #[test]
+    fn tombstoned_entries_are_excluded_from_order() {
+        let mut model = DirectoryModel::new();
+        let a = model
+            .entries_mut()
+            .push("a", &Metadata::minimal(EntryKind::File));
+        let b = model
+            .entries_mut()
+            .push("b", &Metadata::minimal(EntryKind::File));
+        model.entries_mut().remove(a);
+        model.sort_by(SortColumn::Name, true);
+        assert_eq!(model.order(), &[b.index()]);
     }
 }
