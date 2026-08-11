@@ -1,0 +1,54 @@
+// content-plugin ~= TC's .wdx: custom columns / metadata fields (e.g. an
+// EXIF "Camera" column). Validated end-to-end at the call-boundary level
+// by the S-7 spike (spikes/s7-wasm-plugin/wit/content-plugin.wit); this is
+// that interface built out to the full handle-based design (see host.wit)
+// instead of the spike's simplified plain-`path: string` signature.
+
+interface content-plugin {
+    use types.{entry, handle, error};
+
+    enum field-kind {
+        text,
+        integer,
+        real,
+        boolean,
+        date,
+    }
+
+    record field-def {
+        name: string,
+        kind: field-kind,
+    }
+
+    variant field-value {
+        text(string),
+        integer(s64),
+        real(f64),
+        boolean(bool),
+        date(s64),
+        none,
+    }
+
+    /// What the plugin is being asked to compute a field for. `meta` is
+    /// always present (it costs the host nothing extra -- it's already
+    /// resident for the panel listing). `content` is present only when the
+    /// plugin's manifest `read-files` grant covers this entry; a
+    /// name/metadata-only field (e.g. "is this a backup file by
+    /// extension?") never needs it and the host does not pay the cost of
+    /// opening one.
+    record target {
+        meta: entry,
+        content: option<handle>,
+    }
+
+    /// List the columns/fields this plugin can compute. Called once at
+    /// load (or on capability/config change) -- not per-entry.
+    fields: func() -> list<field-def>;
+
+    /// Compute one field (by index into `fields()`) for one target.
+    /// Content-plugin calls run inline with panel scrolling/sorting and
+    /// are epoch-bounded per design.md §9.9 (default 2s); a slow plugin
+    /// degrades to `field-value::none` rather than stalling the panel
+    /// (T-8.1.1's enforcement, not this interface's concern).
+    value: func(target: target, field: u32) -> result<field-value, error>;
+}

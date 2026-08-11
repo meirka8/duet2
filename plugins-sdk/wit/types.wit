@@ -1,0 +1,55 @@
+// Shared types used across the host interface and every plugin-class
+// interface. Split out so `host.wit` and the five `*-plugin.wit` files can
+// `use types.{...}` instead of redefining the same records.
+
+interface types {
+    /// Opaque handle to a host-granted resource: an archive being read, a
+    /// write destination, a filesystem-plugin session, a file's content
+    /// for a viewer/content/command call, ... The plugin never receives a
+    /// filesystem path it could open itself. It receives a `handle` the
+    /// host minted *after* checking the manifest's capability grant, and
+    /// exchanges that handle for an actual byte stream via
+    /// `host.open-granted`. That indirection -- handle in, capability
+    /// check happens host-side, stream out -- is the entire security
+    /// argument for the plugin sandbox (design.md §9.9).
+    ///
+    /// A handle is scoped to the plugin call (or, for `fs-plugin`
+    /// sessions, to the `connect`/`disconnect` pair) that received it and
+    /// is not guaranteed valid outside that scope.
+    type handle = u32;
+
+    /// One directory-entry's worth of metadata, as the host already knows
+    /// it (cheap, non-sensitive, already visible in the panel -- unlike
+    /// file *content*, no capability grant is required to receive this).
+    record entry {
+        name: string,
+        size: u64,
+        mtime: s64,
+        mode: u32,
+        is-dir: bool,
+        is-symlink: bool,
+    }
+
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Error taxonomy shared by every plugin-class interface and by
+    /// `host`. Deliberately small and coarse: plugins reason about
+    /// *category* (retry? surface to user? not-applicable?), the host UI
+    /// owns the human-facing message via `host.log`/error context, not the
+    /// wire type.
+    variant error {
+        not-found,
+        permission-denied,
+        io(string),
+        cancelled,
+        unsupported,
+        invalid-argument(string),
+        internal(string),
+    }
+}

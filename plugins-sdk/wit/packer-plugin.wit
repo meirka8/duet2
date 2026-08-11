@@ -1,0 +1,32 @@
+// packer-plugin ~= TC's .wcx: registers an archive format the VFS can
+// browse/extract/pack through the normal UI. `archive`/`out`/`src` are
+// host-granted handles (see types.handle / host.open-granted) to the
+// archive's bytes and to extraction/add destinations and sources -- the
+// plugin parses/writes archive *structure*, the host still owns every byte
+// that crosses the sandbox boundary.
+
+interface packer-plugin {
+    use types.{entry, handle, error};
+
+    /// Sniff-test: does this plugin recognise the format? `head` is a
+    /// small header the host already read (no I/O capability needed for
+    /// probing); `name` is the display name only, for extension checks.
+    probe: func(head: list<u8>, name: string) -> bool;
+
+    /// List members of an archive. `archive` is a read-granted handle to
+    /// the archive's own bytes.
+    list-members: func(archive: handle) -> result<list<entry>, error>;
+
+    /// Extract one member into a host-granted destination. `out` is a
+    /// write-only handle the host already capability-checked against the
+    /// real extraction target.
+    extract: func(archive: handle, member: string, out: handle) -> result<_, error>;
+
+    /// Whether `add` is implemented at all (many archive formats are
+    /// read-only for a first-cut plugin).
+    can-write: func() -> bool;
+
+    /// Append or update one member, reading from a host-granted source.
+    /// Only called if `can-write()` returned `true`.
+    add: func(archive: handle, member: string, src: handle) -> result<_, error>;
+}
