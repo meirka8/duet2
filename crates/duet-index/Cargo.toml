@@ -38,3 +38,17 @@ icu_collator = "2.2"
 # measured 1M-entry total (keygen + sort) to ~85ms on a 24-core box, well
 # inside budget.
 rayon = "1.10"
+# T-3.2.5 watching. Named explicitly in design.md §7.5's dependency list
+# ("notify (inotify)"). `default-features = false` drops the `macos_fsevent`
+# default feature (pulls in macOS-only `fsevent-sys`) -- irrelevant weight
+# for a Linux-only target; the Linux inotify backend (via the `inotify`/
+# `mio` crates) is a target-specific dependency of `notify` itself, not
+# feature-gated, so it's present either way.
+notify = { version = "8.2", default-features = false }
+
+[dev-dependencies]
+# Test-only: T-3.2.5/T-3.2.6's watch/poll tests exercise real filesystem
+# create/delete/rename/modify against a scratch directory. Doesn't affect
+# the shipped binary (dev-dependency only, never compiled into the
+# library or `duet` binary).
+tempfile = "3.27"

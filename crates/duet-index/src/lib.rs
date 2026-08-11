@@ -30,6 +30,7 @@ mod filter;
 mod model;
 mod name_arena;
 mod sort;
+mod watch;
 
 pub use diff::{DirDiffBatch, DirEntryDiff};
 pub use entry_store::{EntryFlags, EntryStore};
@@ -37,6 +38,7 @@ pub use filter::{FilterSpec, Mask, SavedFilter, SavedFilters};
 pub use model::{DirectoryModel, SelectionStats};
 pub use name_arena::{NameArena, NameSpan};
 pub use sort::{SortColumn, SortOptions, Sorter};
+pub use watch::{DirWatcher, RecursiveMode, WatchUpdate};
 
 /// Installed only for the crate's own unit-test binary (`cargo test -p
 /// duet-index`), never for normal builds -- see `alloc_track`'s doc
