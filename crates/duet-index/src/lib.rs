@@ -30,6 +30,7 @@ mod filter;
 mod model;
 mod name_arena;
 mod poll;
+mod size_service;
 mod sort;
 mod watch;
 
@@ -42,6 +43,7 @@ pub use poll::{
     AdaptivePoller, DirFingerprint, LocalDirPoller, PollConfig, PollStats, PollableDir,
     needs_polling,
 };
+pub use size_service::{DirSizeKey, DirSizeService, SizeHandle, SizeOutcome};
 pub use sort::{SortColumn, SortOptions, Sorter};
 pub use watch::{DirWatcher, RecursiveMode, WatchUpdate};
 
