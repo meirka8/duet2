@@ -17,10 +17,26 @@ use super::readdir;
 use super::statx;
 
 /// The local Linux filesystem backend. Stateless today (no per-instance
-/// configuration yet) — later `T-3.1.x` work (T-3.1.7's per-mount property
-/// cache in particular) adds interior-mutable state here.
+/// configuration yet) — T-3.1.7's per-mount property cache lives in
+/// `local::probe` itself (a process-wide cache keyed by `st_dev`, not
+/// per-`LocalFs`-instance state, since every `LocalFs` addresses the same
+/// real filesystems regardless of how many instances exist).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalFs;
+
+impl LocalFs {
+    /// T-3.1.7: measured (not assumed) properties of the filesystem
+    /// containing `dir` -- `st_dev`, rotational/reflink/case-sensitivity
+    /// detection, cached per mount. Not part of the `FileSystem` trait
+    /// (which has no per-path `caps()` — see `local::probe`'s module doc
+    /// comment) — an inherent method on the concrete backend for callers
+    /// (a future status-bar "SSD/HDD" indicator, the copy engine's
+    /// strategy ladder, ...) that specifically need `LocalFs` detail
+    /// beyond the trait's backend-wide `Caps`.
+    pub fn probe_fs_properties(&self, dir: &VPath) -> Result<super::FsProps> {
+        super::probe::probe(dir)
+    }
+}
 
 #[async_trait]
 impl FileSystem for LocalFs {
@@ -126,8 +142,8 @@ impl FileSystem for LocalFs {
         ))
     }
 
-    async fn server_side_copy(&self, _from: &VPath, _to: &VPath) -> Result<CopyOutcome> {
-        Ok(CopyOutcome::Unsupported)
+    async fn server_side_copy(&self, from: &VPath, to: &VPath) -> Result<CopyOutcome> {
+        super::probe::accelerated_copy(from, to)
     }
 }
 
@@ -227,5 +243,56 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Conflict);
+    }
+
+    #[tokio::test]
+    async fn server_side_copy_on_tmpfs_copies_content() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("src.txt"), b"copy me").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let outcome = fs
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"))
+            .await
+            .unwrap();
+        match outcome {
+            CopyOutcome::Copied { bytes, reflinked } => {
+                assert_eq!(bytes, 7);
+                // tmpfs does not implement FICLONE (confirmed by
+                // local::probe::tests::probes_tmpfs_correctly); this must
+                // have gone through the copy_file_range fallback.
+                assert!(!reflinked);
+            }
+            CopyOutcome::Unsupported => panic!("expected an accelerated copy on tmpfs"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("dst.txt")).unwrap(),
+            b"copy me"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_side_copy_conflicts_when_destination_exists() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("src.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("dst.txt"), b"already here").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let err = fs
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Conflict);
+        assert_eq!(
+            std::fs::read(dir.path().join("dst.txt")).unwrap(),
+            b"already here"
+        );
+    }
+
+    #[test]
+    fn probe_fs_properties_reports_tmpfs() {
+        let dir = TempDir::new().unwrap();
+        let root = VPath::local(UnixPathBuf::new(dir.path().to_str().unwrap()).unwrap());
+        let fs = LocalFs;
+        let props = fs.probe_fs_properties(&root).unwrap();
+        assert_eq!(props.kind, crate::local::FsKind::Tmpfs);
     }
 }

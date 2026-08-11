@@ -26,6 +26,7 @@ mod fs;
 mod guard;
 mod meta;
 mod pathutil;
+mod probe;
 mod readdir;
 mod rw;
 mod statx;
@@ -33,3 +34,4 @@ mod traverse;
 
 pub use fs::LocalFs;
 pub use guard::{assert_not_ui_thread, is_ui_thread, mark_ui_thread, unmark_ui_thread};
+pub use probe::{FsKind, FsProps};
