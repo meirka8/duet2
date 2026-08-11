@@ -1,5 +1,7 @@
 /target
-Cargo.lock
+# Cargo.lock is committed: duet is a binary application (crates/duet), and
+# per Cargo's own convention bin crates should lock their dependency graph
+# for reproducible builds (feeds T-11.1.3's reproducible-build goal).
 
 /spikes/s8-packaging/hello-gpui/target/
 /spikes/s8-packaging/*.flatpak

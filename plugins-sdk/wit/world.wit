@@ -1,0 +1,37 @@
+// Ties the host interface and the five plugin-class interfaces together
+// per the Component Model. One world per plugin class rather than a single
+// combined world: a given plugin component implements exactly one class
+// (its manifest's `[plugin].kind`), so its world should only obligate it
+// to export that one interface -- not stub out the other four.
+//
+// Every world imports `host` and nothing else: no WASI, no ambient
+// filesystem/network/clock import anywhere in this package. That is
+// FR-PLUG-01 enforced structurally, not by convention (see host.wit and
+// design.md §9.9).
+
+package duet:plugin@0.1.0;
+
+world content-plugin-world {
+    import host;
+    export content-plugin;
+}
+
+world packer-plugin-world {
+    import host;
+    export packer-plugin;
+}
+
+world fs-plugin-world {
+    import host;
+    export fs-plugin;
+}
+
+world viewer-plugin-world {
+    import host;
+    export viewer-plugin;
+}
+
+world command-plugin-world {
+    import host;
+    export command-plugin;
+}

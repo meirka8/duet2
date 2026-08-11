@@ -1,0 +1,55 @@
+// Host-provided functions available (by import) to every plugin class.
+// This is the *only* way a guest touches the outside world: there is no
+// WASI preopen, no ambient filesystem or network import in any plugin
+// world in this package. Everything here is capability-checked host-side
+// against the plugin's manifest before it does anything -- see design.md
+// §9.9 ("The plugin never receives a filesystem path it can open... It
+// receives handles the host opened after checking the grant").
+
+interface host {
+    use types.{handle, level, error};
+
+    /// A live byte stream for a handle the host has already
+    /// capability-checked and opened on the plugin's behalf. This is the
+    /// *only* way bytes move between guest and host filesystem/network
+    /// I/O -- guests never see paths, sockets, or fds, only this resource.
+    ///
+    /// Whether `read` or `write` is meaningful depends on how the host
+    /// opened the underlying handle (e.g. a packer `extract`'s `out`
+    /// handle is write-only; a content-plugin's `content` handle is
+    /// read-only). Calling the wrong direction returns
+    /// `error::unsupported` rather than trapping.
+    resource granted-stream {
+        /// Read up to `max-len` bytes, advancing the stream's cursor.
+        /// Returns an empty list at EOF.
+        read: func(max-len: u32) -> result<list<u8>, error>;
+
+        /// Write `bytes`, returning the number actually written.
+        write: func(bytes: list<u8>) -> result<u32, error>;
+    }
+
+    /// Exchange a host-granted handle for a live stream. Fails with
+    /// `error::permission-denied` if the handle is unknown to the host or
+    /// its grant has since been revoked (e.g. the user disabled a
+    /// capability and the plugin was not yet reloaded) -- the check
+    /// happens here, host-side, every time, not by trusting the plugin to
+    /// have checked once.
+    open-granted: func(h: handle) -> result<granted-stream, error>;
+
+    /// Report progress on a long-running call (a packer `extract`, an
+    /// `fs-plugin` `get`/`put`, ...). Returns `false` if the user
+    /// cancelled, at which point the plugin should wind down promptly and
+    /// return `error::cancelled` rather than continuing.
+    progress: func(done: u64, total: u64) -> bool;
+
+    /// Structured log line, folded into the host's `tracing` output
+    /// (design.md §12) tagged with the plugin's manifest id.
+    log: func(level: level, msg: string);
+
+    /// Fetch a secret the plugin declared it needs (e.g. a remote
+    /// backend's stored password/token). Requires `cap:secrets` /
+    /// `[capabilities].secrets` in the plugin's manifest to name `key`;
+    /// otherwise returns `error::permission-denied`. Backed by the
+    /// Secret Service keyring (design.md §13), never by a config file.
+    secret-get: func(key: string) -> result<string, error>;
+}

@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/duet-types",
+    "crates/duet-vfs",
+    "crates/duet-ops",
+    "crates/duet-index",
+    "crates/duet-search",
+    "crates/duet-meta",
+    "crates/duet-commands",
+    "crates/duet-config",
+    "crates/duet-plugin",
+    "crates/duet-platform",
+    "crates/duet-widgets",
+    "crates/duet-ui",
+    "crates/duet",
+    "helpers/duet-privileged",
+    "plugins-sdk",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Pinned to the toolchain the Phase 0 spikes (S-1 in particular, which builds
+# gpui 0.2.2 directly) were empirically verified against. Bump only as a
+# deliberate task per design.md ADR-003's compile-and-smoke-gate process, not
+# implicitly by upgrading the local toolchain.
+rust-version = "1.97"
+license = "MIT"
+authors = ["Duet contributors"]
+repository = "https://github.com/meirka8/duet2"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+# Shared across crates once they need them (§7.5 dependency policy: additions
+# noted in the ADR log; each entry below is anticipated by design.md §7.5/§9.1).
+serde = { version = "1.0", features = ["derive", "rc"] }
+bitflags = "2.6"
+thiserror = "2.0"
+proptest = "1.5"
+# `duet-vfs`'s `FileSystem` trait (T-2.2.2, design.md §9.1) must be object
+# -safe: the mount table is `MountId -> Arc<dyn FileSystem>` (§9.1). Native
+# async-fn-in-trait is not object-safe (it desugars to a `-> impl Future`
+# return, which trait objects can't erase); `async-trait` desugars to a
+# boxed-future shape instead, which is. Used deliberately over native AFIT.
+async-trait = "0.1"
+# Only the io traits (`AsyncRead`/`AsyncWrite`/`AsyncSeek`) and stream/box
+# combinators are needed at the trait-definition layer -- no runtime ("rt"),
+# no fs/net backends. Keeps `duet-vfs` itself free of a Tokio runtime
+# dependency; backends (Phase 3+) pull in the runtime features they need.
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[profile.dev]
+# debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
+# debug_assert!-based check and is load-bearing for NFR-02, not decorative.
+debug-assertions = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
