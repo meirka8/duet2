@@ -10,6 +10,16 @@ use crate::sort::{self, SortKeys, SortOptions, Sorter};
 
 pub use crate::sort::SortColumn;
 
+/// Cheap-to-read summary of the current selection (T-3.2.4's AC). Both
+/// fields are maintained incrementally by [`DirectoryModel`]'s selection
+/// methods, so reading this is an `O(1)` struct copy, never a scan over
+/// the selected set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SelectionStats {
+    pub count: u64,
+    pub total_bytes: u64,
+}
+
 /// The panel model a single tab owns (design.md §9.2):
 ///
 /// ```text
@@ -63,8 +73,20 @@ pub struct DirectoryModel {
     order: Vec<u32>,
     /// Selected entries, keyed by stable `EntryId` rather than display
     /// position, so a re-sort or a filter change doesn't perturb the
-    /// selected set (T-3.2.4's AC).
+    /// selected set (T-3.2.4's AC). `RoaringBitmap` over `EntryId::index()`
+    /// values: compressed, so a large contiguous or sparse selection (a
+    /// shift-click range, "select all") costs far less than one bit per
+    /// live entry.
     selection: RoaringBitmap,
+    /// Sum of `entries.size(id)` for every `id` in `selection`, maintained
+    /// incrementally by every method that mutates `selection` (never
+    /// recomputed by scanning the whole selection). This is what makes
+    /// [`Self::selection_stats`] an `O(1)` read regardless of selection
+    /// size -- T-3.2.4's AC ("selection statistics... update in <= 5ms
+    /// after a selection change") is trivial once the running total is
+    /// already right there instead of needing a fresh reduction over
+    /// (potentially) 500k+ ids on every call.
+    selected_bytes: u64,
     cursor: Option<EntryId>,
     /// Bumped on every mutation (population, sort, filter, watch-driven
     /// update). Cheap diffing and stale-batch detection (see
@@ -85,6 +107,7 @@ impl DirectoryModel {
             filter: None,
             order: Vec::new(),
             selection: RoaringBitmap::new(),
+            selected_bytes: 0,
             cursor: None,
             generation: 0,
         }
@@ -125,6 +148,57 @@ impl DirectoryModel {
 
     pub fn selection(&self) -> &RoaringBitmap {
         &self.selection
+    }
+
+    /// `O(1)`: count and total byte size of the current selection. See
+    /// `selected_bytes`'s field doc comment for why this never scans.
+    pub fn selection_stats(&self) -> SelectionStats {
+        SelectionStats {
+            count: self.selection.len(),
+            total_bytes: self.selected_bytes,
+        }
+    }
+
+    pub fn is_selected(&self, id: EntryId) -> bool {
+        self.selection.contains(id.index())
+    }
+
+    /// Adds `id` to the selection. A no-op (including for `selected_bytes`)
+    /// if `id` was already selected.
+    pub fn select(&mut self, id: EntryId) {
+        if self.selection.insert(id.index()) {
+            self.selected_bytes += self.entries.size(id);
+        }
+    }
+
+    /// Removes `id` from the selection. A no-op if it wasn't selected.
+    pub fn deselect(&mut self, id: EntryId) {
+        if self.selection.remove(id.index()) {
+            self.selected_bytes -= self.entries.size(id);
+        }
+    }
+
+    pub fn toggle_selection(&mut self, id: EntryId) {
+        if self.is_selected(id) {
+            self.deselect(id);
+        } else {
+            self.select(id);
+        }
+    }
+
+    /// Selects every id in `ids` (e.g. a shift-click range, or "select
+    /// all" passing `self.order().iter().copied().map(EntryId::new)`).
+    /// `O(k)` in the number of ids given, same as `k` individual `select`
+    /// calls but without `k` separate method-call overheads.
+    pub fn select_many(&mut self, ids: impl IntoIterator<Item = EntryId>) {
+        for id in ids {
+            self.select(id);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.selected_bytes = 0;
     }
 
     pub fn cursor(&self) -> Option<EntryId> {
@@ -192,7 +266,26 @@ impl DirectoryModel {
         self.full_order = full_order;
         self.sort_keys = Some(keys);
         self.order = self.filtered_order();
+        self.prune_selection_to_live();
         self.generation += 1;
+    }
+
+    /// Drops any selected id that has since been tombstoned (e.g. a watch-
+    /// driven delete, once T-3.2.7 wires diffs through here), keeping
+    /// `selected_bytes` from silently drifting away from the truth. `O(k)`
+    /// in selection size (`RoaringBitmap` iteration), not `O(n)` in entry
+    /// count -- a resort already touches every live entry once for the
+    /// sort itself, but selection is typically far smaller than the full
+    /// listing, so scanning *it* instead is the cheaper direction.
+    fn prune_selection_to_live(&mut self) {
+        let stale: Vec<u32> = self
+            .selection
+            .iter()
+            .filter(|&ix| self.entries.is_tombstoned(EntryId::new(ix)))
+            .collect();
+        for ix in stale {
+            self.deselect(EntryId::new(ix));
+        }
     }
 
     /// Replaces the active filter and re-derives `order` from the
@@ -302,7 +395,7 @@ mod tests {
         let b = model
             .entries_mut()
             .push("a", &Metadata::minimal(EntryKind::File));
-        model.selection.insert(b.index());
+        model.select(b);
 
         // Name-ascending puts b ("a") before a ("z").
         model.sort_by(SortColumn::Name, true);
@@ -445,5 +538,160 @@ mod tests {
                 "filtering 1M entries took {elapsed:?}, over the 80ms T-3.2.3 budget"
             );
         }
+    }
+
+    #[test]
+    fn selection_stats_track_count_and_bytes_incrementally() {
+        let mut model = DirectoryModel::new();
+        let mut meta = Metadata::minimal(EntryKind::File);
+        meta.size = 100;
+        let a = model.entries_mut().push("a", &meta);
+        meta.size = 250;
+        let b = model.entries_mut().push("b", &meta);
+
+        assert_eq!(model.selection_stats(), SelectionStats::default());
+
+        model.select(a);
+        assert_eq!(
+            model.selection_stats(),
+            SelectionStats {
+                count: 1,
+                total_bytes: 100
+            }
+        );
+        model.select(b);
+        assert_eq!(
+            model.selection_stats(),
+            SelectionStats {
+                count: 2,
+                total_bytes: 350
+            }
+        );
+        // Selecting an already-selected id is a no-op, not double-counted.
+        model.select(a);
+        assert_eq!(model.selection_stats().total_bytes, 350);
+
+        model.deselect(a);
+        assert_eq!(
+            model.selection_stats(),
+            SelectionStats {
+                count: 1,
+                total_bytes: 250
+            }
+        );
+
+        model.toggle_selection(a);
+        model.toggle_selection(b);
+        assert_eq!(
+            model.selection_stats(),
+            SelectionStats {
+                count: 1,
+                total_bytes: 100
+            }
+        );
+
+        model.clear_selection();
+        assert_eq!(model.selection_stats(), SelectionStats::default());
+    }
+
+    #[test]
+    fn selecting_500k_then_resorting_preserves_the_exact_set_by_id() {
+        use std::collections::HashSet;
+
+        const N: usize = 500_000;
+        let mut model = DirectoryModel::new();
+        let mut ids = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut meta = Metadata::minimal(EntryKind::File);
+            meta.size = i as u64;
+            ids.push(
+                model
+                    .entries_mut()
+                    .push(&format!("entry_{i:07}.txt"), &meta),
+            );
+        }
+        model.sort_by(SortColumn::Name, true);
+
+        // Select every other entry -- 250k of the 500k, by EntryId, before
+        // any sort has happened relative to this selection pass.
+        model.select_many(ids.iter().copied().step_by(2).collect::<Vec<_>>());
+        let expected: HashSet<u32> = ids.iter().step_by(2).map(|id| id.index()).collect();
+        assert_eq!(model.selection_stats().count as usize, expected.len());
+
+        let bytes_before = model.selection_stats().total_bytes;
+
+        // Re-sort by a different column, then a different direction --
+        // this permutes `order`/`full_order` completely.
+        model.sort_by(SortColumn::Size, true);
+        let selected_after_size_sort: HashSet<u32> = model.selection().iter().collect();
+        assert_eq!(selected_after_size_sort, expected);
+        assert_eq!(model.selection_stats().total_bytes, bytes_before);
+
+        model.sort_by(SortColumn::Name, false);
+        let selected_after_name_desc: HashSet<u32> = model.selection().iter().collect();
+        assert_eq!(selected_after_name_desc, expected);
+        assert_eq!(model.selection_stats().total_bytes, bytes_before);
+    }
+
+    #[test]
+    fn selection_stats_update_within_budget_after_a_selection_change() {
+        use std::time::Instant;
+
+        const N: usize = 500_000;
+        let mut model = DirectoryModel::new();
+        let mut ids = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut meta = Metadata::minimal(EntryKind::File);
+            meta.size = 1;
+            ids.push(
+                model
+                    .entries_mut()
+                    .push(&format!("entry_{i:07}.txt"), &meta),
+            );
+        }
+        model.sort_by(SortColumn::Name, true);
+
+        let start = Instant::now();
+        model.select_many(ids);
+        let select_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let stats = model.selection_stats();
+        let read_elapsed = start.elapsed();
+
+        assert_eq!(stats.count as usize, N);
+        assert_eq!(stats.total_bytes as usize, N);
+        // T-3.2.4's AC: "selection statistics... update in <= 5ms after a
+        // selection change". `selection_stats()` itself is an O(1) struct
+        // copy (see its doc comment) so it's trivially inside budget; what
+        // this actually exercises is that reading stats right after a
+        // large selection change doesn't require any deferred/batched
+        // recomputation to catch up first.
+        if !cfg!(debug_assertions) {
+            assert!(
+                read_elapsed.as_millis() <= 5,
+                "selection_stats() took {read_elapsed:?} after selecting {N} entries \
+                 ({select_elapsed:?} to select) -- expected an O(1) read"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstoning_a_selected_entry_prunes_it_from_selection_on_resort() {
+        let mut model = DirectoryModel::new();
+        let mut meta = Metadata::minimal(EntryKind::File);
+        meta.size = 42;
+        let a = model.entries_mut().push("a", &meta);
+        let b = model.entries_mut().push("b", &meta);
+        model.select(a);
+        model.select(b);
+        assert_eq!(model.selection_stats().total_bytes, 84);
+
+        model.entries_mut().remove(a);
+        model.sort_by(SortColumn::Name, true);
+
+        assert!(!model.is_selected(a));
+        assert!(model.is_selected(b));
+        assert_eq!(model.selection_stats().total_bytes, 42);
     }
 }

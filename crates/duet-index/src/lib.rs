@@ -34,7 +34,7 @@ mod sort;
 pub use diff::{DirDiffBatch, DirEntryDiff};
 pub use entry_store::{EntryFlags, EntryStore};
 pub use filter::{FilterSpec, Mask, SavedFilter, SavedFilters};
-pub use model::DirectoryModel;
+pub use model::{DirectoryModel, SelectionStats};
 pub use name_arena::{NameArena, NameSpan};
 pub use sort::{SortColumn, SortOptions, Sorter};
 
