@@ -5,6 +5,7 @@ use roaring::RoaringBitmap;
 
 use crate::diff::DirDiffBatch;
 use crate::entry_store::EntryStore;
+use crate::filter::FilterSpec;
 use crate::sort::{self, SortKeys, SortOptions, Sorter};
 
 pub use crate::sort::SortColumn;
@@ -51,6 +52,10 @@ pub struct DirectoryModel {
     /// filter-independent. T-3.2.3's filtering derives `order` from this
     /// without touching `sort_keys` or re-sorting.
     full_order: Vec<u32>,
+    /// The active filter (T-3.2.3), or `None` for "everything visible"
+    /// (equivalent to `FilterSpec { show_hidden: true, .. }` but avoids
+    /// allocating/evaluating a no-op filter on the hot path).
+    filter: Option<FilterSpec>,
     /// Indices into `entries` (equivalently, `EntryId::index()` values),
     /// in the current sorted-and-filtered display order. This is what the
     /// virtualized table renders through; row `r` on screen is
@@ -77,6 +82,7 @@ impl DirectoryModel {
             sort_options: SortOptions::default(),
             sort_keys: None,
             full_order: Vec::new(),
+            filter: None,
             order: Vec::new(),
             selection: RoaringBitmap::new(),
             cursor: None,
@@ -104,6 +110,17 @@ impl DirectoryModel {
     /// (tombstoned or filtered-out entries are excluded).
     pub fn order(&self) -> &[u32] {
         &self.order
+    }
+
+    /// Every live entry in sort order, ignoring the active filter --
+    /// exposed mainly so tests (and any future "clear filter" UI path) can
+    /// observe that filtering never perturbs it.
+    pub fn full_order(&self) -> &[u32] {
+        &self.full_order
+    }
+
+    pub fn filter(&self) -> Option<&FilterSpec> {
+        self.filter.as_ref()
     }
 
     pub fn selection(&self) -> &RoaringBitmap {
@@ -159,12 +176,10 @@ impl DirectoryModel {
     /// Recomputes `sort_keys`/`full_order`/`order` from scratch for the
     /// current `sort_options`. `O(n)` key generation (parallelized across
     /// the name column, see `Sorter::build_keys`) plus an `O(n log n)`
-    /// stable sort over the precomputed keys.
-    ///
-    /// Filtering is not yet wired in here (T-3.2.3 lands it): until then,
-    /// `order` is always a full clone of `full_order`. T-3.2.3 replaces
-    /// that last step with the filter-application scan without touching
-    /// anything above it in this function.
+    /// stable sort over the precomputed keys, then one `O(n)` filter scan
+    /// (`filtered_order`) to derive `order` -- the expensive parts (key
+    /// generation, sorting) never re-run just because the filter changes;
+    /// see [`Self::set_filter`].
     fn resort(&mut self) {
         let keys = self
             .sorter
@@ -174,10 +189,45 @@ impl DirectoryModel {
             .collect();
         sort::sort_order(&mut full_order, &keys, self.sort_options);
 
-        self.order = full_order.clone();
         self.full_order = full_order;
         self.sort_keys = Some(keys);
+        self.order = self.filtered_order();
         self.generation += 1;
+    }
+
+    /// Replaces the active filter and re-derives `order` from the
+    /// already-sorted `full_order` with a single `O(n)` scan through
+    /// [`FilterSpec::matches`]. Does **not** touch `sort_keys`/`full_order`
+    /// or call `Sorter::build_keys`/`sort::sort_order` -- T-3.2.3's AC:
+    /// changing the filter must not force a re-sort.
+    pub fn set_filter(&mut self, filter: Option<FilterSpec>) {
+        self.filter = filter;
+        self.order = self.filtered_order();
+        self.generation += 1;
+    }
+
+    /// Scans `full_order` through the active filter (or passes everything
+    /// through, if `self.filter` is `None`). Pulled out as its own method
+    /// so both `resort` (sort changed, filter reapplied) and `set_filter`
+    /// (filter changed, sort reused) share one implementation of "what does
+    /// visible mean right now" rather than two copies that could drift.
+    fn filtered_order(&self) -> Vec<u32> {
+        match &self.filter {
+            None => self.full_order.clone(),
+            Some(spec) => self
+                .full_order
+                .iter()
+                .copied()
+                .filter(|&ix| {
+                    let id = EntryId::new(ix);
+                    spec.matches(
+                        self.entries.name(id),
+                        self.entries.flags(id).hidden(),
+                        self.entries.kind(id),
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// Applies a diff batch produced elsewhere (e.g. by the T-3.2.7
@@ -291,5 +341,109 @@ mod tests {
         model.entries_mut().remove(a);
         model.sort_by(SortColumn::Name, true);
         assert_eq!(model.order(), &[b.index()]);
+    }
+
+    #[test]
+    fn filter_narrows_order_without_touching_full_order() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("main.rs", &Metadata::minimal(EntryKind::File));
+        model
+            .entries_mut()
+            .push("readme.md", &Metadata::minimal(EntryKind::File));
+        model
+            .entries_mut()
+            .push(".gitignore", &Metadata::minimal(EntryKind::File));
+        model.sort_by(SortColumn::Name, true);
+
+        let full_before = model.full_order().to_vec();
+        // `filter: None` means "everything visible" (see its field doc
+        // comment), so the dotfile is included here too.
+        assert_eq!(full_before.len(), 3);
+
+        model.set_filter(Some(crate::filter::FilterSpec {
+            show_hidden: false,
+            quick_filter: None,
+            mask: Some(crate::filter::Mask::new("*.rs")),
+        }));
+
+        // full_order is untouched by a filter change -- same 3 entries,
+        // same sort order -- only `order` narrows.
+        assert_eq!(model.full_order(), full_before.as_slice());
+        let visible: Vec<_> = model.ordered_names().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(visible, vec!["main.rs"]);
+
+        // Clearing the filter restores full visibility without a resort.
+        model.set_filter(None);
+        let visible: Vec<_> = model.ordered_names().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(visible, vec![".gitignore", "main.rs", "readme.md"]);
+    }
+
+    #[test]
+    fn changing_sort_reapplies_the_active_filter() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("b.rs", &Metadata::minimal(EntryKind::File));
+        model
+            .entries_mut()
+            .push("a.txt", &Metadata::minimal(EntryKind::File));
+        model
+            .entries_mut()
+            .push("a.rs", &Metadata::minimal(EntryKind::File));
+        model.sort_by(SortColumn::Name, true);
+        model.set_filter(Some(crate::filter::FilterSpec {
+            show_hidden: true,
+            quick_filter: None,
+            mask: Some(crate::filter::Mask::new("*.rs")),
+        }));
+        let visible: Vec<_> = model.ordered_names().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(visible, vec!["a.rs", "b.rs"]);
+
+        // Re-sorting descending: filter (still "*.rs") stays applied.
+        model.sort_by(SortColumn::Name, false);
+        let visible: Vec<_> = model.ordered_names().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(visible, vec!["b.rs", "a.rs"]);
+        assert!(model.filter().is_some());
+    }
+
+    #[test]
+    fn filter_over_1m_entries_completes_within_budget() {
+        use std::time::Instant;
+
+        const N: usize = 1_000_000;
+        let mut model = DirectoryModel::new();
+        for i in 0..N {
+            let kind = if i % 5 == 0 {
+                EntryKind::Directory
+            } else {
+                EntryKind::File
+            };
+            let ext = if i % 3 == 0 { "rs" } else { "txt" };
+            model
+                .entries_mut()
+                .push(&format!("entry_{i:07}.{ext}"), &Metadata::minimal(kind));
+        }
+        model.sort_by(SortColumn::Name, true);
+
+        let start = Instant::now();
+        model.set_filter(Some(crate::filter::FilterSpec {
+            show_hidden: true,
+            quick_filter: None,
+            mask: Some(crate::filter::Mask::new("*.rs")),
+        }));
+        let elapsed = start.elapsed();
+
+        assert!(!model.order().is_empty());
+        // T-3.2.3's AC: "filter over 1M entries <= 80ms". Only enforced
+        // under --release for the same reason sort.rs's 1M-entry test is:
+        // an unoptimized debug build isn't what the AC's number is about.
+        if !cfg!(debug_assertions) {
+            assert!(
+                elapsed.as_millis() <= 80,
+                "filtering 1M entries took {elapsed:?}, over the 80ms T-3.2.3 budget"
+            );
+        }
     }
 }

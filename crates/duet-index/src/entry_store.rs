@@ -241,6 +241,12 @@ impl EntryStore {
         let mut flags = EntryFlags::new(metadata.kind);
         let has_extended = has_extended_fields(metadata);
         flags.set_has_extended(has_extended);
+        // T-3.2.3's "hidden files (dotfile convention)": `Metadata` has no
+        // backend-reported `hidden` field (POSIX has none to report --
+        // this *is* the POSIX convention), so it's derived from the name
+        // at push time, once, rather than re-checking `name.starts_with('.')`
+        // on every filter evaluation.
+        flags.set_hidden(name.starts_with('.'));
         self.flags.push(flags);
         self.extended
             .push(has_extended.then(|| Box::new(metadata.clone())));

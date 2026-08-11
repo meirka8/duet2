@@ -26,12 +26,14 @@
 mod alloc_track;
 mod diff;
 mod entry_store;
+mod filter;
 mod model;
 mod name_arena;
 mod sort;
 
 pub use diff::{DirDiffBatch, DirEntryDiff};
 pub use entry_store::{EntryFlags, EntryStore};
+pub use filter::{FilterSpec, Mask, SavedFilter, SavedFilters};
 pub use model::DirectoryModel;
 pub use name_arena::{NameArena, NameSpan};
 pub use sort::{SortColumn, SortOptions, Sorter};
