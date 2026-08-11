@@ -1,0 +1,32 @@
+// command-plugin: Duet-native, no TC equivalent. Registers commands/menu
+// items into the same command registry every built-in command lives in
+// (design.md §9.4), so plugin commands are bindable and palette-searchable
+// like any other. Ids are namespaced by the host as
+// `plugin.command.<manifest-id>.<id>` (see docs/commands.md and the G1
+// gate report's FR-PLUG-02 placeholder-id note).
+
+interface command-plugin {
+    use types.{handle, error};
+
+    record command-def {
+        id: string,
+        title: string,
+        category: string,
+    }
+
+    record selection-entry {
+        name: string,
+        is-dir: bool,
+    }
+
+    /// Contributed commands/menu items. Called once at load.
+    commands: func() -> list<command-def>;
+
+    /// Invoke one of the ids from `commands()` with the current panel
+    /// selection. `content` is parallel to `selection` (same length,
+    /// same order): an entry the manifest's `read-files` grant covers
+    /// content for gets `some(handle)`; every other entry gets `none`, so
+    /// a plugin cannot infer anything about grant boundaries beyond what
+    /// it was already told at install time.
+    invoke: func(id: string, selection: list<selection-entry>, content: list<option<handle>>) -> result<_, error>;
+}

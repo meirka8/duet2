@@ -1,0 +1,31 @@
+// viewer-plugin ~= TC's .wlx: a custom F3 preview. Two render paths, per
+// design.md §9.9's prose ("probe + render-to-surface or
+// render-to-markdown"): the preferred, cheaper-to-sandbox path where the
+// host owns layout and the plugin only produces text, and an escape hatch
+// for formats markdown can't represent.
+
+interface viewer-plugin {
+    use types.{handle, error};
+
+    record surface {
+        width: u32,
+        height: u32,
+        /// Tightly packed RGBA8, `width * height * 4` bytes.
+        rgba8: list<u8>,
+    }
+
+    /// Does this plugin want to render `name`, given a content sniff the
+    /// host already read?
+    probe: func(head: list<u8>, name: string) -> bool;
+
+    /// Preferred path: return Markdown-ish text: the host does
+    /// layout/rendering (same text-viewer machinery as any other file),
+    /// the plugin only ever produces a string. `content` is a
+    /// read-granted handle to the file's bytes.
+    render-to-markdown: func(content: handle) -> result<string, error>;
+
+    /// Escape hatch for formats markdown can't represent (a custom image
+    /// codec, a waveform view, ...). The host proposes a maximum size;
+    /// the plugin returns whatever it actually produced (<= the max).
+    render-to-surface: func(content: handle, max-width: u32, max-height: u32) -> result<surface, error>;
+}

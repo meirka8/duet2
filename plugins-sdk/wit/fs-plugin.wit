@@ -1,0 +1,47 @@
+// fs-plugin ~= TC's .wfx: mounts a VFS backend (an S3 bucket, a custom
+// protocol, ...). `path`/`dir`/`old-path`/`new-path` strings are paths
+// *within this backend's own namespace* (an FTP path, an S3 key) -- not host-local
+// filesystem paths, so passing them as plain strings carries none of the
+// ambient-authority risk that a local path would; the plugin only ever
+// interprets them against whatever remote/virtual store it itself
+// implements. The local half of any transfer (`get`'s `dest`, `put`'s
+// `src`) is still handle-mediated, per host.wit.
+
+interface fs-plugin {
+    use types.{entry, handle, error};
+
+    /// Capability bits this backend instance actually provides --
+    /// answered honestly, not aspirationally: the VFS conformance suite
+    /// (design.md §14.2) checks a backend claiming `atomic-replace`
+    /// really provides it.
+    record backend-caps {
+        atomic-replace: bool,
+        server-side-copy: bool,
+        server-side-move: bool,
+        symlinks: bool,
+    }
+
+    /// Establish a session against one mounted instance of this backend.
+    /// `config` is the non-secret TOML fragment from `connections.toml`;
+    /// secrets (passwords, tokens) are never passed in -- the plugin
+    /// fetches them itself via `host.secret-get`. Returns a session handle
+    /// scoping every subsequent call until `disconnect`.
+    connect: func(config: string) -> result<handle, error>;
+    disconnect: func(session: handle) -> result<_, error>;
+
+    capabilities: func(session: handle) -> backend-caps;
+
+    list-dir: func(session: handle, dir: string) -> result<list<entry>, error>;
+    stat: func(session: handle, path: string) -> result<entry, error>;
+
+    /// Download: stream backend bytes into a host-granted write
+    /// destination. Long-running; call `host.progress` periodically.
+    get: func(session: handle, path: string, dest: handle) -> result<_, error>;
+
+    /// Upload: stream from a host-granted read source into the backend.
+    put: func(session: handle, path: string, src: handle) -> result<_, error>;
+
+    remove: func(session: handle, path: string, recursive: bool) -> result<_, error>;
+    mkdir: func(session: handle, path: string) -> result<_, error>;
+    rename: func(session: handle, old-path: string, new-path: string) -> result<_, error>;
+}

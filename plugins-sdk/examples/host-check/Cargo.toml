@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "host-check"
+version = "0.1.0"
+edition = "2021"
+
+# T-2.6.1 validation harness only: proves `wasmtime::component::bindgen!`
+# generates valid host-side Rust bindings for all five plugin-class worlds
+# in plugins-sdk/wit/, and that the content-plugin world's guest component
+# (plugins-sdk/examples/stub-content) actually instantiates and links
+# against them end to end -- host functions included, not just the
+# exported interface (S-7's spike only exercised the latter, since its
+# guest had zero host imports). Not part of the main workspace, same as
+# spikes/s7-wasm-plugin/host -- the real host lives in crates/duet-plugin,
+# built out in T-8.1.1.
+
+[dependencies]
+wasmtime = { version = "47", features = ["component-model"] }
+anyhow = "1"
