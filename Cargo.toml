@@ -53,6 +53,14 @@ async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `duet-vfs::local` (T-3.1.x, design.md directive: exploit `renameat2`,
+# `FICLONE`, `copy_file_range`, and `*at`-relative syscalls directly rather
+# than going through `std::fs`). Pinned to the version S-4's spike already
+# benchmarked against real hardware (documentation/spikes/S-4.md).
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# Parallel batched `statx` (T-3.1.2), per S-4's finding that 12-16 threads
+# captures the achievable win and an unbounded pool is not needed.
+rayon = "1.12"
 
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
