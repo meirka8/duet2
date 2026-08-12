@@ -1678,7 +1678,6 @@ dependencies = [
  "duet-widgets",
  "futures-util",
  "gpui",
- "gpui-component",
  "tokio",
  "tracing",
 ]

@@ -14,11 +14,18 @@ workspace = true
 [dependencies]
 # T-4.1.1: window/lifecycle wiring (Application bootstrap, root view,
 # theme init) lives here rather than in the `duet` binary crate, because
-# ADR-002 restricts `gpui`/`gpui-component` to this crate and
-# `duet-widgets` -- `duet`'s `main.rs` calls `duet_ui::run()` without ever
-# importing gpui itself. Same pin as duet-widgets; see its Cargo.toml note.
+# ADR-002 restricts `gpui` to this crate and `duet-widgets` -- `duet`'s
+# `main.rs` calls `duet_ui::run()` without ever importing gpui itself.
+# Same pin as duet-widgets; see its Cargo.toml note.
+#
+# T-4.1.2: no `gpui-component` dependency here, deliberately -- R-G7's
+# isolation is that `gpui-component` (the community widget crate) is only
+# ever reached through `duet-widgets`'s façade (`duet_widgets::{table,
+# list, input, select, menu, dialog, toast, resizable, theme, layout,
+# compat}`). Plain `gpui` stays a direct dependency of this crate per
+# ADR-002 -- the façade isolates `gpui-component` specifically, not GPUI
+# itself.
 gpui = "0.2.2"
-gpui-component = "0.5.1"
 duet-widgets = { path = "../duet-widgets" }
 duet-types = { path = "../duet-types" }
 duet-vfs = { path = "../duet-vfs" }
