@@ -1,0 +1,36 @@
+[package]
+name = "duet-bench"
+description = "T-3.3.4: deterministic corpus generator + criterion benchmark harness for NFR-01..07. Also the home of T-3.3.5's local CI-gate check (src/bin/bench_gate.rs)."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+duet-types = { path = "../crates/duet-types" }
+duet-index = { path = "../crates/duet-index" }
+rand.workspace = true
+rayon.workspace = true
+# The gate checker (src/bin/bench_gate.rs) only needs to parse criterion's
+# own `estimates.json`; a tiny serde_json dependency is cheaper and more
+# robust than hand-rolled JSON scraping.
+serde.workspace = true
+serde_json = "1.0"
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile = "3.14"
+
+[[bench]]
+name = "entry_store"
+harness = false
+
+[[bench]]
+name = "local_listing"
+harness = false

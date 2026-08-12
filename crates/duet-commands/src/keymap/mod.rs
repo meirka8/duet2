@@ -37,6 +37,7 @@
 //! and noted as a documented limitation, not a silent gap.
 
 mod key;
+pub mod tc_csv;
 
 pub use key::{KeyChord, KeyParseError, KeyStep, Modifiers};
 
@@ -45,6 +46,7 @@ use std::fmt;
 
 use crate::id::CommandId;
 use crate::predicate::Predicate;
+use crate::registry::CommandRegistry;
 
 /// Which shipped base keymap a user's `keymap.toml` layers on top of
 /// (`docs/config-schema.md` §2, the `base` key). `None` starts from an
@@ -212,14 +214,25 @@ pub enum KeymapDiagnostic {
         key: KeyChord,
         shadowed_command: CommandId,
         shadowed_source: KeymapSource,
+        /// Where the shadowed binding was declared, when known (populated by
+        /// [`resolve_with_locations`]; always `None` from plain [`resolve`],
+        /// e.g. a `keymap.toml` load that has no per-binding span tracking
+        /// yet).
+        shadowed_location: Option<SourceLocation>,
         winning_command: CommandId,
         winning_source: KeymapSource,
+        /// Where the winning binding was declared, when known. See
+        /// `shadowed_location`.
+        winning_location: Option<SourceLocation>,
     },
     /// An `[[unbind]]` didn't match any currently-resolved binding.
     UnbindNoMatch {
         context: Predicate,
         key: KeyChord,
         command: Option<CommandId>,
+        /// Where the no-op unbind was declared, when known. See
+        /// `Shadowed::shadowed_location`.
+        location: Option<SourceLocation>,
     },
 }
 
@@ -231,29 +244,51 @@ impl fmt::Display for KeymapDiagnostic {
                 key,
                 shadowed_command,
                 shadowed_source,
+                shadowed_location,
                 winning_command,
                 winning_source,
+                winning_location,
             } => {
                 write!(
                     f,
                     "binding conflict: key `{key}` in context `{context}` -- \
-                     `{shadowed_command}` ({shadowed_source}) is shadowed by `{winning_command}` ({winning_source})"
+                     `{shadowed_command}` ({shadowed_source}{}) is shadowed by `{winning_command}` ({winning_source}{})",
+                    LocSuffix(shadowed_location.as_ref()),
+                    LocSuffix(winning_location.as_ref()),
                 )
             }
             KeymapDiagnostic::UnbindNoMatch {
                 context,
                 key,
                 command,
+                location,
             } => match command {
                 Some(cmd) => write!(
                     f,
-                    "unbind has no matching binding: key `{key}` in context `{context}` for command `{cmd}`"
+                    "unbind has no matching binding: key `{key}` in context `{context}` for command `{cmd}`{}",
+                    LocSuffix(location.as_ref())
                 ),
                 None => write!(
                     f,
-                    "unbind has no matching binding: key `{key}` in context `{context}`"
+                    "unbind has no matching binding: key `{key}` in context `{context}`{}",
+                    LocSuffix(location.as_ref())
                 ),
             },
+        }
+    }
+}
+
+/// Formats `" at {location}"` when present, or nothing at all -- used so
+/// [`KeymapDiagnostic`]'s `Display` reads naturally whether or not a
+/// location is known (plain [`resolve`] never has one; [`resolve_with_locations`]
+/// usually does).
+struct LocSuffix<'a>(Option<&'a SourceLocation>);
+
+impl fmt::Display for LocSuffix<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(loc) => write!(f, " at {loc}"),
+            None => Ok(()),
         }
     }
 }
@@ -277,6 +312,40 @@ impl ResolvedKeymap {
             .iter()
             .find(|b| &b.binding.context == context && &b.binding.key == key)
     }
+
+    /// Every resolved binding whose `command` is **not** registered in
+    /// `registry` -- T-3.3.2's "every keymap binding's command field must
+    /// resolve to a real registered `CommandId`" check, generalised to any
+    /// keymap (not just the TC CSV loader's), since a `keymap.toml` binding
+    /// referencing an unknown command is exactly as much a load-time
+    /// diagnostic as a `Shadowed`/`UnbindNoMatch`.
+    ///
+    /// Returns the offending bindings rather than a boolean so a caller can
+    /// build a real diagnostic listing (file/line included, when known) --
+    /// see [`keymap::tc_csv`](crate::keymap::tc_csv)'s report for a worked
+    /// example.
+    pub fn unknown_commands<'a>(&'a self, registry: &CommandRegistry) -> Vec<&'a ResolvedBinding> {
+        self.bindings
+            .iter()
+            .filter(|b| !registry.contains(&b.binding.command))
+            .collect()
+    }
+}
+
+/// One layer's worth of bindings/unbinds for [`resolve_with_locations`],
+/// each optionally tagged with where it was declared.
+///
+/// This is the location-aware generalisation of `(KeymapSource,
+/// KeymapFile)`: a plain TOML `KeymapFile` load has no per-binding span
+/// tracking yet (see [`SourceLocation`]'s doc comment), so [`resolve`] builds
+/// one of these with every location set to `None`; a loader that *does* know
+/// (e.g. [`tc_csv`], which gets real CSV row numbers from the `csv` crate)
+/// builds one directly.
+#[derive(Debug)]
+pub struct KeymapLayer {
+    pub source: KeymapSource,
+    pub bindings: Vec<(Binding, Option<SourceLocation>)>,
+    pub unbinds: Vec<(Unbind, Option<SourceLocation>)>,
 }
 
 /// Layers a sequence of keymap files in order -- typically `[(Base(base),
@@ -289,16 +358,40 @@ impl ResolvedKeymap {
 /// later binding with the same `(context, key)` as an earlier one replaces
 /// it and produces a [`KeymapDiagnostic::Shadowed`] rather than silently
 /// dropping the earlier binding.
+///
+/// A thin wrapper over [`resolve_with_locations`] that tags every binding
+/// and unbind with `location: None` (plain `KeymapFile`s -- typically parsed
+/// straight from TOML -- carry no span information; see
+/// [`SourceLocation`]'s doc comment).
 pub fn resolve(layers: impl IntoIterator<Item = (KeymapSource, KeymapFile)>) -> ResolvedKeymap {
+    resolve_with_locations(layers.into_iter().map(|(source, file)| KeymapLayer {
+        source,
+        bindings: file.bindings.into_iter().map(|b| (b, None)).collect(),
+        unbinds: file.unbinds.into_iter().map(|u| (u, None)).collect(),
+    }))
+}
+
+/// The location-tracking generalisation of [`resolve`]: identical layering
+/// and conflict-detection semantics, but every resolved binding and every
+/// [`KeymapDiagnostic`] carries a [`SourceLocation`] when the caller supplied
+/// one, so diagnostics can point at a real file/line (T-3.3.2 AC: "binding
+/// conflicts produce diagnostics with file/line").
+pub fn resolve_with_locations(layers: impl IntoIterator<Item = KeymapLayer>) -> ResolvedKeymap {
     let mut resolved: Vec<ResolvedBinding> = Vec::new();
     let mut diagnostics: Vec<KeymapDiagnostic> = Vec::new();
 
-    for (source, file) in layers {
-        for binding in file.bindings {
+    for layer in layers {
+        let KeymapLayer {
+            source,
+            bindings,
+            unbinds,
+        } = layer;
+
+        for (binding, location) in bindings {
             let candidate = ResolvedBinding {
                 binding,
                 source: source.clone(),
-                location: None,
+                location,
             };
             if let Some(pos) = resolved.iter().position(|existing| {
                 existing.binding.context == candidate.binding.context
@@ -310,14 +403,16 @@ pub fn resolve(layers: impl IntoIterator<Item = (KeymapSource, KeymapFile)>) -> 
                     key: candidate.binding.key.clone(),
                     shadowed_command: shadowed.binding.command.clone(),
                     shadowed_source: shadowed.source,
+                    shadowed_location: shadowed.location,
                     winning_command: candidate.binding.command.clone(),
                     winning_source: candidate.source.clone(),
+                    winning_location: candidate.location.clone(),
                 });
             }
             resolved.push(candidate);
         }
 
-        for unbind in file.unbinds {
+        for (unbind, location) in unbinds {
             let mut matched_any = false;
             resolved.retain(|existing| {
                 let context_and_key_match = existing.binding.context == unbind.context
@@ -337,6 +432,7 @@ pub fn resolve(layers: impl IntoIterator<Item = (KeymapSource, KeymapFile)>) -> 
                     context: unbind.context,
                     key: unbind.key,
                     command: unbind.command,
+                    location,
                 });
             }
         }

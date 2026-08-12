@@ -18,6 +18,12 @@ async-trait.workspace = true
 tokio.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
+# `local` module only (T-3.1.x) -- see workspace Cargo.toml for the
+# rationale on pinning/scope; every other module in this crate stays
+# syscall-free.
+rustix.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
+tempfile = "3.12"

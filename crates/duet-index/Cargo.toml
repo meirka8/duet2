@@ -14,3 +14,45 @@ workspace = true
 [dependencies]
 duet-types = { path = "../duet-types" }
 roaring = "0.11.4"
+# T-3.2.2 locale-aware collation. `icu_collator` (ICU4X, Unicode-3.0
+# license, actively maintained by the Unicode Consortium's own ICU4X
+# project -- not a third-party reimplementation) over the alternative
+# `unicode-collation` crate: the latter's only published release on
+# crates.io is a `0.0.0` placeholder, i.e. not actually usable. Default
+# `compiled_data` feature bakes the DUCET/CLDR root-collation tables into
+# the binary (no runtime data file, no network, works offline), which is
+# the right tradeoff for NFR-09's binary-size ceiling: it costs a few MB,
+# not the double-digit-MB weight of the full `icu` meta-crate, since only
+# `icu_collator` (+ its own `icu_collator_data`/`icu_normalizer`/
+# `icu_locale` transitive deps) is pulled in, not the whole ICU4X surface
+# (segmentation, calendars, number formatting, ...). `numeric_ordering`
+# (CLDR `kn` preference) gives natural-numeric comparison
+# ("file2.txt" < "file10.txt") as a first-class collation feature rather
+# than a hand-rolled digit-run parser layered on top.
+icu_collator = "2.2"
+# T-3.2.2 "1M-entry sort <= 400ms": generating one collation sort key per
+# name is the expensive part (~700ms/1M single-threaded, measured) -- the
+# comparison-only sort over precomputed keys is cheap (~5-7ms/1M). Rayon
+# parallelizes key generation across the CPU pool (design.md §8.2 lists
+# "bulk sort" as an explicit Rayon CPU-pool workload) and brings the
+# measured 1M-entry total (keygen + sort) to ~85ms on a 24-core box, well
+# inside budget.
+rayon = "1.10"
+# T-3.2.5 watching. Named explicitly in design.md §7.5's dependency list
+# ("notify (inotify)"). `default-features = false` drops the `macos_fsevent`
+# default feature (pulls in macOS-only `fsevent-sys`) -- irrelevant weight
+# for a Linux-only target; the Linux inotify backend (via the `inotify`/
+# `mio` crates) is a target-specific dependency of `notify` itself, not
+# feature-gated, so it's present either way.
+notify = { version = "8.2", default-features = false }
+
+[dev-dependencies]
+# Test-only: T-3.2.5/T-3.2.6's watch/poll tests exercise real filesystem
+# create/delete/rename/modify against a scratch directory. Doesn't affect
+# the shipped binary (dev-dependency only, never compiled into the
+# library or `duet` binary).
+tempfile = "3.27"
+# T-3.2.7's property test (random mutation sequences over compute_diff).
+# Already a workspace dependency (see root Cargo.toml, used the same way
+# by duet-types); dev-only here too.
+proptest.workspace = true

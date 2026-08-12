@@ -13,3 +13,5 @@ workspace = true
 
 [dependencies]
 duet-types = { path = "../duet-types" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

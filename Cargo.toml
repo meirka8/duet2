@@ -16,6 +16,7 @@ members = [
     "crates/duet",
     "helpers/duet-privileged",
     "plugins-sdk",
+    "benches",
 ]
 
 [workspace.package]
@@ -53,6 +54,30 @@ async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# `duet-vfs::local` (T-3.1.x, design.md directive: exploit `renameat2`,
+# `FICLONE`, `copy_file_range`, and `*at`-relative syscalls directly rather
+# than going through `std::fs`). Pinned to the version S-4's spike already
+# benchmarked against real hardware (documentation/spikes/S-4.md).
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# Parallel batched `statx` (T-3.1.2, T-3.3.4's corpus materialization), per
+# S-4's finding that 12-16 threads captures the achievable win and an
+# unbounded pool is not needed.
+rayon = "1.12"
+# Structured logging (design.md §7.5's dependency list, §12: "`tracing`
+# with per-crate filters"). `tracing-subscriber`'s `env-filter` feature
+# backs the `DUET_LOG` filter; `registry`/`fmt` (both default features)
+# back the layered subscriber T-3.3.3 builds (fmt output + a ring-buffer
+# layer for crash dumps).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# T-3.3.4's corpus generator (`benches/`): seeded, index-local RNG draws so
+# generation is both deterministic-from-a-seed and safely parallelizable
+# (each entry's attributes depend only on `(seed, index)`, never on shared
+# mutable RNG state) -- see `benches/src/corpus.rs`.
+rand = "0.9"
+# T-3.3.4's benchmark harness. `harness = false` on every `[[bench]]` below;
+# criterion drives its own `main`/reporting instead of libtest's bench harness.
+criterion = "0.8"
 
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a
