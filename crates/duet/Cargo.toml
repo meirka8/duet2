@@ -13,5 +13,8 @@ workspace = true
 
 [dependencies]
 duet-types = { path = "../duet-types" }
+# T-4.1.1: the bootstrap itself -- see duet-ui's crate doc for why this
+# dependency is safe under ADR-002 (duet-ui owns gpui, not this crate).
+duet-ui = { path = "../duet-ui" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

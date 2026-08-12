@@ -12,3 +12,21 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# T-4.1.1: window/lifecycle wiring (Application bootstrap, root view,
+# theme init) lives here rather than in the `duet` binary crate, because
+# ADR-002 restricts `gpui`/`gpui-component` to this crate and
+# `duet-widgets` -- `duet`'s `main.rs` calls `duet_ui::run()` without ever
+# importing gpui itself. Same pin as duet-widgets; see its Cargo.toml note.
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+duet-widgets = { path = "../duet-widgets" }
+duet-types = { path = "../duet-types" }
+duet-vfs = { path = "../duet-vfs" }
+# The executor-wiring demo (AC: "the core's async tasks drive UI updates
+# through the foreground executor") needs a real multi-threaded Tokio
+# runtime distinct from GPUI's own executor -- "rt-multi-thread" to build
+# it, "sync" for the oneshot channel that bridges a background Tokio task's
+# result back onto GPUI's foreground executor.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+futures-util = { workspace = true }
+tracing = { workspace = true }
