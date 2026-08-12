@@ -61,6 +61,14 @@ jobs:
       - name: Fail if any crate outside duet-ui/duet-widgets depends on gpui
         run: ./scripts/check-gpui-isolation.sh
 
+  gpui-component-facade-lint:
+    name: gpui-component façade lint (R-G7, T-4.1.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if any crate outside duet-widgets references gpui_component:: directly
+        run: ./scripts/check-gpui-component-facade.sh
+
   perf-gate:
     name: performance regression gate (T-3.3.5)
     runs-on: ubuntu-latest

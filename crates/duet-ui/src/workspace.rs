@@ -6,13 +6,16 @@ use std::path::PathBuf;
 
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
+use duet_widgets::{
+    layout::{h_flex, v_flex},
+    theme::ActiveTheme as _,
+};
 use futures_util::StreamExt;
 use gpui::{
     App, AppContext as _, Application, Bounds, Context, Entity, Hsla, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, TitlebarOptions, Window, WindowBounds,
     WindowOptions, px, size,
 };
-use gpui_component::{ActiveTheme as _, Theme, h_flex, v_flex};
 
 /// Opens the Duet application window.
 ///
@@ -65,12 +68,13 @@ pub fn run() {
                 ..Default::default()
             },
             |window, cx| {
-                // Re-sync appearance now that a real `Window` exists.
-                // `Theme::sync_system_appearance`'s own doc comment notes
-                // that the pre-window call (already done inside
-                // `duet_widgets::init` -> `gpui_component::init`) can be
-                // unreliable on Linux, hence the second sync here.
-                Theme::sync_system_appearance(Some(window), cx);
+                // Re-sync appearance now that a real `Window` exists. See
+                // `duet_widgets::compat::sync_theme_with_window`'s doc
+                // comment for why this second, post-window sync is needed
+                // on top of the pre-window one already done inside
+                // `duet_widgets::init` (which delegates to the underlying
+                // gpui-component crate's own init).
+                duet_widgets::compat::sync_theme_with_window(window, cx);
 
                 let workspace = cx.new(|cx| Workspace::new(window, cx));
                 spawn_entry_count_demo(tokio_handle.clone(), workspace.clone(), cx);
