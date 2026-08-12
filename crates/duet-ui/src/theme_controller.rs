@@ -66,8 +66,7 @@ impl ThemeController {
                 );
                 duet_widgets::compat::sync_theme_with_window(window, cx);
                 let new_active_file = build_and_install(new_mode, cx);
-                let new_watch =
-                    spawn_file_watch(new_active_file.clone(), new_mode, workspace.clone(), cx);
+                let new_watch = spawn_file_watch(new_mode, workspace.clone(), cx);
                 workspace.update(cx, |ws, cx| {
                     ws.theme_mut().mode = new_mode;
                     ws.theme_mut().active_file = new_active_file;
@@ -78,7 +77,12 @@ impl ThemeController {
             })
         };
 
-        let file_watch = spawn_file_watch(active_file.clone(), mode, workspace, cx);
+        // Watched unconditionally on the *resolved path* for this mode,
+        // regardless of whether a file exists there yet: `duet_config::watch`
+        // watches the parent directory (not the file inode), so a file
+        // authored *after* startup still triggers a reload the moment it's
+        // created -- not only a file that already existed at launch.
+        let file_watch = spawn_file_watch(mode, workspace, cx);
 
         Self {
             mode,
@@ -108,6 +112,14 @@ fn theme_file_name(mode: ThemeMode) -> &'static str {
     }
 }
 
+/// The XDG-resolved path for `mode`'s theme file, regardless of whether
+/// anything is there yet. `None` only if `$HOME`/`$XDG_CONFIG_HOME` can't
+/// be resolved at all (the same rare condition `duet_config::paths`
+/// already reports).
+fn resolve_theme_path(mode: ThemeMode) -> Option<PathBuf> {
+    duet_config::paths::theme_path(theme_file_name(mode)).ok()
+}
+
 /// Builds the built-in palette for `mode`, merges a `themes/<name>.toml`
 /// override on top if one exists and parses cleanly, installs the result
 /// as the process-wide [`TokenPalette`] (and onto `gpui-component`'s own
@@ -119,7 +131,7 @@ fn build_and_install(mode: ThemeMode, cx: &mut App) -> Option<PathBuf> {
     let mut palette = TokenPalette::built_in(mode);
     let mut applied_path = None;
 
-    if let Ok(path) = duet_config::paths::theme_path(theme_file_name(mode)) {
+    if let Some(path) = resolve_theme_path(mode) {
         match duet_config::theme::load_tokens(&path) {
             Ok(file) => match file.typed() {
                 Ok(doc) => {
@@ -152,18 +164,31 @@ fn build_and_install(mode: ThemeMode, cx: &mut App) -> Option<PathBuf> {
     applied_path
 }
 
-/// Starts (or skips, if `path` is `None`) a hot-reload watch on the active
-/// theme file, bridging `duet-config`'s background-thread callback into
-/// GPUI's foreground executor over a `tokio::sync::mpsc` channel -- see
-/// this module's doc comment for why that bridge is safe to poll from
-/// GPUI's own executor without a live Tokio runtime.
+/// Starts a hot-reload watch on `mode`'s theme file path, bridging
+/// `duet-config`'s background-thread callback into GPUI's foreground
+/// executor over a `tokio::sync::mpsc` channel -- see this module's doc
+/// comment for why that bridge is safe to poll from GPUI's own executor
+/// without a live Tokio runtime. Watches the path unconditionally (even if
+/// no file exists there yet -- `duet_config::watch` watches the *parent
+/// directory*, so a file created later while the app is running still
+/// triggers a reload); `None` only if the path can't be resolved at all or
+/// its parent directory can't be created/watched.
 fn spawn_file_watch(
-    path: Option<PathBuf>,
     mode: ThemeMode,
     workspace: Entity<Workspace>,
     cx: &mut App,
 ) -> Option<duet_config::ConfigWatcher> {
-    let path = path?;
+    let path = resolve_theme_path(mode)?;
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            target: "duet_ui::theme_controller",
+            path = %parent.display(),
+            "could not create themes/ directory, theme file hot-reload disabled: {err}"
+        );
+        return None;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<duet_config::ThemeTokensDocument>();
 
     let watch_result = duet_config::watch::<duet_config::ThemeTokensDocument>(

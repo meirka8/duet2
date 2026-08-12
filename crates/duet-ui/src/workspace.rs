@@ -11,7 +11,7 @@ use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
     input::{Input, InputState},
-    layout::{h_flex, v_flex},
+    layout::{Root, h_flex, v_flex},
     resizable::{ResizableState, h_resizable, resizable_panel},
     theme::{ActiveTheme as _, TokenPalette},
 };
@@ -97,7 +97,14 @@ pub fn run() {
 
                 spawn_entry_count_demo(tokio_handle.clone(), workspace.clone(), cx);
                 window.focus(&workspace.read(cx).focus_handle);
-                workspace
+
+                // `gpui-component` widgets (the command-line `Input` among
+                // them -- see `duet_widgets::layout::Root`'s doc comment)
+                // call into `Root::read`/`Root::update` internally and
+                // panic if the window's actual root view isn't one, so the
+                // real render root wraps `workspace`, not `workspace`
+                // itself.
+                cx.new(|cx| Root::new(workspace, window, cx))
             },
         )
         .expect("failed to open the Duet window");
@@ -587,4 +594,57 @@ async fn count_current_dir_entries() -> Result<(String, usize), String> {
         count += entries.len();
     }
     Ok((dir_display, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-NAV-01's "ratio persists per session", exercised end to end
+    /// against real files: no `settings.toml` exists yet (fresh install,
+    /// matching a real first launch), a ratio is saved, and a fresh load
+    /// sees exactly that value -- not the manual, log-based verification
+    /// this task's report otherwise relies on for the interactive
+    /// (drag/keyboard) half of resizing, since this sandbox has no input
+    /// -injection tool to drive that live.
+    #[test]
+    fn splitter_ratio_round_trips_through_settings_toml_from_a_fresh_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        assert!(!path.exists(), "starting from a fresh install, no file yet");
+
+        assert_eq!(load_splitter_ratio(&path), 0.5, "documented default");
+
+        save_splitter_ratio(&path, 0.27).expect("first save must create the file");
+        assert_eq!(load_splitter_ratio(&path), 0.27);
+
+        // A second save (the "user dragged again" case) must not lose the
+        // first write or any other section's defaults.
+        save_splitter_ratio(&path, 0.63).expect("second save must succeed");
+        assert_eq!(load_splitter_ratio(&path), 0.63);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("splitter_ratio"), "{on_disk}");
+    }
+
+    /// Saving a ratio must not disturb the rest of an existing, hand
+    /// -edited `settings.toml` -- the same round-trip-preservation
+    /// contract `duet-config::document::ConfigFile` guarantees generally,
+    /// exercised here through this module's actual save path.
+    #[test]
+    fn saving_ratio_preserves_other_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[panels]\nshow_hidden = true\nsplitter_ratio = 0.5\n",
+        )
+        .unwrap();
+
+        save_splitter_ratio(&path, 0.8).unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("show_hidden = true"), "{on_disk}");
+        assert!(on_disk.contains("splitter_ratio = 0.8"), "{on_disk}");
+    }
 }

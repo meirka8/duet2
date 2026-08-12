@@ -45,3 +45,9 @@ duet-config = { path = "../duet-config" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# T-4.1.4: exercises splitter-ratio persistence against real temp files
+# (see workspace.rs's tests module) -- the same crate duet-config already
+# uses for its own file-round-trip tests.
+tempfile = "3"
