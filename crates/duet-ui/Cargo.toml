@@ -29,6 +29,14 @@ gpui = "0.2.2"
 duet-widgets = { path = "../duet-widgets" }
 duet-types = { path = "../duet-types" }
 duet-vfs = { path = "../duet-vfs" }
+# T-4.1.4: the function-key bar's labels come from the real command
+# catalogue + TC keymap survey, not hardcoded strings.
+duet-commands = { path = "../duet-commands" }
+# T-4.1.4/T-4.1.5: splitter-ratio persistence (settings.toml) and the theme
+# token system (themes/*.toml, hot reload) both go through duet-config's
+# existing round-trip/versioning/watch layer rather than duet-ui inventing
+# its own file I/O.
+duet-config = { path = "../duet-config" }
 # The executor-wiring demo (AC: "the core's async tasks drive UI updates
 # through the foreground executor") needs a real multi-threaded Tokio
 # runtime distinct from GPUI's own executor -- "rt-multi-thread" to build

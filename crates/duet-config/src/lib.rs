@@ -68,4 +68,5 @@ pub use document::ConfigFile;
 pub use error::{ConfigError, Result};
 pub use migrate::{Migration, MigrationRegistry};
 pub use settings::{Settings, SettingsFile};
+pub use theme::{ThemeDocument, ThemeTokensDocument};
 pub use watch::{ConfigWatcher, watch};

@@ -9,11 +9,16 @@
 //! crate calls [`run`] and otherwise never imports `gpui` itself --
 //! ADR-002 restricts that dependency to this crate and `duet-widgets`.
 //!
-//! The root view here (`workspace::Workspace`) is intentionally minimal:
-//! a title and a static two-box stand-in for the eventual dual-pane
-//! layout. The real workspace shell (splitter, tabs, function-key bar,
-//! status bar, command line) is built out starting T-4.1.4.
+//! T-4.1.4 builds out the real workspace shell: a draggable/keyboard
+//! -resizable splitter between the two panels, a function-key bar, a
+//! status bar, and a command-line row (`workspace::Workspace`).
+//! T-4.1.5 builds out a real theme system on top of T-4.1.1's one-shot
+//! appearance sync: Duet's own documented token palette
+//! (`docs/config-schema.md` §4), live desktop light/dark follow, and
+//! `themes/*.toml` loading with hot reload (`theme_controller`).
 
+mod function_bar;
+mod theme_controller;
 mod workspace;
 
 pub use workspace::run;

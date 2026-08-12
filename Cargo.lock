@@ -1673,6 +1673,8 @@ dependencies = [
 name = "duet-ui"
 version = "0.1.0"
 dependencies = [
+ "duet-commands",
+ "duet-config",
  "duet-types",
  "duet-vfs",
  "duet-widgets",
