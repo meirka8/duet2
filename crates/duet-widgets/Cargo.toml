@@ -12,3 +12,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# T-4.1.1: the façade needs the real gpui-component dependency to call its
+# `init()` (theme registry, icon font, widget-state globals) and to
+# eventually wrap every widget it re-exports (T-4.1.2). Pinned to the exact
+# versions Phase 0's S-1 spike (`spikes/s1-virtualised-table`) validated --
+# do not bump without re-running that spike's benchmark.
+gpui = "0.2.2"
+gpui-component = "0.5.1"
