@@ -12,3 +12,30 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# `serde`: typed read-views (`Settings`, etc.) deserialize out of the
+# round-trip document via `toml_edit`'s serde support (below).
+serde.workspace = true
+thiserror.workspace = true
+# Format-preserving TOML: the whole point of T-3.3.1's round-trip AC is that
+# editing one key and re-saving must not disturb comments, formatting, or
+# keys this schema version doesn't recognise (future keys, user additions).
+# Plain `toml`/serde-only deserialization is lossy for that -- see
+# docs/config-schema.md's "Schema versioning and migration" section, which
+# names `toml_edit` explicitly. `serde` feature enables typed read-views.
+toml_edit = { version = "0.25", features = ["serde"] }
+# Hot reload (docs/config-schema.md "Hot reload"): inotify-backed watching
+# off the UI thread, never on it (T-3.1.6). Version picked as the latest
+# non-prerelease on crates.io as of this task (9.0.0 was still an -rc);
+# T-3.2.5 (duet-index, sibling worktree) had not landed a pin at the time
+# this was written -- reconcile at Phase-3 consolidation if it differs.
+notify = "8.2"
+# Crash-safe, directory-fd-relative atomic saves (`*at` syscalls,
+# `renameat2`): a config save writes a temp file, fsyncs it, renames it over
+# the target, and fsyncs the parent directory, all relative to one open
+# directory fd -- matching the project's data-safety posture (NFR-08) even
+# though this crate's blast radius (a settings file, not user data) is much
+# smaller than the ops engine's.
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
