@@ -62,6 +62,16 @@ const COL_NAME: usize = 0;
 const COL_SIZE: usize = 1;
 const COL_MODIFIED: usize = 2;
 
+/// `duet_widgets::table::TableDelegate::render_last_empty_col`'s default
+/// (`gpui-component-0.5.1/src/table/delegate.rs`) unconditionally appends
+/// a `w_3()` (12px) filler column after the real ones, plus the table's
+/// own `.bordered(true)` border -- so a column-width sum that exactly
+/// matches the measured panel width still overflows by a few pixels and
+/// trips the built-in horizontal scrollbar. Reserved out of every
+/// [`FileTableDelegate::apply_responsive_widths`] call so "fits exactly"
+/// really means fits, with a little slack for rounding.
+const TABLE_CHROME_RESERVE: f32 = 20.0;
+
 /// Responsive column sizing: as the panel narrows, shrink columns toward
 /// their minimums before dropping any, and only drop the least-essential
 /// trailing columns (Modified, then Size -- Name is never dropped) once
@@ -231,7 +241,8 @@ impl FileTableDelegate {
         }
         self.last_available_width = Some(available);
 
-        let widths = responsive::column_widths(available);
+        let usable = (available - TABLE_CHROME_RESERVE).max(0.0);
+        let widths = responsive::column_widths(usable);
         self.columns = self
             .base_columns
             .iter()
