@@ -67,6 +67,7 @@ pub fn run() {
     Application::new().run(move |cx: &mut App| {
         duet_widgets::init(cx);
         bind_workspace_keys(cx);
+        crate::file_table::bind_file_table_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -97,7 +98,18 @@ pub fn run() {
                 });
 
                 spawn_entry_count_demo(tokio_handle.clone(), workspace.clone(), cx);
-                window.focus(&workspace.read(cx).focus_handle);
+                // Focuses the left panel itself, not the workspace root --
+                // T-4.2.2's cursor movement is bound to `FileTable`'s own
+                // key context, and there's no click-to-focus or Tab-based
+                // panel switching yet (`focus.other_panel` is T-4.3.x's
+                // job) for a user to reach it any other way. `Workspace`'s
+                // own "Workspace"-context bindings (Ctrl+Left/Right
+                // splitter resize) still fire from here: GPUI's action
+                // dispatch walks the focused element's ancestor chain, and
+                // `Workspace`'s root div stays an ancestor of the left
+                // panel regardless of which of the two holds focus.
+                let left_panel = workspace.read(cx).left_panel.clone();
+                window.focus(&left_panel.read(cx).focus_handle(cx));
 
                 // `gpui-component` widgets (the command-line `Input` among
                 // them -- see `duet_widgets::layout::Root`'s doc comment)
