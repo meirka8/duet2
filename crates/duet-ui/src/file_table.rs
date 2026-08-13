@@ -46,7 +46,9 @@ use std::path::PathBuf;
 use duet_index::{DirectoryModel, SortColumn};
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
-use duet_widgets::table::{Column, ColumnSort, Table, TableDelegate, TableRow, TableState};
+use duet_widgets::table::{
+    Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
+};
 use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt;
 use gpui::{
@@ -867,6 +869,32 @@ impl FileTable {
         let delegate = FileTableDelegate::new(DirectoryModel::new());
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(dir, tokio_handle, state.clone(), cx);
+
+        // `duet_widgets::table::TableState` has its own built-in
+        // click-to-select row/column tracking (`selected_row`/
+        // `selected_col`, set by an unconditional `on_click` handler
+        // baked into the widget itself -- `on_row_left_click` calls
+        // `set_selected_row` with no gate, confirmed by reading
+        // `gpui-component-0.5.1/src/table/state.rs`), completely separate
+        // from `FileTableDelegate::cursor_row`/`model.selection()`. Left
+        // alone, a click paints a persistent highlight (`table_active`)
+        // that this delegate's own render_tr never reads and nothing
+        // clears -- a confusing "second cursor" that doesn't respond to
+        // any of T-4.2.2/T-4.2.3's real cursor/selection commands, since
+        // mouse support isn't wired up yet (T-4.3.8). Subscribing to
+        // `TableEvent` and immediately clearing it back neutralises that
+        // stray highlight until real click-driven cursor movement is
+        // built and can intentionally use this same mechanism.
+        cx.subscribe(&state, |_this, state, event, cx| {
+            if matches!(
+                event,
+                TableEvent::SelectRow(_) | TableEvent::SelectColumn(_)
+            ) {
+                state.update(cx, |state, cx| state.clear_selection(cx));
+            }
+        })
+        .detach();
+
         Self {
             state,
             focus_handle: cx.focus_handle(),
