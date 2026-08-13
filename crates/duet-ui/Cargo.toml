@@ -29,6 +29,12 @@ gpui = "0.2.2"
 duet-widgets = { path = "../duet-widgets" }
 duet-types = { path = "../duet-types" }
 duet-vfs = { path = "../duet-vfs" }
+# T-4.2.1: `FileTable` (`src/file_table.rs`) renders a real
+# `duet_index::DirectoryModel`/`EntryStore` -- the Phase 3 SoA panel model,
+# not a parallel structure invented for the UI layer. `duet-index` stays
+# gpui-free itself (ADR-002); this is the one-directional dependency that
+# lets its gpui-aware *consumer* reach it.
+duet-index = { path = "../duet-index" }
 # T-4.1.4: the function-key bar's labels come from the real command
 # catalogue + TC keymap survey, not hardcoded strings.
 duet-commands = { path = "../duet-commands" }
@@ -51,3 +57,9 @@ tracing = { workspace = true }
 # (see workspace.rs's tests module) -- the same crate duet-config already
 # uses for its own file-round-trip tests.
 tempfile = "3"
+# T-4.2.1's 1M-row benchmark (`examples/bench_file_table.rs`) reuses
+# T-3.3.4's deterministic in-memory corpus generator (`duet_bench::corpus`)
+# rather than hand-rolling a second synthetic-entry generator. Dev-only:
+# examples get dev-dependencies, and this benchmark harness has no business
+# being part of the normal `duet-ui` library build.
+duet-bench = { path = "../../benches" }

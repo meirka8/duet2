@@ -23,6 +23,7 @@ use gpui::{
     size,
 };
 
+use crate::file_table::FileTable;
 use crate::function_bar::{self, FKeySlot};
 use crate::theme_controller::ThemeController;
 
@@ -88,7 +89,7 @@ pub fn run() {
                 // behaviour this one-shot call cannot provide on its own.
                 duet_widgets::compat::sync_theme_with_window(window, cx);
 
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                let workspace = cx.new(|cx| Workspace::new(window, cx, tokio_handle.clone()));
                 let theme = ThemeController::install(window, cx, workspace.clone());
                 workspace.update(cx, |ws, cx| {
                     ws.theme = Some(theme);
@@ -156,6 +157,12 @@ pub struct Workspace {
     /// builder argument.
     resizable_state: Entity<ResizableState>,
 
+    /// T-4.2.1: the left panel's real, virtualised directory table --
+    /// `duet_index::DirectoryModel`/`EntryStore` backed, not a placeholder.
+    /// The right panel stays a placeholder for now (T-4.2.2 onward builds
+    /// out per-panel selection/cursor/navigation before both are real).
+    left_panel: Entity<FileTable>,
+
     function_keys: Vec<FKeySlot>,
     command_line: Entity<InputState>,
 
@@ -182,7 +189,11 @@ enum DemoState {
 }
 
 impl Workspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Self {
         let settings_path = duet_config::paths::settings_path().ok();
         let splitter_ratio = settings_path
             .as_deref()
@@ -195,11 +206,19 @@ impl Workspace {
                 .placeholder("Command line (not wired to a shell yet -- T-5.3.5)")
         });
 
+        // T-4.2.1: list the process's current directory in the left panel --
+        // same directory the T-4.1.1 executor-wiring demo below counts, so
+        // the status bar's "N entries in <dir>" line and the left panel's
+        // actual row count are checkable against each other.
+        let initial_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let left_panel = cx.new(|cx| FileTable::new(initial_dir, tokio_handle.clone(), window, cx));
+
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
             splitter_ratio,
             resizable_state: cx.new(|_| ResizableState::default()),
+            left_panel,
             function_keys: function_bar::build_function_bar(),
             command_line,
             settings_path,
@@ -284,7 +303,7 @@ impl Workspace {
                 resizable_panel()
                     .size(left_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(placeholder_panel("Left panel", true, tokens, theme.border)),
+                    .child(left_panel_view(&self.left_panel, tokens, theme.border)),
             )
             .child(
                 resizable_panel()
@@ -435,6 +454,24 @@ impl Render for Workspace {
             .child(self.status_bar_row(cx))
             .child(self.function_key_bar(cx))
     }
+}
+
+/// Wraps the real, virtualised [`FileTable`] (T-4.2.1) in the same
+/// themed frame [`placeholder_panel`] below uses, so the left panel's chrome
+/// matches the still-placeholder right panel until T-4.2.2 onward makes
+/// both real.
+fn left_panel_view(
+    table: &Entity<FileTable>,
+    tokens: &TokenPalette,
+    border: gpui::Hsla,
+) -> impl IntoElement {
+    v_flex()
+        .size_full()
+        .bg(tokens.color.panel_bg_active)
+        .border_1()
+        .border_color(border)
+        .rounded_md()
+        .child(table.clone())
 }
 
 /// A placeholder panel standing in for a future `PanelView` (T-4.2.x).
