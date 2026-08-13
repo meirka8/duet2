@@ -72,85 +72,54 @@ const COL_MODIFIED: usize = 2;
 /// really means fits, with a little slack for rounding.
 const TABLE_CHROME_RESERVE: f32 = 20.0;
 
-/// Responsive column sizing: as the panel narrows, shrink columns toward
-/// their minimums before dropping any, and only drop the least-essential
-/// trailing columns (Modified, then Size -- Name is never dropped) once
-/// even minimum widths don't fit. This mirrors `duet_widgets::table`'s
-/// column order, so truncating `FileTableDelegate::columns` from the tail
-/// is enough -- no index remapping needed in `render_td`/`perform_sort`.
+/// Responsive column sizing: Size and Modified stay at their fixed ideal
+/// widths always -- they're short, roughly constant-width content (a size
+/// string, a date), nothing is gained by shrinking them. Name is the only
+/// elastic column: it grows to fill whatever space Size+Modified leave
+/// behind, and shrinks as the panel narrows, down to [`NAME_MIN`] --
+/// narrower than that, filenames just get ellipsized (`render_td` applies
+/// `.truncate()` to the Name cell), never truncated by hiding a column or
+/// growing the panel. Below `NAME_MIN` even with Size+Modified included,
+/// this falls back to fixed minimum widths for all three and lets
+/// `duet_widgets::table::Table`'s built-in horizontal scrollbar take over
+/// -- "impossibly narrow", not worth squeezing further.
 ///
 /// Full per-column configuration (more columns, user-chosen order/widths)
-/// is T-4.2.4's job; this is deliberately just enough to stop the fixed
-/// 360+110+170px layout from silently overflowing the panel on any
-/// window narrower than ~640px.
+/// is T-4.2.4's job.
 mod responsive {
-    pub const NAME_MIN: f32 = 120.0;
+    pub const NAME_MIN: f32 = 60.0;
     pub const NAME_IDEAL: f32 = 360.0;
-    pub const SIZE_MIN: f32 = 70.0;
-    pub const SIZE_IDEAL: f32 = 110.0;
-    pub const MODIFIED_MIN: f32 = 140.0;
-    pub const MODIFIED_IDEAL: f32 = 170.0;
+    pub const SIZE_WIDTH: f32 = 110.0;
+    pub const MODIFIED_WIDTH: f32 = 170.0;
 
-    /// Computes column widths (in the order Name, [Size], [Modified]) for
-    /// `available` pixels of panel width. Below `NAME_MIN` even a lone
-    /// Name column can't fit -- "impossibly narrow" -- so this falls back
-    /// to fixed minimum widths for all three columns and lets
-    /// `duet_widgets::table::Table`'s built-in horizontal scrollbar take
-    /// over, rather than trying to squeeze further.
-    pub fn column_widths(available: f32) -> Vec<f32> {
-        let ideal_total = NAME_IDEAL + SIZE_IDEAL + MODIFIED_IDEAL;
-        let min_total = NAME_MIN + SIZE_MIN + MODIFIED_MIN;
-
-        if available >= ideal_total {
-            let extra = available - ideal_total;
-            return vec![NAME_IDEAL + extra, SIZE_IDEAL, MODIFIED_IDEAL];
+    /// Computes column widths (Name, Size, Modified) for `available`
+    /// pixels of panel width. Never changes the *number* of columns --
+    /// see the module doc comment.
+    pub fn column_widths(available: f32) -> [f32; 3] {
+        let name = available - SIZE_WIDTH - MODIFIED_WIDTH;
+        if name >= NAME_MIN {
+            [name, SIZE_WIDTH, MODIFIED_WIDTH]
+        } else {
+            [NAME_MIN, SIZE_WIDTH, MODIFIED_WIDTH]
         }
-        if available >= min_total {
-            let mut deficit = ideal_total - available;
-            let mut modified = MODIFIED_IDEAL;
-            let mut size = SIZE_IDEAL;
-            let mut name = NAME_IDEAL;
-
-            let shrink = deficit.min(MODIFIED_IDEAL - MODIFIED_MIN);
-            modified -= shrink;
-            deficit -= shrink;
-
-            let shrink = deficit.min(SIZE_IDEAL - SIZE_MIN);
-            size -= shrink;
-            deficit -= shrink;
-
-            let shrink = deficit.min(NAME_IDEAL - NAME_MIN);
-            name -= shrink;
-
-            return vec![name, size, modified];
-        }
-        if available >= NAME_MIN + SIZE_MIN {
-            // Sacrifice Modified.
-            let ideal_total = NAME_IDEAL + SIZE_IDEAL;
-            if available >= ideal_total {
-                let extra = available - ideal_total;
-                return vec![NAME_IDEAL + extra, SIZE_IDEAL];
-            }
-            let mut deficit = ideal_total - available;
-            let mut size = SIZE_IDEAL;
-            let mut name = NAME_IDEAL;
-
-            let shrink = deficit.min(SIZE_IDEAL - SIZE_MIN);
-            size -= shrink;
-            deficit -= shrink;
-            name -= deficit.min(NAME_IDEAL - NAME_MIN);
-
-            return vec![name, size];
-        }
-        if available >= NAME_MIN {
-            // Sacrifice Size and Modified; Name takes whatever is left.
-            return vec![available.max(NAME_MIN)];
-        }
-
-        // Impossibly narrow: stop resizing/sacrificing and let the
-        // Table's own horizontal scrollbar handle it.
-        vec![NAME_MIN, SIZE_MIN, MODIFIED_MIN]
     }
+}
+
+/// Clones `base` (Name/Size/Modified, in that order, carrying their
+/// sortable/alignment flags) and overwrites each clone's width from
+/// `widths`. Shared by [`FileTableDelegate::new`] (the narrow first-frame
+/// widths) and [`FileTableDelegate::apply_responsive_widths`] (every
+/// subsequent recomputation) so the two never drift out of sync on column
+/// order/count.
+fn columns_with_widths(base: &[Column], widths: [f32; 3]) -> Vec<Column> {
+    base.iter()
+        .cloned()
+        .zip(widths)
+        .map(|(mut col, w)| {
+            col.width = px(w);
+            col
+        })
+        .collect()
 }
 
 /// One row's pre-formatted display text -- see the module doc comment for
@@ -171,11 +140,11 @@ struct RowText {
 pub struct FileTableDelegate {
     model: DirectoryModel,
     columns: Vec<Column>,
-    /// The full Name/Size/Modified column definitions (sortable flags,
-    /// alignment, ...) at their ideal widths -- `columns` is rebuilt from
-    /// this base (cloned, re-widthed, possibly truncated from the tail)
-    /// every time [`Self::apply_responsive_widths`] runs, so those flags
-    /// never need to be re-specified by hand there.
+    /// The Name/Size/Modified column definitions (sortable flags,
+    /// alignment, ...) at their initial widths -- `columns` is rebuilt from
+    /// this base (cloned, re-widthed) every time
+    /// [`Self::apply_responsive_widths`] runs, so those flags never need to
+    /// be re-specified by hand there.
     base_columns: Vec<Column>,
     /// The panel width `columns` was last computed for -- lets
     /// `apply_responsive_widths` skip recomputation (and the `cx.notify()`
@@ -207,16 +176,35 @@ impl FileTableDelegate {
                 .width(px(responsive::NAME_IDEAL))
                 .sortable(),
             Column::new("size", "Size")
-                .width(px(responsive::SIZE_IDEAL))
+                .width(px(responsive::SIZE_WIDTH))
                 .text_right()
                 .sortable(),
             Column::new("modified", "Modified")
-                .width(px(responsive::MODIFIED_IDEAL))
+                .width(px(responsive::MODIFIED_WIDTH))
                 .sortable(),
         ];
+        // Start at NAME_MIN, not NAME_IDEAL: `duet_widgets::resizable`'s
+        // `ResizablePanel` treats a panel with no stored size yet as
+        // non-shrinkable on its very first render (`flex_none()` in
+        // `gpui-component-0.5.1/src/resizable/panel.rs`), and an
+        // automatic min-content size still applies underneath that --
+        // wide enough first-frame content could in principle inflate a
+        // heavily off-center splitter ratio's panel width beyond what the
+        // ratio itself asks for. Cheap insurance against that: start
+        // narrow, and let `FileTable::render`'s measuring canvas correct
+        // `columns` to the real available width within a frame or two,
+        // same as any other resize.
+        let columns = columns_with_widths(
+            &base_columns,
+            [
+                responsive::NAME_MIN,
+                responsive::SIZE_WIDTH,
+                responsive::MODIFIED_WIDTH,
+            ],
+        );
         let mut delegate = Self {
             model,
-            columns: base_columns.clone(),
+            columns,
             base_columns,
             last_available_width: None,
             row_text: Vec::new(),
@@ -229,10 +217,10 @@ impl FileTableDelegate {
     }
 
     /// Recomputes `columns` for `available` pixels of real panel width
-    /// (see `FileTable::render`'s measuring `canvas`), resizing before
-    /// dropping any column -- see the `responsive` module doc comment.
-    /// Returns whether anything actually changed, so the caller only
-    /// `cx.notify()`s on a real change rather than every frame.
+    /// (see `FileTable::render`'s measuring `canvas`) -- see the
+    /// `responsive` module doc comment. Returns whether anything actually
+    /// changed, so the caller only `cx.notify()`s on a real change rather
+    /// than every frame.
     fn apply_responsive_widths(&mut self, available: f32) -> bool {
         if let Some(last) = self.last_available_width
             && (last - available).abs() < 1.0
@@ -242,18 +230,7 @@ impl FileTableDelegate {
         self.last_available_width = Some(available);
 
         let usable = (available - TABLE_CHROME_RESERVE).max(0.0);
-        let widths = responsive::column_widths(usable);
-        self.columns = self
-            .base_columns
-            .iter()
-            .take(widths.len())
-            .cloned()
-            .zip(widths)
-            .map(|(mut col, w)| {
-                col.width = px(w);
-                col
-            })
-            .collect();
+        self.columns = columns_with_widths(&self.base_columns, responsive::column_widths(usable));
         true
     }
 
@@ -398,9 +375,17 @@ impl TableDelegate for FileTableDelegate {
             })
             .unwrap_or_default();
 
+        // `.truncate()` (overflow-hidden + nowrap + ellipsis) matters most
+        // for Name, the one column that shrinks (see the `responsive`
+        // module doc comment) -- a long filename in a narrow panel gets a
+        // "…" instead of being clipped mid-glyph or forcing overflow.
+        // Size/Modified are short, fixed-width strings this never
+        // actually triggers for, so applying it unconditionally is simpler
+        // than a per-column special case.
         div()
             .id(("file-cell", row_ix as u64 * 8 + col_ix as u64))
             .px_2()
+            .truncate()
             .child(text)
     }
 
@@ -508,6 +493,14 @@ impl Render for FileTable {
         let state = self.state.clone();
         div()
             .size_full()
+            // Flexbox's default `min-width: auto` would otherwise let
+            // `Table`'s declared column widths act as this view's intrinsic
+            // minimum content size, which could in principle grow the
+            // resizable splitter's panel past what its ratio actually asks
+            // for. The splitter should always dictate the available width,
+            // never the other way around; pinning `min_w` to zero here
+            // rules that out regardless of how wide any column gets.
+            .min_w(px(0.))
             .child(Table::new(&self.state).stripe(true).bordered(true))
             .child(
                 // Measures the panel's real width every frame (the same
@@ -671,80 +664,50 @@ mod tests {
     }
 
     #[test]
-    fn responsive_widths_grow_name_to_fill_leftover_space_when_roomy() {
+    fn responsive_widths_keep_size_and_modified_fixed_always() {
+        for available in [80.0, 250.0, 500.0, 1000.0] {
+            let widths = responsive::column_widths(available);
+            assert_eq!(widths[1], responsive::SIZE_WIDTH, "Size never changes");
+            assert_eq!(
+                widths[2],
+                responsive::MODIFIED_WIDTH,
+                "Modified never changes"
+            );
+        }
+    }
+
+    #[test]
+    fn responsive_widths_grow_name_to_fill_all_leftover_space_when_roomy() {
         let widths = responsive::column_widths(1000.0);
-        assert_eq!(widths.len(), 3);
-        let ideal_total =
-            responsive::NAME_IDEAL + responsive::SIZE_IDEAL + responsive::MODIFIED_IDEAL;
-        assert_eq!(widths[0], responsive::NAME_IDEAL + (1000.0 - ideal_total));
-        assert_eq!(widths[1], responsive::SIZE_IDEAL);
-        assert_eq!(widths[2], responsive::MODIFIED_IDEAL);
+        let expected_name = 1000.0 - responsive::SIZE_WIDTH - responsive::MODIFIED_WIDTH;
+        assert_eq!(widths[0], expected_name);
         assert!((widths.iter().sum::<f32>() - 1000.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn responsive_widths_shrink_modified_and_size_before_touching_name() {
-        // A small deficit (within Modified's + Size's combined shrink
-        // range) should come entirely out of Modified, then Size, leaving
-        // Name untouched at its ideal width.
-        let widths = responsive::column_widths(600.0);
-        assert_eq!(widths.len(), 3);
-        assert_eq!(widths[0], responsive::NAME_IDEAL, "Name stays at ideal");
-        assert!(widths[1] < responsive::SIZE_IDEAL);
-        assert!(widths[1] >= responsive::SIZE_MIN);
+    fn responsive_widths_shrink_name_as_panel_narrows() {
+        let wide = responsive::column_widths(1000.0);
+        let narrow = responsive::column_widths(500.0);
+        assert!(narrow[0] < wide[0], "Name shrinks as available width drops");
         assert_eq!(
-            widths[2],
-            responsive::MODIFIED_MIN,
-            "Modified absorbs the deficit first, down to its minimum"
+            narrow[0],
+            500.0 - responsive::SIZE_WIDTH - responsive::MODIFIED_WIDTH
         );
-        let sum: f32 = widths.iter().sum();
-        assert!((sum - 600.0).abs() < 0.01);
     }
 
     #[test]
-    fn responsive_widths_shrink_name_too_once_modified_and_size_bottom_out() {
-        // A larger deficit exceeds what Modified+Size can absorb on their
-        // own (30 + 40 = 70px of slack) -- Name must give up some width
-        // too, but all three columns still fit (min_total = 330 <= 500).
-        let widths = responsive::column_widths(500.0);
-        assert_eq!(widths.len(), 3);
-        assert_eq!(widths[1], responsive::SIZE_MIN);
-        assert_eq!(widths[2], responsive::MODIFIED_MIN);
-        assert!(widths[0] < responsive::NAME_IDEAL);
-        assert!(widths[0] >= responsive::NAME_MIN);
-        let sum: f32 = widths.iter().sum();
-        assert!((sum - 500.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn responsive_widths_sacrifice_modified_before_size_or_name() {
-        // Below the three-column minimum but still enough for Name+Size at
-        // their minimums: Modified is dropped entirely, not shrunk to zero.
-        let widths = responsive::column_widths(250.0);
-        assert_eq!(widths.len(), 2, "Modified column is dropped");
-        assert!(widths[0] >= responsive::NAME_MIN);
-        assert!(widths[1] >= responsive::SIZE_MIN);
-    }
-
-    #[test]
-    fn responsive_widths_sacrifice_size_leaving_only_name() {
-        let widths = responsive::column_widths(150.0);
-        assert_eq!(widths.len(), 1, "only Name remains");
-        assert!(widths[0] >= responsive::NAME_MIN);
-    }
-
-    #[test]
-    fn responsive_widths_fall_back_to_fixed_minimums_when_impossibly_narrow() {
-        // Even Name alone can't fit at its minimum -- stop resizing/
-        // sacrificing and let the Table's own horizontal scrollbar handle
-        // the overflow instead.
+    fn responsive_widths_fall_back_to_name_min_when_impossibly_narrow() {
+        // Below Size+Modified+NAME_MIN, Name can't shrink any further
+        // without disappearing -- hold it at its floor and let the
+        // Table's own horizontal scrollbar handle the (now unavoidable)
+        // overflow, rather than letting Name go to zero or negative.
         let widths = responsive::column_widths(50.0);
         assert_eq!(
             widths,
-            vec![
+            [
                 responsive::NAME_MIN,
-                responsive::SIZE_MIN,
-                responsive::MODIFIED_MIN,
+                responsive::SIZE_WIDTH,
+                responsive::MODIFIED_WIDTH,
             ]
         );
     }
@@ -752,22 +715,24 @@ mod tests {
     #[test]
     fn apply_responsive_widths_updates_columns_and_dedupes_repeat_calls() {
         let mut delegate = FileTableDelegate::new(sample_model());
-        assert!(delegate.apply_responsive_widths(250.0));
-        assert_eq!(delegate.columns.len(), 2, "Modified sacrificed at 250px");
-        assert_eq!(delegate.columns[0].key.as_ref(), "name");
-        assert_eq!(delegate.columns[1].key.as_ref(), "size");
+        assert!(delegate.apply_responsive_widths(500.0));
+        assert_eq!(delegate.columns.len(), 3, "column count never changes");
+        let narrow_name = delegate.columns[0].width;
 
         assert!(
-            !delegate.apply_responsive_widths(250.3),
+            !delegate.apply_responsive_widths(500.3),
             "sub-pixel jitter should not trigger a rebuild"
         );
-        assert_eq!(delegate.columns.len(), 2);
+        assert_eq!(delegate.columns[0].width, narrow_name);
 
         assert!(
             delegate.apply_responsive_widths(1000.0),
             "a real width change should trigger a rebuild"
         );
-        assert_eq!(delegate.columns.len(), 3, "all columns return when roomy");
+        assert!(
+            delegate.columns[0].width > narrow_name,
+            "Name grows back once the panel widens"
+        );
     }
 
     #[test]

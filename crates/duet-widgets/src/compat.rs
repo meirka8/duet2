@@ -44,6 +44,24 @@ use gpui::{App, Window};
 /// windows/dialogs.
 pub fn sync_theme_with_window(window: &mut Window, cx: &mut App) {
     gpui_component::Theme::sync_system_appearance(Some(window), cx);
+    apply_font_scale(cx);
+}
+
+/// `gpui_component::theme::Theme::apply_config` (run by every
+/// `sync_system_appearance`/mode-change call above, light<->dark included)
+/// unconditionally resets `font_size`/`mono_font_size` back to its own
+/// built-in 16px/13px defaults whenever the active `ThemeConfig` doesn't
+/// specify them -- which Duet's never does, so a one-time override in
+/// `duet_widgets::init` would only survive until the next appearance sync
+/// (observed happening several times within the first second of startup
+/// alone, via `ThemeController`'s live follow-system). Re-asserting the
+/// scaled-down size here, right after every sync, is what actually makes
+/// it stick.
+fn apply_font_scale(cx: &mut App) {
+    const SCALE: f32 = 0.8; // 20% smaller than gpui-component's defaults.
+    let theme = gpui_component::Theme::global_mut(cx);
+    theme.font_size = gpui::px(16.0 * SCALE);
+    theme.mono_font_size = gpui::px(13.0 * SCALE);
 }
 
 /// The concrete element type `gpui_component::table::TableDelegate`'s
