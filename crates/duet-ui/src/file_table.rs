@@ -50,8 +50,9 @@ use duet_widgets::table::{Column, ColumnSort, Table, TableDelegate, TableRow, Ta
 use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt;
 use gpui::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyBinding, ParentElement as _, Render, SharedString, Styled as _, Window,
+    actions, div, px,
 };
 
 /// Column indices this delegate ships with -- a reasonable subset
@@ -165,6 +166,18 @@ pub struct FileTableDelegate {
     /// (`TableDelegate::loading`) while a background directory listing is
     /// still in flight.
     loading: bool,
+    /// The cursor's current row position within `model.order()` (T-4.2.2),
+    /// cached alongside `model`'s own `EntryId`-based cursor rather than
+    /// recomputed from it. Keyboard movement (`move_cursor_by`/
+    /// `move_cursor_to`) reads and writes this directly -- an `O(1)` row
+    /// computation, not a scan over `order()` -- which is what keeps
+    /// holding an arrow key smooth even over a near-1M-row listing (the
+    /// same reasoning `selected_bytes` documents for selection stats).
+    /// Only ever goes stale across a sort (`order()` itself changes), and
+    /// [`Self::perform_sort`] -- called by the user sorting, not per
+    /// frame -- re-derives it there with the one `O(n)` scan that's
+    /// actually necessary ([`Self::sync_cursor_row_from_model`]).
+    cursor_row: Option<usize>,
 }
 
 impl FileTableDelegate {
@@ -213,8 +226,10 @@ impl FileTableDelegate {
             cached_generation: u64::MAX, // guarantees the first rebuild runs
             scratch: String::new(),
             loading: true,
+            cursor_row: None,
         };
         delegate.rebuild_row_text();
+        delegate.set_cursor_row(Some(0));
         delegate
     }
 
@@ -253,15 +268,78 @@ impl FileTableDelegate {
 
     /// Replaces the backing model wholesale (a fresh directory listing
     /// finished loading, or the 1M-row synthetic benchmark corpus) and
-    /// forces the text cache to rebuild for it.
+    /// forces the text cache to rebuild for it. Cursor resets to the first
+    /// row (TC's own behaviour on entering/refreshing a listing) --
+    /// there's no previous row position that would still mean anything
+    /// against an entirely new entry set.
     pub fn set_model(&mut self, model: DirectoryModel) {
         self.model = model;
         self.cached_generation = u64::MAX;
         self.rebuild_row_text();
+        self.set_cursor_row(Some(0));
     }
 
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
+    }
+
+    /// The cursor's current row within `model.order()`, if any (an empty
+    /// listing has none).
+    pub fn cursor_row(&self) -> Option<usize> {
+        self.cursor_row
+    }
+
+    /// Sets the cursor to `row` (clamped into range) and keeps
+    /// `model`'s own `EntryId`-based cursor in lock-step -- the two must
+    /// never disagree, so every write to either goes through this one
+    /// method rather than setting `self.cursor_row` or calling
+    /// `model.set_cursor` directly.
+    fn set_cursor_row(&mut self, row: Option<usize>) {
+        let row = row.filter(|_| !self.model.order().is_empty());
+        self.cursor_row = row;
+        let id = row
+            .and_then(|r| self.model.order().get(r))
+            .copied()
+            .map(EntryId::new);
+        self.model.set_cursor(id);
+    }
+
+    /// Moves the cursor by `delta` rows (negative for up), clamped to
+    /// `[0, order().len() - 1]`. Returns the resulting row so the caller
+    /// (`FileTable`'s action handlers) can decide whether to scroll it
+    /// into view -- a no-op (empty listing) returns `None`.
+    fn move_cursor_by(&mut self, delta: i64) -> Option<usize> {
+        let len = self.model.order().len();
+        if len == 0 {
+            return None;
+        }
+        let current = self.cursor_row.unwrap_or(0) as i64;
+        let target = (current + delta).clamp(0, len as i64 - 1) as usize;
+        self.set_cursor_row(Some(target));
+        self.cursor_row
+    }
+
+    /// Moves the cursor directly to `row`, clamped into range (so
+    /// `usize::MAX` is a convenient "last row" for End/Ctrl+End).
+    fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
+        let len = self.model.order().len();
+        if len == 0 {
+            return None;
+        }
+        self.set_cursor_row(Some(row.min(len - 1)));
+        self.cursor_row
+    }
+
+    /// Re-derives `cursor_row` from `model`'s `EntryId`-based cursor after
+    /// `order()` itself changes (a resort) -- the one place an `O(n)` scan
+    /// over `order()` is actually necessary, and it's fine here because
+    /// sorting is already `O(n log n)` and user-triggered, not a per-frame
+    /// cost. See the `cursor_row` field's doc comment.
+    fn sync_cursor_row_from_model(&mut self) {
+        self.cursor_row = self
+            .model
+            .cursor()
+            .and_then(|id| self.model.order().iter().position(|&ix| ix == id.index()));
     }
 
     /// Rebuilds `row_text` for the current `model.order()`/`generation()`
@@ -330,17 +408,26 @@ impl TableDelegate for FileTableDelegate {
         let ascending = !matches!(sort, ColumnSort::Descending);
         self.model.sort_by(column, ascending);
         self.rebuild_row_text();
+        self.sync_cursor_row_from_model();
     }
 
     /// Row container: the only per-row work is an `order`/selection-bitmap
     /// lookup and a conditional background color -- no string formatting,
     /// no allocation (matching S-1 spike's `render_tr`).
+    /// Cursor and selection are visually distinct (TC convention, and
+    /// `docs/config-schema.md` §4 gives them separate tokens for exactly
+    /// this): selection is a subtle background tint that can span many
+    /// rows, the cursor is a single, strongly-highlighted row showing
+    /// where keyboard commands (T-4.2.2 movement now, T-4.2.3 selection
+    /// commands next) actually act. A row can be both -- the cursor's
+    /// stronger fill wins in that case, same as TC's own rendering.
     fn render_tr(
         &mut self,
         row_ix: usize,
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> TableRow {
+        let is_cursor = self.cursor_row == Some(row_ix);
         let selected = self
             .model
             .order()
@@ -349,8 +436,11 @@ impl TableDelegate for FileTableDelegate {
             .is_some_and(|ix| self.model.is_selected(EntryId::new(ix)));
 
         let row = div().id(("file-row", row_ix));
-        if selected {
-            let tokens = TokenPalette::current(cx);
+        let tokens = TokenPalette::current(cx);
+        if is_cursor {
+            row.bg(tokens.color.cursor_bg)
+                .text_color(tokens.color.cursor_fg)
+        } else if selected {
             row.bg(tokens.color.selection_bg)
         } else {
             row
@@ -470,6 +560,51 @@ fn write_date(out: &mut String, mtime_secs: i64) {
     let _ = write!(out, "{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}");
 }
 
+// T-4.2.2's keyboard cursor movement, per `docs/keymap-tc.csv`'s
+// `nav.cursor_up`/`nav.cursor_down`/`nav.cursor_top`/`nav.cursor_bottom`/
+// `nav.page_up`/`nav.page_down` rows -- Home and Ctrl+Home (same for
+// End/Ctrl+End) both bind to the same action since the CSV itself marks
+// the Ctrl variants "uncertain... may be redundant with plain Home/End".
+//
+// These are plain GPUI actions bound directly to keys, the same shape
+// T-4.1.4's `ResizeSplitterLeft`/`ResizeSplitterRight` already established
+// in `workspace.rs`, not routed through `duet-commands`' registry/
+// predicate/keymap-CSV pipeline. That pipeline exists and the CSV is what
+// these bindings are faithful to, but nothing yet turns a loaded keymap
+// entry into a live GPUI keybinding at runtime -- building that generic
+// bridge is bigger than "cursor rendering, keyboard movement" and belongs
+// to whichever task first needs more than a handful of hand-wired
+// commands (T-4.3.x territory), not this one.
+actions!(
+    duet_file_table,
+    [
+        CursorUp,
+        CursorDown,
+        CursorHome,
+        CursorEnd,
+        CursorPageUp,
+        CursorPageDown
+    ]
+);
+
+/// Registers [`FileTable`]'s keybindings. Called once from
+/// `workspace::run`, before any window opens -- see `bind_workspace_keys`
+/// for the identical pattern this mirrors. `Some("FileTable")` scopes
+/// every binding to elements tagged with that key context (`FileTable`'s
+/// own render root), so they only fire while a file table has focus.
+pub fn bind_file_table_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", CursorUp, Some("FileTable")),
+        KeyBinding::new("down", CursorDown, Some("FileTable")),
+        KeyBinding::new("home", CursorHome, Some("FileTable")),
+        KeyBinding::new("ctrl-home", CursorHome, Some("FileTable")),
+        KeyBinding::new("end", CursorEnd, Some("FileTable")),
+        KeyBinding::new("ctrl-end", CursorEnd, Some("FileTable")),
+        KeyBinding::new("pageup", CursorPageUp, Some("FileTable")),
+        KeyBinding::new("pagedown", CursorPageDown, Some("FileTable")),
+    ]);
+}
+
 /// The real virtualised directory-table view: a thin `Render` wrapper
 /// around `duet_widgets::table::TableState<FileTableDelegate>`, populated
 /// from a real local directory listing via the core Tokio runtime --
@@ -479,6 +614,7 @@ fn write_date(out: &mut String, mtime_secs: i64) {
 /// established.
 pub struct FileTable {
     state: Entity<TableState<FileTableDelegate>>,
+    focus_handle: FocusHandle,
 }
 
 impl FileTable {
@@ -494,7 +630,10 @@ impl FileTable {
         let delegate = FileTableDelegate::new(DirectoryModel::new());
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(dir, tokio_handle, state.clone(), cx);
-        Self { state }
+        Self {
+            state,
+            focus_handle: cx.focus_handle(),
+        }
     }
 
     /// Exposes the underlying table state -- e.g. for a future status-bar
@@ -503,13 +642,88 @@ impl FileTable {
     pub fn state(&self) -> &Entity<TableState<FileTableDelegate>> {
         &self.state
     }
+
+    /// Moves the cursor by `delta` rows and scrolls it into view if (and
+    /// only if) the move actually took it outside the currently visible
+    /// range -- an in-view move (the common case while holding an arrow
+    /// key) never forces a scroll, since `TableState::scroll_to_row`'s
+    /// only placement option is `ScrollStrategy::Top`, which would
+    /// otherwise jump the list on every single keystroke instead of only
+    /// when the cursor is actually about to leave the viewport.
+    fn move_cursor(&mut self, delta: i64, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if let Some(row) = state.delegate_mut().move_cursor_by(delta) {
+                if !state.visible_range().rows().contains(&row) {
+                    state.scroll_to_row(row, cx);
+                }
+                cx.notify();
+            }
+        });
+    }
+
+    /// PgUp/PgDn: same in-view-check as [`Self::move_cursor`], just with
+    /// the delta computed from the table's own currently visible row
+    /// count instead of a fixed ±1 -- `visible_range()` has to be read
+    /// before the move (not after, like the in-view check), so this can't
+    /// simply call `move_cursor` with a precomputed delta.
+    fn move_cursor_by_page(&mut self, direction: i64, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let page = state.visible_range().rows().len().max(1) as i64;
+            if let Some(row) = state.delegate_mut().move_cursor_by(direction * page) {
+                if !state.visible_range().rows().contains(&row) {
+                    state.scroll_to_row(row, cx);
+                }
+                cx.notify();
+            }
+        });
+    }
+
+    /// Home/Ctrl+Home (`row = 0`) and End/Ctrl+End (`row = usize::MAX`,
+    /// clamped by `move_cursor_to` to the last row) both always scroll --
+    /// jumping to either end is definitionally leaving the current view
+    /// unless the whole listing already fits on screen, in which case
+    /// `scroll_to_row` is a harmless no-op.
+    fn move_cursor_to(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if let Some(row) = state.delegate_mut().move_cursor_to(row) {
+                state.scroll_to_row(row, cx);
+                cx.notify();
+            }
+        });
+    }
+}
+
+impl Focusable for FileTable {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for FileTable {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.clone();
         div()
             .size_full()
+            .key_context("FileTable")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &CursorUp, _window, cx| {
+                this.move_cursor(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorDown, _window, cx| {
+                this.move_cursor(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorHome, _window, cx| {
+                this.move_cursor_to(0, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorEnd, _window, cx| {
+                this.move_cursor_to(usize::MAX, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorPageUp, _window, cx| {
+                this.move_cursor_by_page(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorPageDown, _window, cx| {
+                this.move_cursor_by_page(1, cx);
+            }))
             // 20% smaller than `gpui-component`'s 16px default, scoped to
             // just this panel (cascades into `Table`'s header/row text) --
             // not a global theme change, so the command line, status bar,
@@ -694,6 +908,116 @@ mod tests {
         let delegate = FileTableDelegate::new(sample_model());
         assert_eq!(delegate.columns.len(), 3);
         assert_eq!(delegate.model().order().len(), 2);
+    }
+
+    /// Five files named so name-ascending order is `f0, f1, f2, f3, f4` --
+    /// plain, predictable row positions for the cursor-movement tests.
+    fn five_file_model() -> DirectoryModel {
+        let mut model = DirectoryModel::new();
+        for n in 0..5 {
+            model
+                .entries_mut()
+                .push(&format!("f{n}"), &meta(EntryKind::File, n as u64, 0));
+        }
+        model.sort_by(SortColumn::Name, true);
+        model
+    }
+
+    #[test]
+    fn new_delegate_starts_cursor_at_row_zero_unless_empty() {
+        let delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.cursor_row(), Some(0));
+        assert_eq!(
+            delegate.model().cursor(),
+            Some(EntryId::new(delegate.model().order()[0]))
+        );
+
+        let empty = FileTableDelegate::new(DirectoryModel::new());
+        assert_eq!(empty.cursor_row(), None);
+        assert!(empty.model().cursor().is_none());
+    }
+
+    #[test]
+    fn move_cursor_by_steps_and_clamps_at_both_ends() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.move_cursor_by(1), Some(1));
+        assert_eq!(delegate.move_cursor_by(2), Some(3));
+        assert_eq!(
+            delegate.move_cursor_by(10),
+            Some(4),
+            "clamps at the last row rather than going out of bounds"
+        );
+        assert_eq!(delegate.move_cursor_by(-100), Some(0), "clamps at row 0");
+    }
+
+    #[test]
+    fn move_cursor_by_keeps_model_cursor_in_lock_step() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.move_cursor_by(2);
+        let row = delegate.cursor_row().unwrap();
+        assert_eq!(
+            delegate.model().cursor(),
+            Some(EntryId::new(delegate.model().order()[row])),
+            "model's EntryId-based cursor must always match the cached row"
+        );
+    }
+
+    #[test]
+    fn move_cursor_to_jumps_directly_and_clamps_usize_max_to_last_row() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.move_cursor_to(3), Some(3));
+        assert_eq!(
+            delegate.move_cursor_to(usize::MAX),
+            Some(4),
+            "End/Ctrl+End pass usize::MAX; must clamp to the last row"
+        );
+        assert_eq!(delegate.move_cursor_to(0), Some(0));
+    }
+
+    #[test]
+    fn cursor_movement_on_an_empty_model_is_a_no_op() {
+        let mut delegate = FileTableDelegate::new(DirectoryModel::new());
+        assert_eq!(delegate.move_cursor_by(1), None);
+        assert_eq!(delegate.move_cursor_to(0), None);
+        assert!(delegate.cursor_row().is_none());
+    }
+
+    #[test]
+    fn sort_re_derives_cursor_row_to_follow_the_same_entry() {
+        // `TableDelegate::perform_sort` needs a live `Window`/`Context`
+        // (unavailable under plain `cargo test`, same reason the module
+        // doc comment on `delegate_reads_row_count_and_columns_from_the_
+        // real_model` gives) -- this drives the same two calls
+        // `perform_sort`'s body makes directly instead, exercising
+        // `sync_cursor_row_from_model` without needing the trait method's
+        // GPUI-only parameters.
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        // Name-ascending puts "f4" last; move the cursor onto it, remember
+        // which entry that is, then reverse the sort order.
+        delegate.move_cursor_to(4);
+        let entry_on_cursor = delegate.model().cursor();
+        assert_eq!(
+            delegate
+                .model()
+                .entries()
+                .name(entry_on_cursor.unwrap())
+                .to_string(),
+            "f4"
+        );
+
+        delegate.model.sort_by(SortColumn::Name, false);
+        delegate.sync_cursor_row_from_model();
+
+        assert_eq!(
+            delegate.model().cursor(),
+            entry_on_cursor,
+            "the EntryId under the cursor doesn't change just because order() did"
+        );
+        assert_eq!(
+            delegate.cursor_row(),
+            Some(0),
+            "f4 is now first in name-descending order, so its row must follow"
+        );
     }
 
     #[test]

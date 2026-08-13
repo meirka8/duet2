@@ -205,6 +205,18 @@ impl DirectoryModel {
         self.cursor
     }
 
+    /// Moves the cursor to `id` directly, or clears it (`None`). This
+    /// method has no opinion about display/row position -- like
+    /// `select`/`deselect`, it operates purely on the stable `EntryId`; a
+    /// caller that thinks in terms of rows (T-4.2.2's keyboard movement)
+    /// translates through `order()` itself. Doesn't bump `generation`,
+    /// same as every other selection method -- see `selected_bytes`'s doc
+    /// comment for why cursor/selection changes are cheap, non-generation
+    /// events distinct from population/sort/filter.
+    pub fn set_cursor(&mut self, id: Option<EntryId>) {
+        self.cursor = id;
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -369,6 +381,23 @@ mod tests {
         assert!(model.order().is_empty());
         assert!(model.cursor().is_none());
         assert_eq!(model.selection().len(), 0);
+    }
+
+    #[test]
+    fn set_cursor_moves_and_clears_without_bumping_generation() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("a", &Metadata::minimal(EntryKind::File));
+        let gen_before = model.generation();
+
+        model.set_cursor(Some(EntryId::new(0)));
+        assert_eq!(model.cursor(), Some(EntryId::new(0)));
+        assert_eq!(model.generation(), gen_before);
+
+        model.set_cursor(None);
+        assert!(model.cursor().is_none());
+        assert_eq!(model.generation(), gen_before);
     }
 
     #[test]
