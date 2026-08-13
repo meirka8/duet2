@@ -137,6 +137,12 @@ pub struct Panels {
     pub default_sort_order: String,
     /// Whether view/sort changes persist per tab or reset each launch.
     pub remember_view_per_tab: bool,
+    /// The dual-pane splitter's left-panel fraction of the workspace width,
+    /// `0.1..=0.9` (FR-NAV-01: "ratio persists per session"). T-4.1.4 wires
+    /// this as the simple, single global default; per-tab/per-session
+    /// splitter state (distinct ratios across restored tabs) is T-4.3.7's
+    /// job ("Session persistence: panes, tabs, cwds, ..., splitter").
+    pub splitter_ratio: f32,
 }
 
 impl Default for Panels {
@@ -150,6 +156,7 @@ impl Default for Panels {
             default_sort_column: "name".into(),
             default_sort_order: "ascending".into(),
             remember_view_per_tab: true,
+            splitter_ratio: 0.5,
         }
     }
 }
