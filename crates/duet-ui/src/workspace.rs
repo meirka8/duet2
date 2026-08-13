@@ -379,9 +379,7 @@ impl Workspace {
             .justify_between()
             .bg(tokens.color.statusbar_bg)
             .text_color(tokens.color.statusbar_fg)
-            // Scaled down 20% along with the theme's default font size --
-            // see `duet_widgets::compat::apply_font_scale`.
-            .text_size(px(9.6))
+            .text_size(px(12.))
             .child(gpui::div().child(status_text))
             .child(gpui::div().child(theme_text))
             // Placeholder selection-stats slot -- real content (selected
@@ -407,14 +405,14 @@ impl Workspace {
                     .py_1()
                     .child(
                         gpui::div()
-                            .text_size(px(8.8))
+                            .text_size(px(11.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(tokens.color.accent)
                             .child(slot.key),
                     )
                     .child(
                         gpui::div()
-                            .text_size(px(8.8))
+                            .text_size(px(11.))
                             .text_color(tokens.color.statusbar_fg)
                             .child(if slot.label.is_empty() {
                                 SharedString::from("—")

@@ -181,6 +181,7 @@ impl FileTableDelegate {
                 .sortable(),
             Column::new("modified", "Modified")
                 .width(px(responsive::MODIFIED_WIDTH))
+                .text_right()
                 .sortable(),
         ];
         // Start at NAME_MIN, not NAME_IDEAL: `duet_widgets::resizable`'s
@@ -493,6 +494,11 @@ impl Render for FileTable {
         let state = self.state.clone();
         div()
             .size_full()
+            // 20% smaller than `gpui-component`'s 16px default, scoped to
+            // just this panel (cascades into `Table`'s header/row text) --
+            // not a global theme change, so the command line, status bar,
+            // and function-key bar keep their own sizes.
+            .text_size(px(12.8))
             // Flexbox's default `min-width: auto` would otherwise let
             // `Table`'s declared column widths act as this view's intrinsic
             // minimum content size, which could in principle grow the
