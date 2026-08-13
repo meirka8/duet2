@@ -531,14 +531,25 @@ impl Render for FileTable {
                 // `adjust_to_container_size`, see
                 // `gpui-component-0.5.1/src/resizable/panel.rs`) and feeds
                 // it to `FileTableDelegate::apply_responsive_widths`. A
-                // width change takes effect on the next frame (via
-                // `cx.notify()`), same one-frame lag as the splitter.
+                // width change takes effect on the next frame, via
+                // `TableState::refresh` -- not just `cx.notify()`, which
+                // only repaints with whatever `col_groups` already holds.
+                // `TableState` computes `col_groups` (the column layout it
+                // actually renders from) once at construction and caches
+                // it there permanently; `refresh()` is the only thing that
+                // re-derives it from `TableDelegate::column()`, per that
+                // method's own doc comment ("When we update columns or
+                // rows, we need to refresh the table"). Skipping this call
+                // silently strands every later width change -- confirmed
+                // the hard way: this delegate's own `columns` field was
+                // updating correctly all along, but the table kept
+                // painting whatever `columns` looked like at construction.
                 gpui::canvas(
                     move |bounds, _window, cx| {
                         state.update(cx, |state, cx| {
                             let delegate = state.delegate_mut();
                             if delegate.apply_responsive_widths(f32::from(bounds.size.width)) {
-                                cx.notify();
+                                state.refresh(cx);
                             }
                         });
                     },
