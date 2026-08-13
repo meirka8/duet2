@@ -175,13 +175,14 @@ impl FileTableDelegate {
             Column::new("name", "Name")
                 .width(px(responsive::NAME_IDEAL))
                 .sortable(),
+            // Not `.text_right()` -- see `render_td`'s doc comment: that
+            // builder sets `Column::align`, which nothing in
+            // `gpui-component-0.5.1`'s table rendering ever reads.
             Column::new("size", "Size")
                 .width(px(responsive::SIZE_WIDTH))
-                .text_right()
                 .sortable(),
             Column::new("modified", "Modified")
                 .width(px(responsive::MODIFIED_WIDTH))
-                .text_right()
                 .sortable(),
         ];
         // Start at NAME_MIN, not NAME_IDEAL: `duet_widgets::resizable`'s
@@ -383,11 +384,26 @@ impl TableDelegate for FileTableDelegate {
         // Size/Modified are short, fixed-width strings this never
         // actually triggers for, so applying it unconditionally is simpler
         // than a per-column special case.
-        div()
+        //
+        // Right-alignment can't come from `Column::text_right()` --
+        // `duet_widgets::table::Column::align` is set by that call but
+        // never read anywhere in `gpui-component-0.5.1`'s table rendering
+        // (confirmed by reading the crate source: no `.align` reference
+        // outside the setter itself), so it's a dead field. Applying
+        // `gpui::Styled::text_right()` directly to this cell -- a
+        // different, unrelated `text_right` that genuinely sets the
+        // element's own text-alignment style -- is what actually works.
+        // `w_full()` first so there's room within the cell to align into
+        // (this div would otherwise shrink-wrap to the text's own width).
+        let mut cell = div()
             .id(("file-cell", row_ix as u64 * 8 + col_ix as u64))
+            .w_full()
             .px_2()
-            .truncate()
-            .child(text)
+            .truncate();
+        if col_ix == COL_SIZE || col_ix == COL_MODIFIED {
+            cell = cell.text_right();
+        }
+        cell.child(text)
     }
 
     fn loading(&self, _cx: &App) -> bool {
