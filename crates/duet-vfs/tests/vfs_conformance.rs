@@ -208,6 +208,27 @@ async fn stat_reports_correct_size() {
 }
 
 #[tokio::test]
+async fn volume_stats_reports_nonzero_real_capacity() {
+    // Can't assert exact figures (the test runner's real filesystem, not
+    // fabricated) -- but total/available should be plausible: nonzero,
+    // and available never exceeding total.
+    let f = Fixture::local();
+    let stats = f.fs.volume_stats(&f.root).await.unwrap();
+    assert!(stats.total_bytes > 0);
+    assert!(stats.available_bytes <= stats.total_bytes);
+}
+
+#[tokio::test]
+async fn volume_stats_on_nonexistent_path_is_not_found() {
+    let f = Fixture::local();
+    let err =
+        f.fs.volume_stats(&f.path("does-not-exist"))
+            .await
+            .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+#[tokio::test]
 async fn stat_reports_file_kind() {
     let f = Fixture::local();
     f.write_std("a.txt", b"x");

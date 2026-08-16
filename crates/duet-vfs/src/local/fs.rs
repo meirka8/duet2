@@ -9,7 +9,7 @@ use rustix::fs::{CWD, Mode as RustixMode};
 
 use crate::{
     AsyncReadSeek, AsyncWriteCommit, ChangeEvent, CopyOutcome, DirEntry, FileSystem, ListOpts,
-    Mode, RemoveKind, RenameFlags, WriteOpts,
+    Mode, RemoveKind, RenameFlags, VolumeStats, WriteOpts,
 };
 
 use super::pathutil::real_path;
@@ -79,6 +79,22 @@ impl FileSystem for LocalFs {
         // enrich separately.
         super::meta::enrich(&mut md, &path, ListFields::all());
         Ok(md)
+    }
+
+    async fn volume_stats(&self, p: &VPath) -> Result<VolumeStats> {
+        let path = real_path(p);
+        let stats =
+            rustix::fs::statvfs(&path).map_err(|e| super::pathutil::rustix_err("statvfs", p, e))?;
+        // `f_bavail` (space available to an unprivileged process), not
+        // `f_bfree` (raw free space, including whatever the filesystem
+        // reserves for root) -- see `VolumeStats::available_bytes`'s doc
+        // comment. `f_frsize` is the fragment size `statvfs`'s block
+        // counts are actually denominated in (not always equal to
+        // `f_bsize`).
+        Ok(VolumeStats {
+            total_bytes: stats.f_blocks.saturating_mul(stats.f_frsize),
+            available_bytes: stats.f_bavail.saturating_mul(stats.f_frsize),
+        })
     }
 
     async fn open_read(&self, p: &VPath) -> Result<Box<dyn AsyncReadSeek>> {

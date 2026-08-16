@@ -16,6 +16,7 @@ mod io;
 mod list_opts;
 mod null;
 mod ops;
+mod volume_stats;
 mod watch;
 mod write_opts;
 
@@ -31,5 +32,6 @@ pub use list_opts::{ListFields, ListOpts};
 pub use local::LocalFs;
 pub use null::NullFs;
 pub use ops::{RemoveKind, RenameFlags};
+pub use volume_stats::VolumeStats;
 pub use watch::ChangeEvent;
 pub use write_opts::{Mode, WriteOpts};

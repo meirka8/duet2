@@ -854,12 +854,32 @@ pub fn bind_file_table_keys(cx: &mut App) {
 pub struct FileTable {
     state: Entity<TableState<FileTableDelegate>>,
     focus_handle: FocusHandle,
+    /// The directory this panel is currently showing. Static today (no
+    /// navigation commands exist yet -- T-4.3.1's job); stored rather than
+    /// just passed transiently to `new` so `workspace::panel_header`
+    /// (T-4.2.7) has something real to display, and so navigation can
+    /// update it in place later without changing this field's shape.
+    current_dir: PathBuf,
+    /// The volume's free/total space as of the last successful query
+    /// (T-4.2.7's free-space indicator), or `None` until
+    /// `spawn_volume_stats_load` finishes at least once. Refreshed
+    /// whenever `current_dir` changes -- there's no mount-change *event*
+    /// to react to yet (no filesystem-watcher-driven mount table exists),
+    /// so "the directory changed" is the practical proxy for "the volume
+    /// might have changed" until real multi-mount navigation lands.
+    volume_stats: Option<duet_vfs::VolumeStats>,
 }
 
 impl FileTable {
     /// Starts listing `dir` in the background and returns immediately with
     /// an empty, `loading` table -- `spawn_directory_load` populates it
-    /// once the listing completes.
+    /// once the listing completes. Also starts a separate, independent
+    /// background query for the volume's free/total space
+    /// (`spawn_volume_stats_load`) -- kept as two separate background
+    /// tasks rather than one combined round-trip so a slow `statvfs` (an
+    /// unusual but possible stall on some remote-backed or heavily
+    /// loaded filesystems) can never delay the directory listing itself
+    /// from appearing.
     pub fn new(
         dir: PathBuf,
         tokio_handle: tokio::runtime::Handle,
@@ -868,7 +888,8 @@ impl FileTable {
     ) -> Self {
         let delegate = FileTableDelegate::new(DirectoryModel::new());
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
-        spawn_directory_load(dir, tokio_handle, state.clone(), cx);
+        spawn_directory_load(dir.clone(), tokio_handle.clone(), state.clone(), cx);
+        spawn_volume_stats_load(dir.clone(), tokio_handle, cx);
 
         // `duet_widgets::table::TableState` has its own built-in
         // click-to-select row/column tracking (`selected_row`/
@@ -898,14 +919,28 @@ impl FileTable {
         Self {
             state,
             focus_handle: cx.focus_handle(),
+            current_dir: dir,
+            volume_stats: None,
         }
     }
 
-    /// Exposes the underlying table state -- e.g. for a future status-bar
-    /// selection-stats readout (T-4.2.7) that needs to reach
+    /// Exposes the underlying table state -- e.g. for
+    /// `workspace::panel_footer` (T-4.2.7) to reach
     /// `TableState::delegate().model()` from outside this view.
     pub fn state(&self) -> &Entity<TableState<FileTableDelegate>> {
         &self.state
+    }
+
+    /// The directory this panel is currently showing. See the field's doc
+    /// comment.
+    pub fn current_dir(&self) -> &std::path::Path {
+        &self.current_dir
+    }
+
+    /// The volume's free/total space as of the last successful query, or
+    /// `None` before the first one completes. See the field's doc comment.
+    pub fn volume_stats(&self) -> Option<duet_vfs::VolumeStats> {
+        self.volume_stats
     }
 
     /// Moves the cursor by `delta` rows and scrolls it into view if (and
@@ -1248,6 +1283,17 @@ fn spawn_directory_load(
     .detach();
 }
 
+/// Converts `dir` into a local `VPath` -- the shared first step every
+/// `LocalFs` call this module makes off the UI thread needs.
+fn local_vpath(dir: &std::path::Path) -> Result<VPath, String> {
+    let path_str = dir
+        .to_str()
+        .ok_or_else(|| "directory path is not valid UTF-8".to_string())?;
+    UnixPathBuf::new(path_str)
+        .map(VPath::local)
+        .map_err(|e| format!("invalid path {path_str:?}: {e}"))
+}
+
 /// Lists `dir` through the real local VFS backend (`duet_vfs::LocalFs`),
 /// requesting `MODIFIED` on top of the always-cheap `size`/`kind` (design.md
 /// §9.1's `ListFields`) so the Modified column has real data, not a
@@ -1257,12 +1303,7 @@ fn spawn_directory_load(
 /// would want to apply chunks incrementally instead (a future refinement,
 /// not required by this task's AC).
 async fn list_directory(dir: PathBuf) -> Result<Vec<DirEntry>, String> {
-    let path_str = dir
-        .to_str()
-        .ok_or_else(|| "directory path is not valid UTF-8".to_string())?;
-    let vpath = VPath::local(
-        UnixPathBuf::new(path_str).map_err(|e| format!("invalid path {path_str:?}: {e}"))?,
-    );
+    let vpath = local_vpath(&dir)?;
 
     let fs = LocalFs;
     let opts = ListOpts {
@@ -1276,6 +1317,57 @@ async fn list_directory(dir: PathBuf) -> Result<Vec<DirEntry>, String> {
         entries.extend(chunk);
     }
     Ok(entries)
+}
+
+/// Starts a background query (T-4.2.7) for the volume's free/total space
+/// backing `dir`, applying the result to `FileTable::volume_stats` once it
+/// completes -- see `FileTable::new`'s doc comment for why this is a
+/// separate task from the directory listing rather than combined with it.
+fn spawn_volume_stats_load(
+    dir: PathBuf,
+    tokio_handle: tokio::runtime::Handle,
+    cx: &mut Context<FileTable>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    tokio_handle.spawn(async move {
+        let result = volume_stats_for(dir).await;
+        let _ = tx.send(result);
+    });
+
+    cx.spawn(async move |this, cx| {
+        let stats = match rx.await {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "duet_ui::file_table",
+                    "volume-stats query failed: {err}"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "duet_ui::file_table",
+                    "volume-stats task was dropped before completing"
+                );
+                return;
+            }
+        };
+
+        let _ = this.update(cx, |this, cx| {
+            this.volume_stats = Some(stats);
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+async fn volume_stats_for(dir: PathBuf) -> Result<duet_vfs::VolumeStats, String> {
+    let vpath = local_vpath(&dir)?;
+    LocalFs
+        .volume_stats(&vpath)
+        .await
+        .map_err(|e| format!("volume_stats: {e}"))
 }
 
 #[cfg(test)]
