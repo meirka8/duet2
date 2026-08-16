@@ -1047,6 +1047,29 @@ impl Render for FileTable {
             .size_full()
             .key_context("FileTable")
             .track_focus(&self.focus_handle)
+            // `.track_focus()` only *registers* this div against
+            // `focus_handle` -- it doesn't grab focus on click by itself,
+            // and nothing else in the render tree does either (confirmed
+            // by reading `gpui-component-0.5.1/src/table/state.rs`:
+            // `TableState` has its own unused `focus_handle` field, never
+            // `track_focus`ed anywhere, so it was never a focus target to
+            // begin with). Without this, clicking the panel after focus
+            // had moved elsewhere (Tab to the command line, say) left
+            // focus right where it was -- explaining the reported "cursor
+            // doesn't move with arrow keys after clicking the panel":
+            // every `CursorUp`/`CursorDown`/etc. action above only fires
+            // while this div's "FileTable" key context is actually
+            // active, which requires focus to be somewhere in this
+            // subtree. `on_mouse_down` (not `on_click`, which only fires
+            // after a matching mouse-up) so focus moves immediately on
+            // press, matching how clicking into any other focusable
+            // widget behaves.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _event, window, _cx| {
+                    window.focus(&this.focus_handle);
+                }),
+            )
             .on_action(cx.listener(|this, _: &CursorUp, _window, cx| {
                 this.move_cursor(-1, cx);
             }))
