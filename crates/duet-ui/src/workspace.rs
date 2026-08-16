@@ -23,7 +23,7 @@ use gpui::{
     size,
 };
 
-use crate::file_table::FileTable;
+use crate::file_table::{FileTable, write_byte_count};
 use crate::function_bar::{self, FKeySlot};
 use crate::theme_controller::ThemeController;
 
@@ -394,10 +394,40 @@ impl Workspace {
             .text_size(px(12.))
             .child(gpui::div().child(status_text))
             .child(gpui::div().child(theme_text))
-            // Placeholder selection-stats slot -- real content (selected
-            // count/size, free space) is T-4.2.7's job; this establishes
-            // the layout slot the AC asks for.
-            .child(gpui::div().child("0 items, 0 bytes selected"))
+            // FR-SEL-05's "n of m files selected, x of y bytes" (T-4.2.3).
+            // The free-space indicator and active-panel treatment this
+            // slot will eventually also carry are T-4.2.7's job.
+            .child(gpui::div().child(self.selection_stats_text(cx)))
+    }
+
+    /// See `status_bar_row`'s FR-SEL-05 slot. Reads straight through to
+    /// `left_panel`'s live `DirectoryModel` rather than caching a copy --
+    /// `DirectoryModel::selection_stats()` is already `O(1)`, and
+    /// `FileTableDelegate::total_bytes_in_view` is cached per generation,
+    /// so there's nothing to gain by duplicating either here. GPUI's own
+    /// per-view accessed-entity tracking (confirmed by reading
+    /// `gpui-0.2.2/src/view.rs`) is what makes this live: reading
+    /// `left_panel`'s entity during `Workspace`'s render marks `Workspace`
+    /// dependent on it, so `left_panel`'s `cx.notify()` after any
+    /// selection command re-renders this text without an explicit
+    /// `cx.observe` subscription.
+    fn selection_stats_text(&self, cx: &Context<Self>) -> SharedString {
+        let panel = self.left_panel.read(cx);
+        let state = panel.state().read(cx);
+        let model = state.delegate().model();
+        let stats = model.selection_stats();
+
+        let mut selected_bytes = String::new();
+        write_byte_count(&mut selected_bytes, stats.total_bytes);
+        let mut total_bytes = String::new();
+        write_byte_count(&mut total_bytes, state.delegate().total_bytes_in_view());
+
+        format!(
+            "{} of {} files selected, {selected_bytes} of {total_bytes} bytes",
+            stats.count,
+            model.order().len(),
+        )
+        .into()
     }
 
     fn function_key_bar(&self, cx: &Context<Self>) -> impl IntoElement {
