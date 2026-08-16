@@ -547,7 +547,17 @@ impl FileTableDelegate {
         else {
             return false;
         };
-        self.move_cursor_to(row);
+        // `row` is a *model*-space index (into `model.order()`), but
+        // `move_cursor_to` takes a *display*-space one (T-4.3.1's ".."
+        // row, when showing, occupies display row 0 ahead of every real
+        // model row -- see `display_row`'s doc comment). Without
+        // `+ parent_offset()` here, restoring the cursor onto anything
+        // but the very first real entry lands one row too early in every
+        // directory that has a parent (i.e. every directory but the
+        // filesystem root) -- caught by T-4.3.7's session-restore test,
+        // which is also the only caller that actually exercises this with
+        // `has_parent_row` set.
+        self.move_cursor_to(row + self.parent_offset());
         true
     }
 
@@ -570,6 +580,22 @@ impl FileTableDelegate {
         let id = EntryId::new(ix);
         (self.model.entries().kind(id) == EntryKind::Directory)
             .then(|| self.model.entries().name(id).to_string())
+    }
+
+    /// The cursor entry's name regardless of kind (files included, unlike
+    /// [`Self::cursor_dir_name`]) -- T-4.3.7's "restore the cursor
+    /// position across a restart". Same `None` cases as `cursor_dir_name`
+    /// otherwise: an empty/cursor-less listing, or the cursor sitting on
+    /// the synthetic ".." row (nothing meaningful to restore there;
+    /// landing back on row 0, `set_model`'s own default, is exactly
+    /// right).
+    pub(crate) fn cursor_entry_name(&self) -> Option<String> {
+        if self.cursor_on_parent {
+            return None;
+        }
+        let row = self.cursor_row?;
+        let &ix = self.model.order().get(row)?;
+        Some(self.model.entries().name(EntryId::new(ix)).to_string())
     }
 
     /// Whether the display cursor is on the synthetic ".." row. See the
@@ -1178,17 +1204,46 @@ pub(crate) type LockedNavigationHandler = Rc<dyn Fn(PathBuf, &mut Window, &mut A
 /// sort/loading-state changes, all of which also call `cx.notify()` for
 /// their own reasons but don't represent "this tab is now showing a
 /// different directory." T-4.3.2's `Panel` (the per-side tab container)
-/// subscribes to exactly this event per tab so it knows when to persist
-/// `session.json` -- without a narrowly-scoped event to key off, the only
-/// alternative would be re-persisting on every keystroke that moves the
-/// cursor, which is both wasteful I/O and irrelevant churn (cursor
-/// position isn't part of what T-4.3.2 persists; that's T-4.3.7's job).
+/// subscribes to exactly this event per tab so it knows when to
+/// eagerly persist `session.json` -- without a narrowly-scoped event to
+/// key off, the only alternative would be re-persisting on every
+/// keystroke that moves the cursor, which is wasteful I/O for a change
+/// this frequent. Cursor position and sort *are* part of what gets
+/// persisted (T-4.3.7), just not through this event -- `workspace.rs`'s
+/// periodic save (`SESSION_PERIODIC_SAVE_INTERVAL`) covers those instead,
+/// deliberately eventually-consistent rather than instrumenting every
+/// cursor-moving/sort-changing call site individually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTableEvent {
     DirectoryChanged,
 }
 
 impl EventEmitter<FileTableEvent> for FileTable {}
+
+/// What a freshly-created tab seeds its very first directory load with,
+/// beyond the directory itself -- T-4.3.7's session-restore inputs (a
+/// `Panel` reconstructing tabs from `session.json`) and the closely
+/// related "sort persists across ordinary navigation, not just
+/// restarts" fix ([`FileTable::navigate_to`] reads the *current* sort
+/// back out of this same shape rather than resetting to the default on
+/// every directory change). `Default`'s `sort: (SortColumn::Name, true)`
+/// matches `duet_index::SortOptions::default()`; `cursor_name: None`
+/// simply means "land on row 0", [`FileTableDelegate::set_model`]'s own
+/// default when there's no specific entry to restore onto.
+#[derive(Clone)]
+pub(crate) struct TabRestore {
+    pub cursor_name: Option<String>,
+    pub sort: (SortColumn, bool),
+}
+
+impl Default for TabRestore {
+    fn default() -> Self {
+        Self {
+            cursor_name: None,
+            sort: (SortColumn::Name, true),
+        }
+    }
+}
 
 impl FileTable {
     /// Starts listing `dir` in the background and returns immediately with
@@ -1206,10 +1261,21 @@ impl FileTable {
     /// sibling tab in the same `Panel` skips this table's first-frame
     /// narrow-column flash; `None` (a brand-new panel, nothing to copy
     /// from yet) falls back to the ordinary narrow-then-corrects default.
-    pub fn new(
+    ///
+    /// `restore`: see [`TabRestore`] -- applied to this table's very
+    /// first directory load only (subsequent navigation reads sort back
+    /// out of the live model instead, per `navigate_to`'s doc comment).
+    ///
+    /// `pub(crate)`, not `pub`: only `Panel::add_tab_entry` ever
+    /// constructs a `FileTable` now (T-4.3.2 made `Panel` the sole owner
+    /// of tab lifecycle) -- taking `TabRestore` (itself `pub(crate)`) as
+    /// a parameter here would otherwise leak a private type through a
+    /// public signature.
+    pub(crate) fn new(
         dir: PathBuf,
         tokio_handle: tokio::runtime::Handle,
         width_seed: Option<([f32; 3], f32)>,
+        restore: TabRestore,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1222,7 +1288,8 @@ impl FileTable {
             dir.clone(),
             tokio_handle.clone(),
             state.clone(),
-            None,
+            restore.cursor_name,
+            restore.sort,
             0,
             cx,
         );
@@ -1289,6 +1356,21 @@ impl FileTable {
     /// See `FileTableDelegate::responsive_seed`.
     pub(crate) fn responsive_seed(&self, cx: &App) -> Option<([f32; 3], f32)> {
         self.state.read(cx).delegate().responsive_seed()
+    }
+
+    /// See `FileTableDelegate::cursor_entry_name` -- T-4.3.7's
+    /// `Panel::snapshot`/`ClosedTab` use this to capture what to restore
+    /// the cursor onto later.
+    pub(crate) fn cursor_entry_name(&self, cx: &App) -> Option<String> {
+        self.state.read(cx).delegate().cursor_entry_name()
+    }
+
+    /// The tab's current sort column + direction -- T-4.3.7's
+    /// `Panel::snapshot`/`ClosedTab`/`new_tab` (inherit the active tab's
+    /// sort into a freshly created sibling) all read this.
+    pub(crate) fn sort_state(&self, cx: &App) -> (SortColumn, bool) {
+        let options = self.state.read(cx).delegate().model().sort_options();
+        (options.column, options.ascending)
     }
 
     /// The volume's free/total space as of the last successful query, or
@@ -1438,6 +1520,18 @@ impl FileTable {
     ///
     /// `select_name`: see `spawn_directory_load`'s doc comment.
     ///
+    /// The new listing sorts by whatever this tab's *current* sort is
+    /// (read back out of the live model via `sort_options()`), not a
+    /// hardcoded Name-ascending default -- T-4.3.7: sorting by e.g. Size
+    /// and then navigating into a subdirectory should keep sorting by
+    /// Size, the same way TC itself treats sort as a per-panel/per-tab
+    /// setting that survives ordinary navigation, not something each
+    /// fresh directory listing resets on its own. This is also what makes
+    /// session-restored sort state (`TabRestore::sort`, applied only to
+    /// the very first load in `Self::new`) actually stick past the first
+    /// navigation after restore, rather than reverting on the next
+    /// directory change.
+    ///
     /// T-4.3.2's tab lock: if [`Self::locked_navigation`] is set (this
     /// tab is locked *without* `lock_dir_change`), this doesn't navigate
     /// at all -- it hands `dir` to that callback instead, which opens a
@@ -1465,17 +1559,19 @@ impl FileTable {
         }
         self.current_dir = dir.clone();
         cx.emit(FileTableEvent::DirectoryChanged);
-        let generation = self.state.update(cx, |state, cx| {
+        let (generation, sort_options) = self.state.update(cx, |state, cx| {
             let generation = state.delegate_mut().bump_nav_generation();
+            let sort_options = state.delegate().model().sort_options();
             state.delegate_mut().set_loading(true);
             cx.notify();
-            generation
+            (generation, sort_options)
         });
         spawn_directory_load(
             dir.clone(),
             self.tokio_handle.clone(),
             self.state.clone(),
             select_name,
+            (sort_options.column, sort_options.ascending),
             generation,
             cx,
         );
@@ -1729,19 +1825,24 @@ impl Render for FileTable {
 /// Lists `dir` on the core's Tokio runtime (never the GPUI/UI thread),
 /// then applies the result to `state` through GPUI's foreground executor --
 /// see the struct doc comment. `select_name`: T-4.3.1's "cursor restores
-/// to the child directory when going up" -- if given, the cursor lands on
-/// that entry once loaded (via `select_row_by_name`) instead of
-/// `set_model`'s row-0 default; `None` for the ordinary case (entering a
-/// directory, opening at startup) where there's no specific row to
-/// restore. `generation`: the `FileTableDelegate::nav_generation` this
-/// load was started for -- see that field's doc comment for why the
-/// result is silently discarded (not applied) if a newer navigation has
-/// started by the time this completes.
+/// to the child directory when going up" (also T-4.3.7's session-restore
+/// cursor position -- both funnel through the same `select_row_by_name`
+/// mechanism) -- if given, the cursor lands on that entry once loaded
+/// instead of `set_model`'s row-0 default; `None` when there's no
+/// specific row to restore. `sort`: applied to the freshly-loaded model
+/// before anything else reads it, so the very first paint already shows
+/// the right order -- see `FileTable::navigate_to`'s doc comment for why
+/// this is never just a hardcoded default. `generation`: the
+/// `FileTableDelegate::nav_generation` this load was started for -- see
+/// that field's doc comment for why the result is silently discarded
+/// (not applied) if a newer navigation has started by the time this
+/// completes.
 fn spawn_directory_load(
     dir: PathBuf,
     tokio_handle: tokio::runtime::Handle,
     state: Entity<TableState<FileTableDelegate>>,
     select_name: Option<String>,
+    sort: (SortColumn, bool),
     generation: u64,
     cx: &mut Context<FileTable>,
 ) {
@@ -1780,7 +1881,7 @@ fn spawn_directory_load(
         for entry in entries {
             model.entries_mut().push(&entry.name, &entry.metadata);
         }
-        model.sort_by(SortColumn::Name, true);
+        model.sort_by(sort.0, sort.1);
         let entry_count = model.order().len();
 
         let updated = state.update(cx, |state, cx| {
@@ -2207,6 +2308,28 @@ mod tests {
         delegate.move_cursor_to(0);
         assert!(delegate.select_row_by_name("f3"));
         assert_eq!(delegate.cursor_row(), Some(3));
+    }
+
+    /// Regression: `select_row_by_name` computes `row` in *model*-space
+    /// but must land on the matching *display* row -- with the ".." row
+    /// showing (`has_parent_row`, true for every directory but the
+    /// filesystem root), those differ by `parent_offset()`. Caught by
+    /// T-4.3.7's session-restore work: every previous test of this method
+    /// used a delegate with no parent row at all, so a one-row-too-early
+    /// bug here went uncaught until a real directory (which always has a
+    /// parent) exercised it.
+    #[test]
+    fn select_row_by_name_accounts_for_the_parent_row_offset() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.move_cursor_to(0); // lands on ".." (display row 0)
+
+        assert!(delegate.select_row_by_name("f3"));
+        // "f3" is model row 3; with the ".." row ahead of it, that's
+        // display row 4, i.e. still model row 3 -- `cursor_row()` (model-
+        // space) must read back exactly what it did with no parent row.
+        assert_eq!(delegate.cursor_row(), Some(3));
+        assert!(!delegate.cursor_on_parent());
     }
 
     #[test]

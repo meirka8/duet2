@@ -14,5 +14,14 @@
 //! view isn't one. Every `duet-ui` window-open callback must wrap its real
 //! root view in `Root::new(view, window, cx)` rather than returning that
 //! view directly -- see `duet-ui::workspace::run`.
+//!
+//! [`WindowExt`] is `Root`'s own extension trait on `gpui::Window`
+//! (`window.push_notification(..)`, `open_dialog`/`open_sheet`, ...) --
+//! re-exported alongside `Root` since every one of its methods requires
+//! exactly the `Root`-wrapped window this module's own doc comment
+//! describes, and calling any of them before that wrapping has happened
+//! panics the same way (T-4.3.7: `Workspace::render` uses
+//! `push_notification` for the "a corrupt session file degrades to
+//! defaults with a notice" AC).
 
-pub use gpui_component::{Root, h_flex, v_flex};
+pub use gpui_component::{Root, WindowExt, h_flex, v_flex};

@@ -16,7 +16,8 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use duet_config::{SessionPanel, SessionTab};
+use duet_config::{SessionPanel, SessionSortColumn, SessionTab};
+use duet_index::SortColumn;
 use duet_widgets::{
     layout::{h_flex, v_flex},
     theme::TokenPalette,
@@ -27,7 +28,32 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, actions, div, px,
 };
 
-use crate::file_table::{FileTable, FileTableEvent, LockedNavigationHandler};
+use crate::file_table::{FileTable, FileTableEvent, LockedNavigationHandler, TabRestore};
+
+/// `duet_config::SessionSortColumn` -> `duet_index::SortColumn`, for
+/// restoring a tab's sort from `session.json`.
+fn sort_column_from_session(column: SessionSortColumn) -> SortColumn {
+    match column {
+        SessionSortColumn::Name => SortColumn::Name,
+        SessionSortColumn::Size => SortColumn::Size,
+        SessionSortColumn::Modified => SortColumn::Modified,
+    }
+}
+
+/// The inverse of [`sort_column_from_session`], for [`Panel::snapshot`].
+/// `SortColumn::Kind` is a real variant but unreachable through any
+/// column `FileTableDelegate` actually renders (see
+/// `SessionSortColumn`'s own doc comment) -- falls back to `Name`,
+/// matching what `FileTableDelegate::perform_sort`'s own
+/// `_ => SortColumn::Name` arm already does for anything outside its
+/// three known columns.
+fn sort_column_to_session(column: SortColumn) -> SessionSortColumn {
+    match column {
+        SortColumn::Size => SessionSortColumn::Size,
+        SortColumn::Modified => SessionSortColumn::Modified,
+        SortColumn::Name | SortColumn::Kind => SessionSortColumn::Name,
+    }
+}
 
 // T-4.3.2's tab commands with a real default binding (see the module doc
 // comment for the rest). Scoped to whichever `Panel` currently contains
@@ -77,13 +103,18 @@ struct TabEntry {
 }
 
 /// What [`Panel::reopen_closed`] needs to recreate a tab exactly as it was
-/// when [`Panel::close_active`]/[`Panel::close_others`] removed it. Cursor
-/// position and sort order are not part of this -- T-4.3.7's job, same
-/// carve-out as `duet_config::session::SessionTab`.
+/// when [`Panel::close_active`]/[`Panel::close_others`] removed it --
+/// directory, lock flags, and (T-4.3.7) cursor position + sort, mirroring
+/// `duet_config::session::SessionTab`'s own fields (native
+/// `duet_index::SortColumn` here rather than `SessionSortColumn`, since
+/// this never gets serialized -- it only ever feeds back into a
+/// [`TabRestore`]).
 struct ClosedTab {
     dir: PathBuf,
     locked: bool,
     lock_dir_change: bool,
+    cursor_name: Option<String>,
+    sort: (SortColumn, bool),
 }
 
 /// The per-side tab container. See the module doc comment.
@@ -125,7 +156,21 @@ impl Panel {
             tokio_handle,
         };
         for tab in tabs {
-            panel.add_tab_entry(tab.dir, tab.locked, tab.lock_dir_change, window, cx);
+            let restore = TabRestore {
+                cursor_name: tab.cursor_name,
+                sort: (
+                    sort_column_from_session(tab.sort_column),
+                    tab.sort_ascending,
+                ),
+            };
+            panel.add_tab_entry(
+                tab.dir,
+                tab.locked,
+                tab.lock_dir_change,
+                restore,
+                window,
+                cx,
+            );
         }
         panel.active = active.min(panel.tabs.len().saturating_sub(1));
         panel
@@ -145,6 +190,7 @@ impl Panel {
         dir: PathBuf,
         locked: bool,
         lock_dir_change: bool,
+        restore: TabRestore,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -163,8 +209,16 @@ impl Panel {
             .tabs
             .get(self.active)
             .and_then(|t| t.table.read(cx).responsive_seed(cx));
-        let table =
-            cx.new(|cx| FileTable::new(dir, self.tokio_handle.clone(), width_seed, window, cx));
+        let table = cx.new(|cx| {
+            FileTable::new(
+                dir,
+                self.tokio_handle.clone(),
+                width_seed,
+                restore,
+                window,
+                cx,
+            )
+        });
         cx.subscribe(
             &table,
             |_this, _table, event: &FileTableEvent, cx| match event {
@@ -225,9 +279,17 @@ impl Panel {
 
     /// Opens a fresh, unlocked tab at `dir` and makes it active -- what a
     /// locked tab's blocked navigation attempt redirects into (TC's real
-    /// locked-tab behaviour: the locked tab itself never moves).
+    /// locked-tab behaviour: the locked tab itself never moves). Inherits
+    /// the locked tab's current sort (it *is* `self.active` at the moment
+    /// its own navigation attempt triggered this -- the user was
+    /// interacting with it), same "carry sort forward, start fresh on
+    /// cursor position" split as `new_tab`.
     fn open_redirected_tab(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = self.add_tab_entry(dir, false, false, window, cx);
+        let restore = TabRestore {
+            cursor_name: None,
+            sort: self.active_table().read(cx).sort_state(cx),
+        };
+        let ix = self.add_tab_entry(dir, false, false, restore, window, cx);
         self.active = ix;
         self.focus_active_tab(window, cx);
         cx.notify();
@@ -238,10 +300,17 @@ impl Panel {
     /// tab (duplicate of current directory)") and switches to it. Always
     /// unlocked regardless of the active tab's own lock state -- TC's
     /// "new tab" is a plain new tab, not a clone of the source tab's lock
-    /// flags (that's `tab.duplicate`'s job, below).
+    /// flags (that's `tab.duplicate`'s job, below). Inherits the active
+    /// tab's current sort (continuing to browse the same directory sorted
+    /// the same way is the expected feel) but starts at row 0, not the
+    /// source tab's cursor position -- a genuinely new tab, not a clone.
     pub fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dir = self.active_table().read(cx).current_dir().to_path_buf();
-        let ix = self.add_tab_entry(dir, false, false, window, cx);
+        let restore = TabRestore {
+            cursor_name: None,
+            sort: self.active_table().read(cx).sort_state(cx),
+        };
+        let ix = self.add_tab_entry(dir, false, false, restore, window, cx);
         self.active = ix;
         self.focus_active_tab(window, cx);
         cx.notify();
@@ -249,12 +318,17 @@ impl Panel {
 
     /// `tab.duplicate` (no default key -- see the module doc comment):
     /// opens a new tab at the active tab's directory *and* copies its
-    /// lock flags, unlike `tab.new`.
+    /// lock flags, cursor position, and sort -- unlike `tab.new`, this is
+    /// a literal clone.
     pub fn duplicate_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = &self.tabs[self.active];
         let dir = active.table.read(cx).current_dir().to_path_buf();
         let (locked, lock_dir_change) = (active.locked, active.lock_dir_change);
-        let ix = self.add_tab_entry(dir, locked, lock_dir_change, window, cx);
+        let restore = TabRestore {
+            cursor_name: active.table.read(cx).cursor_entry_name(cx),
+            sort: active.table.read(cx).sort_state(cx),
+        };
+        let ix = self.add_tab_entry(dir, locked, lock_dir_change, restore, window, cx);
         self.active = ix;
         self.focus_active_tab(window, cx);
         cx.notify();
@@ -274,6 +348,8 @@ impl Panel {
             dir: closed.table.read(cx).current_dir().to_path_buf(),
             locked: closed.locked,
             lock_dir_change: closed.lock_dir_change,
+            cursor_name: closed.table.read(cx).cursor_entry_name(cx),
+            sort: closed.table.read(cx).sort_state(cx),
         });
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -297,6 +373,8 @@ impl Panel {
                 dir: t.table.read(cx).current_dir().to_path_buf(),
                 locked: t.locked,
                 lock_dir_change: t.lock_dir_change,
+                cursor_name: t.table.read(cx).cursor_entry_name(cx),
+                sort: t.table.read(cx).sort_state(cx),
             });
         }
         self.tabs.push(keep);
@@ -314,10 +392,15 @@ impl Panel {
         let Some(closed) = self.closed_stack.pop() else {
             return;
         };
+        let restore = TabRestore {
+            cursor_name: closed.cursor_name,
+            sort: closed.sort,
+        };
         let ix = self.add_tab_entry(
             closed.dir,
             closed.locked,
             closed.lock_dir_change,
+            restore,
             window,
             cx,
         );
@@ -450,10 +533,17 @@ impl Panel {
             tabs: self
                 .tabs
                 .iter()
-                .map(|t| SessionTab {
-                    dir: t.table.read(cx).current_dir().to_path_buf(),
-                    locked: t.locked,
-                    lock_dir_change: t.lock_dir_change,
+                .map(|t| {
+                    let table = t.table.read(cx);
+                    let (sort_column, sort_ascending) = table.sort_state(cx);
+                    SessionTab {
+                        dir: table.current_dir().to_path_buf(),
+                        locked: t.locked,
+                        lock_dir_change: t.lock_dir_change,
+                        cursor_name: table.cursor_entry_name(cx),
+                        sort_column: sort_column_to_session(sort_column),
+                        sort_ascending,
+                    }
                 })
                 .collect(),
             active_tab: self.active,
@@ -542,13 +632,16 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::file_table::NavigateRoot;
+    use crate::file_table::{EnterDirectory, NavigateRoot};
 
     fn session_tab(dir: PathBuf, locked: bool, lock_dir_change: bool) -> SessionTab {
         SessionTab {
             dir,
             locked,
             lock_dir_change,
+            cursor_name: None,
+            sort_column: SessionSortColumn::Name,
+            sort_ascending: true,
         }
     }
 
@@ -607,6 +700,34 @@ mod tests {
     /// assertions read more clearly than `dir_a`/`dir_a` twice would).
     fn two_dirs() -> (TempDir, TempDir) {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    /// Waits for `condition` to become true, alternating `run_until_parked`
+    /// with a short real sleep -- a single `run_until_parked()` call isn't
+    /// enough for anything that depends on `spawn_directory_load`'s
+    /// result: that work crosses onto a genuinely separate OS thread (the
+    /// real, if minimal, Tokio runtime `with_panel` builds), and
+    /// `run_until_parked` only guarantees GPUI's own executor has nothing
+    /// left to do *right now* -- it can return while the Tokio-side
+    /// listing is still in flight, before the oneshot channel it
+    /// eventually completes through has been sent. Panics with a clear
+    /// message if `condition` never becomes true within the timeout,
+    /// rather than hanging a test run indefinitely.
+    fn wait_until(
+        vcx: &mut VisualTestContext,
+        mut condition: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            vcx.run_until_parked();
+            if condition(vcx) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("wait_until: condition did not become true within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[gpui::test]
@@ -984,6 +1105,169 @@ mod tests {
                         "the new tab lands at the target the locked tab tried to reach"
                     );
                     assert!(!panel.tabs[1].locked, "the redirected new tab is unlocked");
+                });
+            },
+        );
+    }
+
+    /// T-4.3.7's session-restore path end to end: a tab built from a
+    /// `SessionTab` with `cursor_name`/`sort_column`/`sort_ascending` set
+    /// must, once its (real, async) directory listing finishes loading,
+    /// land the cursor on the named entry and sort by the saved column
+    /// and direction -- not just carry those values around unapplied.
+    #[gpui::test]
+    fn session_restored_cursor_and_sort_apply_once_the_listing_loads(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a_file.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b_file.txt"), "").unwrap();
+        std::fs::write(dir.path().join("c_file.txt"), "").unwrap();
+
+        with_panel(
+            cx,
+            vec![SessionTab {
+                dir: dir.path().to_path_buf(),
+                locked: false,
+                lock_dir_change: false,
+                cursor_name: Some("b_file.txt".to_string()),
+                sort_column: SessionSortColumn::Name,
+                sort_ascending: false,
+            }],
+            0,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                panel.read_with(vcx, |panel, cx| {
+                    let table = panel.tabs[0].table.read(cx);
+                    assert_eq!(
+                        table.cursor_entry_name(cx),
+                        Some("b_file.txt".to_string()),
+                        "cursor must land on the saved entry once the listing loads"
+                    );
+                    assert_eq!(
+                        table.sort_state(cx),
+                        (SortColumn::Name, false),
+                        "sort must match what was saved, not the Name-ascending default"
+                    );
+                });
+            },
+        );
+    }
+
+    /// The graceful-miss half of the same path: a saved cursor name that
+    /// no longer exists in the directory (renamed/deleted since the
+    /// session was saved) must fall back to row 0, never panic or leave
+    /// the cursor unset.
+    #[gpui::test]
+    fn session_restored_cursor_falls_back_to_row_zero_when_the_named_entry_is_gone(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a_file.txt"), "").unwrap();
+        std::fs::write(dir.path().join("z_file.txt"), "").unwrap();
+
+        with_panel(
+            cx,
+            vec![SessionTab {
+                dir: dir.path().to_path_buf(),
+                locked: false,
+                lock_dir_change: false,
+                cursor_name: Some("this_file_no_longer_exists.txt".to_string()),
+                sort_column: SessionSortColumn::Name,
+                sort_ascending: true,
+            }],
+            0,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                panel.read_with(vcx, |panel, cx| {
+                    let table = panel.tabs[0].table.read(cx);
+                    assert_eq!(
+                        table.cursor_entry_name(cx),
+                        Some("a_file.txt".to_string()),
+                        "falls back to row 0 (name-ascending: a_file.txt) rather than \
+                         leaving the cursor unset"
+                    );
+                });
+            },
+        );
+    }
+
+    /// Sort persists across ordinary navigation within a tab, not just
+    /// across a restart -- `FileTable::navigate_to` reads the *current*
+    /// sort back out of the model instead of resetting to the
+    /// Name-ascending default on every directory change (otherwise,
+    /// restored sort state would revert the moment the user navigated
+    /// anywhere after a restore).
+    #[gpui::test]
+    fn sort_persists_across_navigation_within_a_tab(cx: &mut TestAppContext) {
+        let parent = tempfile::tempdir().unwrap();
+        let child = parent.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("x_file.txt"), "").unwrap();
+
+        with_panel(
+            cx,
+            vec![session_tab(parent.path().to_path_buf(), false, false)],
+            0,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+
+                // Sort descending by Size via a real dispatched click-
+                // equivalent isn't available headlessly without a real
+                // header-click simulation, so drive the same effect
+                // `perform_sort` produces directly through the model --
+                // this is exercising `navigate_to`'s carry-forward
+                // behavior, not header-click dispatch (already covered
+                // elsewhere).
+                panel.update_in(vcx, |panel, _window, cx| {
+                    panel.tabs[0].table.update(cx, |table, cx| {
+                        table.state().update(cx, |state, cx| {
+                            state
+                                .delegate_mut()
+                                .model_mut()
+                                .sort_by(SortColumn::Size, false);
+                            cx.notify();
+                        });
+                    });
+                });
+                panel.read_with(vcx, |panel, cx| {
+                    assert_eq!(
+                        panel.tabs[0].table.read(cx).sort_state(cx),
+                        (SortColumn::Size, false)
+                    );
+                });
+
+                // Navigate into a subdirectory -- the new listing must
+                // still be sorted by Size descending, not reset to Name
+                // ascending.
+                let handle = panel.read_with(vcx, |panel, cx| panel.active_focus_handle(cx));
+                vcx.update(|window, _cx| window.focus(&handle));
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                vcx.dispatch_action(EnterDirectory);
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).current_dir() == child
+                    })
+                });
+
+                panel.read_with(vcx, |panel, cx| {
+                    let table = panel.tabs[0].table.read(cx);
+                    assert_eq!(table.current_dir(), child, "sanity: actually navigated");
+                    assert_eq!(
+                        table.sort_state(cx),
+                        (SortColumn::Size, false),
+                        "sort must carry forward across navigation, not reset"
+                    );
                 });
             },
         );
