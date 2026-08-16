@@ -203,6 +203,21 @@ pub struct FileTableDelegate {
     /// behaviour of starting a fresh anchor at wherever the cursor lands
     /// next.
     range_anchor: Option<usize>,
+    /// Bumped by [`Self::bump_nav_generation`] on every `navigate_to`
+    /// (T-4.3.1) call, before its background directory-listing/volume-
+    /// stats queries are spawned. Each spawned task captures the
+    /// generation it was started for and checks it against this field's
+    /// *current* value before applying its result -- if they've since
+    /// diverged, a *newer* navigation has started in the meantime, and
+    /// the (now-stale) result is silently discarded rather than
+    /// overwriting the newer one. Guards against a real, not just
+    /// theoretical, race: two navigations issued in quick succession
+    /// (e.g. pressing Backspace twice before the first listing finishes)
+    /// have no guaranteed completion order, and without this a slower
+    /// first load completing after a faster second one would leave the
+    /// panel showing the wrong directory's contents under the *right*
+    /// directory's path/header.
+    nav_generation: u64,
 }
 
 impl FileTableDelegate {
@@ -254,6 +269,7 @@ impl FileTableDelegate {
             loading: true,
             cursor_row: None,
             range_anchor: None,
+            nav_generation: 0,
         };
         delegate.rebuild_row_text();
         delegate.set_cursor_row(Some(0));
@@ -311,6 +327,19 @@ impl FileTableDelegate {
         self.loading = loading;
     }
 
+    /// Current navigation generation. See the `nav_generation` field's
+    /// doc comment.
+    pub fn nav_generation(&self) -> u64 {
+        self.nav_generation
+    }
+
+    /// Starts a new navigation generation and returns it. See the
+    /// `nav_generation` field's doc comment.
+    pub fn bump_nav_generation(&mut self) -> u64 {
+        self.nav_generation += 1;
+        self.nav_generation
+    }
+
     /// The cursor's current row within `model.order()`, if any (an empty
     /// listing has none).
     pub fn cursor_row(&self) -> Option<usize> {
@@ -361,6 +390,38 @@ impl FileTableDelegate {
         self.range_anchor = None;
         self.set_cursor_row(Some(row.min(len - 1)));
         self.cursor_row
+    }
+
+    /// T-4.3.1's "cursor restores to the child directory when going up":
+    /// after a fresh listing loads, finds `name` in `order()` and moves
+    /// the cursor there instead of leaving it at row 0 (`set_model`'s
+    /// default). Returns whether `name` was actually found -- it might
+    /// not be (the directory was renamed/removed concurrently), in which
+    /// case the caller leaves the row-0 default alone. `O(n)`, but this
+    /// only ever runs once per completed directory load, never per frame.
+    fn select_row_by_name(&mut self, name: &str) -> bool {
+        let Some(row) = self
+            .model
+            .order()
+            .iter()
+            .position(|&ix| self.model.entries().name(EntryId::new(ix)) == name)
+        else {
+            return false;
+        };
+        self.move_cursor_to(row);
+        true
+    }
+
+    /// The cursor entry's name, if (and only if) it's a directory
+    /// (T-4.3.1's Enter-to-descend) -- `None` for files, symlinks
+    /// (`nav.follow_symlink` isn't implemented), or an empty/cursor-less
+    /// listing.
+    fn cursor_dir_name(&self) -> Option<String> {
+        let row = self.cursor_row?;
+        let &ix = self.model.order().get(row)?;
+        let id = EntryId::new(ix);
+        (self.model.entries().kind(id) == EntryKind::Directory)
+            .then(|| self.model.entries().name(id).to_string())
     }
 
     /// Shift+movement's range-select: extends/shrinks the selection
@@ -805,6 +866,32 @@ actions!(
     ]
 );
 
+// T-4.3.1's navigation commands, per `docs/keymap-tc.csv`'s `nav.*` rows
+// -- same "plain GPUI action, not routed through duet-commands" shape as
+// every other action block above.
+//
+// `EnterDirectory` covers only `nav.enter_dir`, not plain Enter's real TC
+// behaviour (`nav.open_or_enter`, which also opens/executes files under
+// the cursor) -- file execution/associations is a separate, larger
+// feature, out of scope here. `NavigateHome`'s binding (Alt+Home) is my
+// own choice, not a verified TC one -- see that action's handler doc
+// comment. `nav.root`'s "root of the active drive" is `/` outright until
+// real multi-mount navigation exists. `nav.history_open` (a history
+// overlay dialog), `nav.goto_path`/`nav.path_complete` (breadcrumb/path-
+// bar editing, T-4.3.4's job), and the directory hotlist/bookmarks
+// (T-4.3.5's job, FR-NAV-08's other half) are all deliberately not here.
+actions!(
+    duet_file_table,
+    [
+        EnterDirectory,
+        NavigateParent,
+        NavigateRoot,
+        NavigateHome,
+        HistoryBack,
+        HistoryForward
+    ]
+);
+
 /// Registers [`FileTable`]'s keybindings. Called once from
 /// `workspace::run`, before any window opens -- see `bind_workspace_keys`
 /// for the identical pattern this mirrors. `Some("FileTable")` scopes
@@ -841,6 +928,14 @@ pub fn bind_file_table_keys(cx: &mut App) {
         KeyBinding::new("shift-end", ExtendSelectionToBottom, Some("FileTable")),
         KeyBinding::new("shift-pageup", ExtendSelectionPageUp, Some("FileTable")),
         KeyBinding::new("shift-pagedown", ExtendSelectionPageDown, Some("FileTable")),
+        KeyBinding::new("enter", EnterDirectory, Some("FileTable")),
+        KeyBinding::new("ctrl-pagedown", EnterDirectory, Some("FileTable")),
+        KeyBinding::new("backspace", NavigateParent, Some("FileTable")),
+        KeyBinding::new("ctrl-pageup", NavigateParent, Some("FileTable")),
+        KeyBinding::new("ctrl-\\", NavigateRoot, Some("FileTable")),
+        KeyBinding::new("alt-home", NavigateHome, Some("FileTable")),
+        KeyBinding::new("alt-left", HistoryBack, Some("FileTable")),
+        KeyBinding::new("alt-right", HistoryForward, Some("FileTable")),
     ]);
 }
 
@@ -854,11 +949,8 @@ pub fn bind_file_table_keys(cx: &mut App) {
 pub struct FileTable {
     state: Entity<TableState<FileTableDelegate>>,
     focus_handle: FocusHandle,
-    /// The directory this panel is currently showing. Static today (no
-    /// navigation commands exist yet -- T-4.3.1's job); stored rather than
-    /// just passed transiently to `new` so `workspace::panel_header`
-    /// (T-4.2.7) has something real to display, and so navigation can
-    /// update it in place later without changing this field's shape.
+    /// The directory this panel is currently showing -- `navigate_to`
+    /// (T-4.3.1) is the only thing that changes it after construction.
     current_dir: PathBuf,
     /// The volume's free/total space as of the last successful query
     /// (T-4.2.7's free-space indicator), or `None` until
@@ -868,6 +960,17 @@ pub struct FileTable {
     /// so "the directory changed" is the practical proxy for "the volume
     /// might have changed" until real multi-mount navigation lands.
     volume_stats: Option<duet_vfs::VolumeStats>,
+    /// Retained (rather than only ever borrowed transiently through
+    /// `new`) so `navigate_to` (T-4.3.1) can re-spawn a directory listing
+    /// and a volume-stats query later, not just once at construction.
+    tokio_handle: tokio::runtime::Handle,
+    /// Per-panel directory history (FR-NAV-08), browser-style: `navigate_to`
+    /// pushes the *previous* directory here and clears `history_forward`
+    /// on every ordinary navigation (entering a directory, going to the
+    /// parent/root/home); `history_back`/`history_forward` themselves move
+    /// between the two stacks without disturbing either past that.
+    history_back: Vec<PathBuf>,
+    history_forward: Vec<PathBuf>,
 }
 
 impl FileTable {
@@ -888,8 +991,15 @@ impl FileTable {
     ) -> Self {
         let delegate = FileTableDelegate::new(DirectoryModel::new());
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
-        spawn_directory_load(dir.clone(), tokio_handle.clone(), state.clone(), cx);
-        spawn_volume_stats_load(dir.clone(), tokio_handle, cx);
+        spawn_directory_load(
+            dir.clone(),
+            tokio_handle.clone(),
+            state.clone(),
+            None,
+            0,
+            cx,
+        );
+        spawn_volume_stats_load(dir.clone(), tokio_handle.clone(), 0, cx);
 
         // `duet_widgets::table::TableState` has its own built-in
         // click-to-select row/column tracking (`selected_row`/
@@ -921,6 +1031,9 @@ impl FileTable {
             focus_handle: cx.focus_handle(),
             current_dir: dir,
             volume_stats: None,
+            tokio_handle,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
         }
     }
 
@@ -1067,6 +1180,123 @@ impl FileTable {
             cx.notify();
         });
     }
+
+    /// The core "change directory" primitive T-4.3.1's other navigation
+    /// methods build on: updates `current_dir`, flips the table to its
+    /// loading state immediately (visual feedback while the new listing
+    /// is in flight, same as the very first load), and re-spawns both
+    /// background queries (`spawn_directory_load`/`spawn_volume_stats_load`)
+    /// against the new directory.
+    ///
+    /// `push_history`: `true` for ordinary navigation (entering a
+    /// directory, going to the parent/root/home) -- pushes the *previous*
+    /// `current_dir` onto `history_back` and clears `history_forward`,
+    /// browser-style. `false` for `navigate_history_back`/`_forward`
+    /// themselves, which move between the two stacks directly instead of
+    /// adding to either.
+    ///
+    /// `select_name`: see `spawn_directory_load`'s doc comment.
+    fn navigate_to(
+        &mut self,
+        dir: PathBuf,
+        push_history: bool,
+        select_name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if push_history {
+            self.history_back.push(self.current_dir.clone());
+            self.history_forward.clear();
+        }
+        self.current_dir = dir.clone();
+        let generation = self.state.update(cx, |state, cx| {
+            let generation = state.delegate_mut().bump_nav_generation();
+            state.delegate_mut().set_loading(true);
+            cx.notify();
+            generation
+        });
+        spawn_directory_load(
+            dir.clone(),
+            self.tokio_handle.clone(),
+            self.state.clone(),
+            select_name,
+            generation,
+            cx,
+        );
+        spawn_volume_stats_load(dir, self.tokio_handle.clone(), generation, cx);
+    }
+
+    /// Enter/Ctrl+PgDn (`nav.enter_dir`): descends into the directory
+    /// under the cursor. A no-op if the cursor isn't on one -- following
+    /// a symlink into its target directory (`nav.follow_symlink`) and
+    /// opening/executing a file (the other half of plain Enter's real TC
+    /// behaviour, `nav.open_or_enter`) are both out of scope here; see
+    /// the module doc comment.
+    fn enter_cursor_directory(&mut self, cx: &mut Context<Self>) {
+        let name = self.state.read(cx).delegate().cursor_dir_name();
+        if let Some(name) = name {
+            let target = self.current_dir.join(name);
+            self.navigate_to(target, true, None, cx);
+        }
+    }
+
+    /// Backspace/Ctrl+PgUp (`nav.open_parent_and_select`): goes up one
+    /// level, then -- once the parent's listing loads -- moves the
+    /// cursor onto the directory just left ("the detail that makes
+    /// navigation feel right" per this task's own AC). A no-op already
+    /// at the root (`Path::parent()` returns `None`).
+    fn navigate_to_parent(&mut self, cx: &mut Context<Self>) {
+        let Some(parent) = self.current_dir.parent().map(PathBuf::from) else {
+            return;
+        };
+        let child_name = self
+            .current_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        self.navigate_to(parent, true, child_name, cx);
+    }
+
+    /// Ctrl+\ (`nav.root`): jumps to `/`. "Root of the *active drive*"
+    /// once real multi-mount navigation exists (a later task); today
+    /// there's only ever the one filesystem, so this simplifies to the
+    /// filesystem root outright.
+    fn navigate_to_root(&mut self, cx: &mut Context<Self>) {
+        self.navigate_to(PathBuf::from("/"), true, None, cx);
+    }
+
+    /// `nav.home`: jumps to `$HOME`, a no-op if it isn't set. Bound to
+    /// Alt+Home -- unlike every other binding in this module,
+    /// `docs/keymap-tc.csv` has *no row at all* for `nav.home` (TC
+    /// predates "home directory" being as central a concept as it is on
+    /// Unix), so this chord is my own reasonable-default choice, not a
+    /// verified TC binding. Implemented anyway (rather than left
+    /// unreachable, the call T-4.2.3's `select_same_name` made) because
+    /// this task's own AC names "home" as one of the four required
+    /// navigation capabilities, unlike that one.
+    fn navigate_to_home(&mut self, cx: &mut Context<Self>) {
+        if let Some(home) = std::env::var_os("HOME") {
+            self.navigate_to(PathBuf::from(home), true, None, cx);
+        }
+    }
+
+    /// Alt+Left (`nav.history_back`): moves to the previous directory in
+    /// this panel's own history, if any.
+    fn navigate_history_back(&mut self, cx: &mut Context<Self>) {
+        let Some(prev) = self.history_back.pop() else {
+            return;
+        };
+        self.history_forward.push(self.current_dir.clone());
+        self.navigate_to(prev, false, None, cx);
+    }
+
+    /// Alt+Right (`nav.history_forward`): the redo half of
+    /// [`Self::navigate_history_back`].
+    fn navigate_history_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = self.history_forward.pop() else {
+            return;
+        };
+        self.history_back.push(self.current_dir.clone());
+        self.navigate_to(next, false, None, cx);
+    }
 }
 
 impl Focusable for FileTable {
@@ -1165,6 +1395,24 @@ impl Render for FileTable {
                     this.extend_selection_by_page(1, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &EnterDirectory, _window, cx| {
+                this.enter_cursor_directory(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateParent, _window, cx| {
+                this.navigate_to_parent(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateRoot, _window, cx| {
+                this.navigate_to_root(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NavigateHome, _window, cx| {
+                this.navigate_to_home(cx);
+            }))
+            .on_action(cx.listener(|this, _: &HistoryBack, _window, cx| {
+                this.navigate_history_back(cx);
+            }))
+            .on_action(cx.listener(|this, _: &HistoryForward, _window, cx| {
+                this.navigate_history_forward(cx);
+            }))
             // 20% smaller than `gpui-component`'s 16px default, scoped to
             // just this panel (cascades into `Table`'s header/row text) --
             // not a global theme change, so the command line, status bar,
@@ -1218,11 +1466,21 @@ impl Render for FileTable {
 
 /// Lists `dir` on the core's Tokio runtime (never the GPUI/UI thread),
 /// then applies the result to `state` through GPUI's foreground executor --
-/// see the struct doc comment.
+/// see the struct doc comment. `select_name`: T-4.3.1's "cursor restores
+/// to the child directory when going up" -- if given, the cursor lands on
+/// that entry once loaded (via `select_row_by_name`) instead of
+/// `set_model`'s row-0 default; `None` for the ordinary case (entering a
+/// directory, opening at startup) where there's no specific row to
+/// restore. `generation`: the `FileTableDelegate::nav_generation` this
+/// load was started for -- see that field's doc comment for why the
+/// result is silently discarded (not applied) if a newer navigation has
+/// started by the time this completes.
 fn spawn_directory_load(
     dir: PathBuf,
     tokio_handle: tokio::runtime::Handle,
     state: Entity<TableState<FileTableDelegate>>,
+    select_name: Option<String>,
+    generation: u64,
     cx: &mut Context<FileTable>,
 ) {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1259,19 +1517,33 @@ fn spawn_directory_load(
         let entry_count = model.order().len();
 
         let updated = state.update(cx, |state, cx| {
+            if state.delegate().nav_generation() != generation {
+                tracing::debug!(
+                    target: "duet_ui::file_table",
+                    generation,
+                    current = state.delegate().nav_generation(),
+                    "discarding stale directory listing (a newer navigation has since started)"
+                );
+                return false;
+            }
             let delegate = state.delegate_mut();
             delegate.set_model(model);
+            if let Some(name) = &select_name {
+                delegate.select_row_by_name(name);
+            }
             delegate.set_loading(false);
             cx.notify();
+            true
         });
 
         match updated {
-            Ok(()) => {
+            Ok(true) => {
                 tracing::info!(
                     target: "duet_ui::file_table",
                     "directory listing loaded: {entry_count} entries"
                 );
             }
+            Ok(false) => {}
             Err(_) => {
                 tracing::warn!(
                     target: "duet_ui::file_table",
@@ -1326,6 +1598,7 @@ async fn list_directory(dir: PathBuf) -> Result<Vec<DirEntry>, String> {
 fn spawn_volume_stats_load(
     dir: PathBuf,
     tokio_handle: tokio::runtime::Handle,
+    generation: u64,
     cx: &mut Context<FileTable>,
 ) {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1354,7 +1627,18 @@ fn spawn_volume_stats_load(
             }
         };
 
+        // See `FileTableDelegate::nav_generation`'s doc comment: a stale
+        // result from a superseded navigation is silently discarded
+        // rather than overwriting a newer one's stats.
         let _ = this.update(cx, |this, cx| {
+            if this.state.read(cx).delegate().nav_generation() != generation {
+                tracing::debug!(
+                    target: "duet_ui::file_table",
+                    generation,
+                    "discarding stale volume-stats result (a newer navigation has since started)"
+                );
+                return;
+            }
             this.volume_stats = Some(stats);
             cx.notify();
         });
@@ -1516,6 +1800,57 @@ mod tests {
             Some(0),
             "f4 is now first in name-descending order, so its row must follow"
         );
+    }
+
+    #[test]
+    fn cursor_dir_name_returns_name_only_for_directories() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("adir", &meta(EntryKind::Directory, 0, 0));
+        model
+            .entries_mut()
+            .push("bfile.txt", &meta(EntryKind::File, 10, 0));
+        model.sort_by(SortColumn::Name, true);
+        let mut delegate = FileTableDelegate::new(model);
+
+        delegate.move_cursor_to(0); // "adir"
+        assert_eq!(delegate.cursor_dir_name(), Some("adir".to_string()));
+
+        delegate.move_cursor_to(1); // "bfile.txt"
+        assert_eq!(delegate.cursor_dir_name(), None);
+    }
+
+    #[test]
+    fn cursor_dir_name_is_none_on_empty_listing() {
+        let delegate = FileTableDelegate::new(DirectoryModel::new());
+        assert_eq!(delegate.cursor_dir_name(), None);
+    }
+
+    #[test]
+    fn select_row_by_name_finds_and_moves_cursor() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.move_cursor_to(0);
+        assert!(delegate.select_row_by_name("f3"));
+        assert_eq!(delegate.cursor_row(), Some(3));
+    }
+
+    #[test]
+    fn select_row_by_name_returns_false_and_leaves_cursor_when_not_found() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.move_cursor_to(2);
+        assert!(!delegate.select_row_by_name("does-not-exist"));
+        assert_eq!(delegate.cursor_row(), Some(2), "cursor stays put on a miss");
+    }
+
+    #[test]
+    fn nav_generation_starts_at_zero_and_increments() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.nav_generation(), 0);
+        assert_eq!(delegate.bump_nav_generation(), 1);
+        assert_eq!(delegate.nav_generation(), 1);
+        assert_eq!(delegate.bump_nav_generation(), 2);
+        assert_eq!(delegate.nav_generation(), 2);
     }
 
     fn selected_names(delegate: &FileTableDelegate) -> Vec<String> {
