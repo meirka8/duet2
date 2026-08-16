@@ -213,6 +213,7 @@ impl Panel {
     fn open_redirected_tab(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.add_tab_entry(dir, false, false, window, cx);
         self.active = ix;
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -226,6 +227,7 @@ impl Panel {
         let dir = self.active_table().read(cx).current_dir().to_path_buf();
         let ix = self.add_tab_entry(dir, false, false, window, cx);
         self.active = ix;
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -238,6 +240,7 @@ impl Panel {
         let (locked, lock_dir_change) = (active.locked, active.lock_dir_change);
         let ix = self.add_tab_entry(dir, locked, lock_dir_change, window, cx);
         self.active = ix;
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -246,7 +249,7 @@ impl Panel {
     /// tab -- matches `docs/commands.md`'s own context predicate
     /// (`panel && tab.count > 1`); TC never lets a panel drop to zero
     /// tabs.
-    pub fn close_active(&mut self, cx: &mut Context<Self>) {
+    pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
         }
@@ -259,6 +262,7 @@ impl Panel {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -266,7 +270,7 @@ impl Panel {
     /// active one, pushing each onto `closed_stack` in closing order (so
     /// `reopen_closed` brings the most-recently-active-before-closing one
     /// back first).
-    pub fn close_others(&mut self, cx: &mut Context<Self>) {
+    pub fn close_others(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
         }
@@ -281,6 +285,7 @@ impl Panel {
         }
         self.tabs.push(keep);
         self.active = 0;
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -301,24 +306,27 @@ impl Panel {
             cx,
         );
         self.active = ix;
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
     /// Ctrl+Tab (`tab.next`): wraps from the last tab to the first.
-    pub fn next_tab(&mut self, cx: &mut Context<Self>) {
+    pub fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
         }
         self.active = (self.active + 1) % self.tabs.len();
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
     /// Ctrl+Shift+Tab (`tab.prev`): wraps from the first tab to the last.
-    pub fn prev_tab(&mut self, cx: &mut Context<Self>) {
+    pub fn prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
             return;
         }
         self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+        self.focus_active_tab(window, cx);
         cx.notify();
     }
 
@@ -328,11 +336,28 @@ impl Panel {
     /// `ix` is a silent no-op rather than a panic: a stale click (the tab
     /// strip changed between the click starting and landing) is a normal
     /// race, not a bug.
-    pub fn switch_to(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub fn switch_to(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.tabs.len() && ix != self.active {
             self.active = ix;
+            self.focus_active_tab(window, cx);
             cx.notify();
         }
+    }
+
+    /// Moves real keyboard focus onto the active tab's `FileTable`.
+    /// Called after every command that changes which tab is active
+    /// (`new_tab`, `close_active`, `next_tab`, the tab strip's click
+    /// handler, ...): without this, focus stays on whichever `FileTable`
+    /// held it before the switch -- which, for a *closed* or no-longer-
+    /// rendered tab, is an element no longer in the dispatch tree at all,
+    /// so no key press reaches anything and the panel reads as neither
+    /// active nor inactive (T-4.3.2 UAT: "neither panel is active any
+    /// more" after switching tabs). `move_active_left`/`_right` don't call
+    /// this -- they reorder `tabs` but never change *which* `FileTable`
+    /// entity is active, so its focus state is untouched by them.
+    fn focus_active_tab(&self, window: &mut Window, cx: &App) {
+        let handle = self.active_table().read(cx).focus_handle(cx);
+        window.focus(&handle);
     }
 
     /// `tab.lock` (no default key): toggles the active tab's base lock.
@@ -448,8 +473,8 @@ impl Panel {
                     } else {
                         bg
                     })
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        this.switch_to(ix, cx);
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.switch_to(ix, window, cx);
                     }))
                     .child(label)
             }))
@@ -483,9 +508,9 @@ impl Render for Panel {
             .size_full()
             .key_context("Panel")
             .on_action(cx.listener(|this, _: &TabNew, window, cx| this.new_tab(window, cx)))
-            .on_action(cx.listener(|this, _: &TabClose, _window, cx| this.close_active(cx)))
-            .on_action(cx.listener(|this, _: &TabNext, _window, cx| this.next_tab(cx)))
-            .on_action(cx.listener(|this, _: &TabPrev, _window, cx| this.prev_tab(cx)))
+            .on_action(cx.listener(|this, _: &TabClose, window, cx| this.close_active(window, cx)))
+            .on_action(cx.listener(|this, _: &TabNext, window, cx| this.next_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &TabPrev, window, cx| this.prev_tab(window, cx)))
             .on_action(cx.listener(|this, _: &TabReopenClosed, window, cx| {
                 this.reopen_closed(window, cx);
             }))
@@ -624,13 +649,13 @@ mod tests {
             ],
             1,
             |panel, vcx| {
-                panel.update_in(vcx, |panel, _window, cx| panel.close_active(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.close_active(window, cx));
                 panel.read_with(vcx, |panel, cx| {
                     assert_eq!(panel.tabs.len(), 1);
                     assert_eq!(panel.tabs[0].table.read(cx).current_dir(), dir_a.path());
                 });
                 // Closing the last remaining tab must be a no-op.
-                panel.update_in(vcx, |panel, _window, cx| panel.close_active(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.close_active(window, cx));
                 panel.read_with(vcx, |panel, _| {
                     assert_eq!(panel.tabs.len(), 1, "never closes the last tab");
                 });
@@ -649,16 +674,65 @@ mod tests {
             ],
             0,
             |panel, vcx| {
-                panel.update_in(vcx, |panel, _window, cx| panel.next_tab(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.next_tab(window, cx));
                 panel.read_with(vcx, |panel, _| assert_eq!(panel.active, 1));
-                panel.update_in(vcx, |panel, _window, cx| panel.next_tab(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.next_tab(window, cx));
                 panel.read_with(vcx, |panel, _| {
                     assert_eq!(panel.active, 0, "wraps from the last tab back to the first")
                 });
-                panel.update_in(vcx, |panel, _window, cx| panel.prev_tab(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.prev_tab(window, cx));
                 panel.read_with(vcx, |panel, _| {
                     assert_eq!(panel.active, 1, "wraps from the first tab back to the last")
                 });
+            },
+        );
+    }
+
+    /// UAT regression: switching tabs (by any means -- a new tab, closing
+    /// one, next/prev, or a tab-strip click) must move real keyboard focus
+    /// onto the newly-active tab's `FileTable`. Without that, focus is
+    /// left pointing at whichever tab held it before the switch -- for a
+    /// tab that's no longer the one being rendered, an element outside the
+    /// current dispatch tree, so no key press reaches anything and (per
+    /// the report) *neither* panel reads as active any more. Checked via
+    /// real `FocusHandle::is_focused`, not just `panel.active`'s index --
+    /// the index alone wouldn't have caught this bug at all.
+    #[gpui::test]
+    fn switching_tabs_moves_real_keyboard_focus_to_the_new_active_tab(cx: &mut TestAppContext) {
+        let (dir_a, dir_b) = two_dirs();
+        with_panel(
+            cx,
+            vec![
+                session_tab(dir_a.path().to_path_buf(), false, false),
+                session_tab(dir_b.path().to_path_buf(), false, false),
+            ],
+            0,
+            |panel, vcx| {
+                let first_handle = panel.read_with(vcx, |panel, cx| panel.active_focus_handle(cx));
+                vcx.update(|window, _cx| window.focus(&first_handle));
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                vcx.update(|window, _cx| assert!(first_handle.is_focused(window)));
+
+                panel.update_in(vcx, |panel, window, cx| panel.next_tab(window, cx));
+                let _ = vcx.update(|window, cx| window.draw(cx));
+
+                let second_handle = panel.read_with(vcx, |panel, cx| panel.active_focus_handle(cx));
+                vcx.update(|window, _cx| {
+                    assert!(
+                        second_handle.is_focused(window),
+                        "the newly-active tab must hold real keyboard focus after switching"
+                    );
+                    assert!(
+                        !first_handle.is_focused(window),
+                        "the previous tab must not still hold focus"
+                    );
+                });
+
+                // And switching back must move focus back, not leave it
+                // stranded on the tab that was active in between.
+                panel.update_in(vcx, |panel, window, cx| panel.prev_tab(window, cx));
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                vcx.update(|window, _cx| assert!(first_handle.is_focused(window)));
             },
         );
     }
@@ -728,7 +802,7 @@ mod tests {
             ],
             1,
             |panel, vcx| {
-                panel.update_in(vcx, |panel, _window, cx| panel.close_others(cx));
+                panel.update_in(vcx, |panel, window, cx| panel.close_others(window, cx));
                 panel.read_with(vcx, |panel, cx| {
                     assert_eq!(panel.tabs.len(), 1);
                     assert_eq!(panel.active, 0);
@@ -796,9 +870,9 @@ mod tests {
             ],
             0,
             |panel, vcx| {
-                panel.update_in(vcx, |panel, _window, cx| panel.switch_to(50, cx));
+                panel.update_in(vcx, |panel, window, cx| panel.switch_to(50, window, cx));
                 panel.read_with(vcx, |panel, _| assert_eq!(panel.active, 0));
-                panel.update_in(vcx, |panel, _window, cx| panel.switch_to(1, cx));
+                panel.update_in(vcx, |panel, window, cx| panel.switch_to(1, window, cx));
                 panel.read_with(vcx, |panel, _| assert_eq!(panel.active, 1));
             },
         );
