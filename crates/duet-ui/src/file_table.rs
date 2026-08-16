@@ -218,6 +218,31 @@ pub struct FileTableDelegate {
     /// panel showing the wrong directory's contents under the *right*
     /// directory's path/header.
     nav_generation: u64,
+    /// Whether to show a synthetic ".." row above every real entry
+    /// (T-4.3.1's parent-directory navigation affordance) -- `false` at
+    /// the filesystem root, where there's nowhere to go up to. This
+    /// delegate deliberately doesn't know `current_dir` itself (that
+    /// lives on `FileTable`, the one thing that changes across
+    /// navigation); `FileTable::navigate_to`/`FileTable::new` compute it
+    /// and push it in via [`Self::set_has_parent_row`] whenever the
+    /// directory changes. Not part of `model`/`EntryStore` at all -- see
+    /// [`Self::display_row`]'s doc comment for why.
+    has_parent_row: bool,
+    /// Whether the *display* cursor is on the synthetic ".." row
+    /// (display row 0, whenever `has_parent_row`) rather than pointing
+    /// at `cursor_row`. `cursor_row` keeps its ordinary, pseudo-row-
+    /// unaware meaning throughout -- every existing selection method
+    /// (`toggle_cursor_selection`, `extend_selection_to`, ...) still
+    /// reads it directly and stays completely unaware the pseudo-row
+    /// exists, which is deliberate: "select/extend from wherever the
+    /// cursor last meaningfully was" is a perfectly reasonable answer for
+    /// what Ins/Shift+movement do while sitting on "..", and building
+    /// every selection method to understand a row with no underlying
+    /// entry would roughly double this feature's size for a case nobody
+    /// asked about. [`Self::display_row`]/[`Self::set_display_cursor`]
+    /// are the translation boundary cursor *movement* and *rendering*
+    /// go through instead.
+    cursor_on_parent: bool,
 }
 
 impl FileTableDelegate {
@@ -270,6 +295,8 @@ impl FileTableDelegate {
             cursor_row: None,
             range_anchor: None,
             nav_generation: 0,
+            has_parent_row: false,
+            cursor_on_parent: false,
         };
         delegate.rebuild_row_text();
         delegate.set_cursor_row(Some(0));
@@ -319,6 +346,15 @@ impl FileTableDelegate {
         self.model = model;
         self.cached_generation = u64::MAX;
         self.rebuild_row_text();
+        // Every fresh listing starts the cursor on real row 0, not
+        // wherever `cursor_on_parent` happened to be left over from
+        // whatever directory was showing before -- without this, a plain
+        // `Enter`/`nav.enter_dir` into a subdirectory while sitting on the
+        // ".." row would silently land the new listing's cursor back on
+        // its own ".." row instead of row 0, since `set_has_parent_row`
+        // (called right after this, once the new directory's parent-ness
+        // is known) only clears it when there's no parent row to be on.
+        self.cursor_on_parent = false;
         self.set_cursor_row(Some(0));
         self.range_anchor = None;
     }
@@ -361,35 +397,100 @@ impl FileTableDelegate {
         self.model.set_cursor(id);
     }
 
-    /// Moves the cursor by `delta` rows (negative for up), clamped to
-    /// `[0, order().len() - 1]`. Returns the resulting row so the caller
-    /// (`FileTable`'s action handlers) can decide whether to scroll it
-    /// into view -- a no-op (empty listing) returns `None`. Ends any
-    /// in-progress range-select session -- see the `range_anchor` field's
-    /// doc comment.
-    fn move_cursor_by(&mut self, delta: i64) -> Option<usize> {
-        let len = self.model.order().len();
-        if len == 0 {
-            return None;
+    /// See the `has_parent_row` field's doc comment. Called by
+    /// `FileTable::navigate_to`/`FileTable::new` whenever `current_dir`
+    /// changes; leaving the pseudo-row (clearing `cursor_on_parent`) if
+    /// it's no longer showing (moving to the filesystem root) rather than
+    /// leaving the cursor stuck nowhere real.
+    pub fn set_has_parent_row(&mut self, has_parent: bool) {
+        self.has_parent_row = has_parent;
+        if !has_parent {
+            self.cursor_on_parent = false;
         }
-        self.range_anchor = None;
-        let current = self.cursor_row.unwrap_or(0) as i64;
-        let target = (current + delta).clamp(0, len as i64 - 1) as usize;
-        self.set_cursor_row(Some(target));
-        self.cursor_row
     }
 
-    /// Moves the cursor directly to `row`, clamped into range (so
-    /// `usize::MAX` is a convenient "last row" for End/Ctrl+End). Ends any
-    /// in-progress range-select session, same as `move_cursor_by`.
-    fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
-        let len = self.model.order().len();
+    /// `0` or `1` -- how many rows the synthetic ".." row, if showing,
+    /// adds ahead of every `model.order()`-indexed row. The one number
+    /// every display-row/model-row translation in this file is built on.
+    fn parent_offset(&self) -> usize {
+        self.has_parent_row as usize
+    }
+
+    /// `TableDelegate::rows_count`'s real answer -- `model.order().len()`
+    /// alone undercounts by one whenever the ".." row is showing.
+    fn display_rows_count(&self) -> usize {
+        self.model.order().len() + self.parent_offset()
+    }
+
+    /// The cursor's position in *display*-row terms: row 0 is the ".."
+    /// row when [`Self::set_has_parent_row`] is showing one, matching
+    /// exactly what `TableState::scroll_to_row`/`visible_range` index by
+    /// (since `TableDelegate::rows_count` reports [`Self::display_rows_count`],
+    /// not `model.order().len()`) -- this is deliberately a *different*
+    /// number from [`Self::cursor_row`] (model-row terms) whenever a
+    /// parent row is showing, and the two are never meant to be compared
+    /// directly.
+    pub fn display_row(&self) -> Option<usize> {
+        if self.cursor_on_parent {
+            Some(0)
+        } else {
+            self.cursor_row.map(|r| r + self.parent_offset())
+        }
+    }
+
+    /// The inverse of [`Self::display_row`]: moves the cursor to `row`
+    /// (display-row terms), translating into `cursor_on_parent`/
+    /// `cursor_row` as appropriate. The one place that decides "is this
+    /// display row the pseudo-row or a real one" -- `move_cursor_by`/
+    /// `move_cursor_to` (the only callers) stay simple, uniform
+    /// `0..display_rows_count()` arithmetic because of it.
+    fn set_display_cursor(&mut self, row: Option<usize>) {
+        match row {
+            Some(0) if self.has_parent_row => self.cursor_on_parent = true,
+            Some(r) => {
+                self.cursor_on_parent = false;
+                self.set_cursor_row(Some(r - self.parent_offset()));
+            }
+            None => {
+                self.cursor_on_parent = false;
+                self.set_cursor_row(None);
+            }
+        }
+    }
+
+    /// Moves the cursor by `delta` rows (negative for up), clamped to
+    /// `[0, display_rows_count() - 1]` -- *display* rows, so the ".." row
+    /// (if showing) is a real stop like any other. Returns the resulting
+    /// display row so the caller (`FileTable`'s action handlers) can
+    /// decide whether to scroll it into view, matching
+    /// `TableState`'s own row indexing exactly (see
+    /// `display_rows_count`'s doc comment) -- a no-op (empty listing, no
+    /// parent row) returns `None`. Ends any in-progress range-select
+    /// session -- see the `range_anchor` field's doc comment.
+    fn move_cursor_by(&mut self, delta: i64) -> Option<usize> {
+        let len = self.display_rows_count();
         if len == 0 {
             return None;
         }
         self.range_anchor = None;
-        self.set_cursor_row(Some(row.min(len - 1)));
-        self.cursor_row
+        let current = self.display_row().unwrap_or(0) as i64;
+        let target = (current + delta).clamp(0, len as i64 - 1) as usize;
+        self.set_display_cursor(Some(target));
+        self.display_row()
+    }
+
+    /// Moves the cursor directly to `row` (display-row terms, like
+    /// `move_cursor_by`), clamped into range (so `usize::MAX` is a
+    /// convenient "last row" for End/Ctrl+End). Ends any in-progress
+    /// range-select session, same as `move_cursor_by`.
+    fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
+        let len = self.display_rows_count();
+        if len == 0 {
+            return None;
+        }
+        self.range_anchor = None;
+        self.set_display_cursor(Some(row.min(len - 1)));
+        self.display_row()
     }
 
     /// T-4.3.1's "cursor restores to the child directory when going up":
@@ -414,14 +515,29 @@ impl FileTableDelegate {
 
     /// The cursor entry's name, if (and only if) it's a directory
     /// (T-4.3.1's Enter-to-descend) -- `None` for files, symlinks
-    /// (`nav.follow_symlink` isn't implemented), or an empty/cursor-less
-    /// listing.
+    /// (`nav.follow_symlink` isn't implemented), an empty/cursor-less
+    /// listing, or -- deliberately -- while [`Self::cursor_on_parent`] is
+    /// true: `cursor_row` isn't guaranteed to still point at anything
+    /// meaningful once the display cursor has moved onto the pseudo-row,
+    /// and returning it anyway would risk `FileTable::enter_cursor_directory`
+    /// descending into a stale, wrong directory. `FileTable` checks
+    /// `cursor_on_parent` first and handles that case itself (routing to
+    /// `navigate_to_parent`), so this never needs to.
     fn cursor_dir_name(&self) -> Option<String> {
+        if self.cursor_on_parent {
+            return None;
+        }
         let row = self.cursor_row?;
         let &ix = self.model.order().get(row)?;
         let id = EntryId::new(ix);
         (self.model.entries().kind(id) == EntryKind::Directory)
             .then(|| self.model.entries().name(id).to_string())
+    }
+
+    /// Whether the display cursor is on the synthetic ".." row. See the
+    /// `cursor_on_parent` field's doc comment.
+    pub fn cursor_on_parent(&self) -> bool {
+        self.cursor_on_parent
     }
 
     /// Shift+movement's range-select: extends/shrinks the selection
@@ -624,7 +740,7 @@ impl TableDelegate for FileTableDelegate {
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.model.order().len()
+        self.display_rows_count()
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> &Column {
@@ -665,16 +781,31 @@ impl TableDelegate for FileTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> TableRow {
-        let is_cursor = self.cursor_row == Some(row_ix);
+        let row = div().id(("file-row", row_ix));
+        let tokens = TokenPalette::current(cx);
+
+        // The synthetic ".." row (T-4.3.1) is always display row 0 when
+        // showing -- see `has_parent_row`'s doc comment. It can never be
+        // selected (there's no underlying entry to select), only ever
+        // shown as the cursor.
+        if self.has_parent_row && row_ix == 0 {
+            return if self.cursor_on_parent {
+                row.bg(tokens.color.cursor_bg)
+                    .text_color(tokens.color.cursor_fg)
+            } else {
+                row
+            };
+        }
+
+        let model_row = row_ix - self.parent_offset();
+        let is_cursor = !self.cursor_on_parent && self.cursor_row == Some(model_row);
         let selected = self
             .model
             .order()
-            .get(row_ix)
+            .get(model_row)
             .copied()
             .is_some_and(|ix| self.model.is_selected(EntryId::new(ix)));
 
-        let row = div().id(("file-row", row_ix));
-        let tokens = TokenPalette::current(cx);
         if is_cursor {
             row.bg(tokens.color.cursor_bg)
                 .text_color(tokens.color.cursor_fg)
@@ -694,16 +825,26 @@ impl TableDelegate for FileTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let text = self
-            .row_text
-            .get(row_ix)
-            .map(|row| match col_ix {
-                COL_NAME => row.name.clone(),
-                COL_SIZE => row.size.clone(),
-                COL_MODIFIED => row.modified.clone(),
+        // The synthetic ".." row (T-4.3.1) has no `row_text` entry -- it
+        // isn't a model row at all -- so it's rendered directly here
+        // instead of going through the `row_text` lookup below.
+        let text = if self.has_parent_row && row_ix == 0 {
+            match col_ix {
+                COL_NAME => SharedString::from(".."),
                 _ => SharedString::default(),
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            let model_row = row_ix - self.parent_offset();
+            self.row_text
+                .get(model_row)
+                .map(|row| match col_ix {
+                    COL_NAME => row.name.clone(),
+                    COL_SIZE => row.size.clone(),
+                    COL_MODIFIED => row.modified.clone(),
+                    _ => SharedString::default(),
+                })
+                .unwrap_or_default()
+        };
 
         // `.truncate()` (overflow-hidden + nowrap + ellipsis) matters most
         // for Name, the one column that shrinks (see the `responsive`
@@ -932,6 +1073,10 @@ pub fn bind_file_table_keys(cx: &mut App) {
         KeyBinding::new("ctrl-pagedown", EnterDirectory, Some("FileTable")),
         KeyBinding::new("backspace", NavigateParent, Some("FileTable")),
         KeyBinding::new("ctrl-pageup", NavigateParent, Some("FileTable")),
+        // Not from docs/keymap-tc.csv (no row binds Alt+Up to anything) --
+        // added on request as a third, common-convention way to go up,
+        // alongside the two TC-verified ones above.
+        KeyBinding::new("alt-up", NavigateParent, Some("FileTable")),
         KeyBinding::new("ctrl-\\", NavigateRoot, Some("FileTable")),
         KeyBinding::new("alt-home", NavigateHome, Some("FileTable")),
         KeyBinding::new("alt-left", HistoryBack, Some("FileTable")),
@@ -1226,12 +1371,17 @@ impl FileTable {
     }
 
     /// Enter/Ctrl+PgDn (`nav.enter_dir`): descends into the directory
-    /// under the cursor. A no-op if the cursor isn't on one -- following
-    /// a symlink into its target directory (`nav.follow_symlink`) and
-    /// opening/executing a file (the other half of plain Enter's real TC
-    /// behaviour, `nav.open_or_enter`) are both out of scope here; see
-    /// the module doc comment.
+    /// under the cursor, or -- if the cursor is on the synthetic ".." row
+    /// (T-4.3.1) -- goes up instead, same as Backspace. A no-op if the
+    /// cursor isn't on either. Following a symlink into its target
+    /// directory (`nav.follow_symlink`) and opening/executing a file (the
+    /// other half of plain Enter's real TC behaviour, `nav.open_or_enter`)
+    /// are both out of scope here; see the module doc comment.
     fn enter_cursor_directory(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).delegate().cursor_on_parent() {
+            self.navigate_to_parent(cx);
+            return;
+        }
         let name = self.state.read(cx).delegate().cursor_dir_name();
         if let Some(name) = name {
             let target = self.current_dir.join(name);
@@ -1483,6 +1633,11 @@ fn spawn_directory_load(
     generation: u64,
     cx: &mut Context<FileTable>,
 ) {
+    // Computed up front, before `dir` moves into the tokio task below --
+    // `Path::parent()` is a pure path-string operation, no I/O, so there's
+    // no reason to thread a `has_parent: bool` parameter through every
+    // call site when the callee can just derive it from `dir` itself.
+    let has_parent = dir.parent().is_some();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     tokio_handle.spawn(async move {
@@ -1528,6 +1683,7 @@ fn spawn_directory_load(
             }
             let delegate = state.delegate_mut();
             delegate.set_model(model);
+            delegate.set_has_parent_row(has_parent);
             if let Some(name) = &select_name {
                 delegate.select_row_by_name(name);
             }
@@ -1754,6 +1910,112 @@ mod tests {
             "End/Ctrl+End pass usize::MAX; must clamp to the last row"
         );
         assert_eq!(delegate.move_cursor_to(0), Some(0));
+    }
+
+    #[test]
+    fn display_rows_count_adds_one_when_parent_row_showing() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.display_rows_count(), 5);
+        delegate.set_has_parent_row(true);
+        assert_eq!(delegate.display_rows_count(), 6);
+        delegate.set_has_parent_row(false);
+        assert_eq!(delegate.display_rows_count(), 5);
+    }
+
+    #[test]
+    fn move_cursor_by_steps_onto_and_off_the_parent_row() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+
+        // Row 0 (real) is display row 1 while the ".." row is showing.
+        assert_eq!(delegate.display_row(), Some(1));
+        assert!(!delegate.cursor_on_parent());
+
+        // Moving up from there lands on the ".." row (display row 0),
+        // not off the front of the listing.
+        assert_eq!(delegate.move_cursor_by(-1), Some(0));
+        assert!(delegate.cursor_on_parent());
+        assert_eq!(
+            delegate.cursor_row(),
+            Some(0),
+            "cursor_row keeps its last real position while parked on .."
+        );
+
+        // A further move up is clamped -- ".." is the top, same as row 0
+        // ordinarily would be.
+        assert_eq!(delegate.move_cursor_by(-1), Some(0));
+        assert!(delegate.cursor_on_parent());
+
+        // Moving back down leaves the pseudo-row and re-lands on real row 0.
+        assert_eq!(delegate.move_cursor_by(1), Some(1));
+        assert!(!delegate.cursor_on_parent());
+        assert_eq!(delegate.cursor_row(), Some(0));
+    }
+
+    #[test]
+    fn move_cursor_to_0_with_parent_row_lands_on_parent() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.move_cursor_to(3);
+        assert!(!delegate.cursor_on_parent());
+
+        assert_eq!(delegate.move_cursor_to(0), Some(0));
+        assert!(delegate.cursor_on_parent());
+
+        assert_eq!(delegate.move_cursor_to(1), Some(1));
+        assert!(!delegate.cursor_on_parent());
+        assert_eq!(delegate.cursor_row(), Some(0));
+    }
+
+    #[test]
+    fn cursor_dir_name_is_none_while_cursor_on_parent() {
+        let mut model = DirectoryModel::new();
+        model
+            .entries_mut()
+            .push("adir", &meta(EntryKind::Directory, 0, 0));
+        model.sort_by(SortColumn::Name, true);
+        let mut delegate = FileTableDelegate::new(model);
+        delegate.set_has_parent_row(true);
+
+        delegate.move_cursor_to(0); // the ".." row
+        assert!(delegate.cursor_on_parent());
+        assert_eq!(
+            delegate.cursor_dir_name(),
+            None,
+            "must not report a directory name while parked on the pseudo-row, even \
+             though cursor_row still points at a real directory underneath it"
+        );
+    }
+
+    #[test]
+    fn set_has_parent_row_false_clears_cursor_on_parent() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.move_cursor_to(0);
+        assert!(delegate.cursor_on_parent());
+
+        // Navigating to the filesystem root turns the parent row off --
+        // there's nowhere left to park the cursor, so it must fall back
+        // to a real row rather than pointing at a row that no longer
+        // exists.
+        delegate.set_has_parent_row(false);
+        assert!(!delegate.cursor_on_parent());
+        assert_eq!(delegate.display_rows_count(), 5);
+    }
+
+    #[test]
+    fn set_model_resets_cursor_on_parent_even_when_a_parent_row_is_still_showing() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.move_cursor_to(0);
+        assert!(delegate.cursor_on_parent());
+
+        // A fresh listing (e.g. Enter on a subdirectory while parked on
+        // "..") must start on real row 0, not silently reopen on its own
+        // ".." row just because the new directory also has a parent.
+        delegate.set_model(five_file_model());
+        assert!(!delegate.cursor_on_parent());
+        assert_eq!(delegate.cursor_row(), Some(0));
     }
 
     #[test]
