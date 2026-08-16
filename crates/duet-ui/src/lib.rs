@@ -19,6 +19,7 @@
 
 pub mod file_table;
 mod function_bar;
+pub mod panel;
 mod theme_controller;
 mod workspace;
 

@@ -36,6 +36,11 @@ notify = "8.2"
 # though this crate's blast radius (a settings file, not user data) is much
 # smaller than the ops engine's.
 rustix = { version = "1", features = ["fs"] }
+# `session.json` (design.md §10) is app state, not user-editable config --
+# unlike every other file this crate handles, it has no round-trip-
+# preservation requirement (`toml_edit`'s whole reason for existing here),
+# so plain `serde_json` is the right tool for it specifically.
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

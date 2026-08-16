@@ -5,8 +5,9 @@
 //! dual-pane splitter, a function-key bar, a status bar, and a
 //! command-line row, all themed by [`crate::theme_controller`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use duet_config::SessionTab;
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
@@ -25,6 +26,7 @@ use gpui::{
 
 use crate::file_table::{FileTable, write_byte_count};
 use crate::function_bar::{self, FKeySlot};
+use crate::panel::{Panel, bind_panel_keys};
 use crate::theme_controller::ThemeController;
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
@@ -35,16 +37,29 @@ use crate::theme_controller::ThemeController;
 // `resizable/mod.rs`: every size-mutating method is `pub(crate)`, so even
 // this façade crate cannot reach it) -- this is the "or add a reasonable
 // one" half of the task brief.
-actions!(duet_workspace, [ResizeSplitterLeft, ResizeSplitterRight]);
+//
+// `FocusOtherPanel` (T-4.3.2, FR-NAV-02's "Tab switches"): handled here,
+// not in `panel.rs`, because answering "which panel isn't focused" needs
+// both panels at once -- something neither `Panel` nor `FileTable` has
+// any reason to know about the other. Bound to plain `Tab` in the
+// `"FileTable"` context (see `bind_workspace_keys`) rather than
+// `"Workspace"`/`"Panel"`: it only makes sense to fire while a panel's
+// table genuinely holds focus, the same reasoning `docs/keymap-tc.csv`
+// gives (`focus.other_panel`'s context column is `panel`).
+actions!(
+    duet_workspace,
+    [ResizeSplitterLeft, ResizeSplitterRight, FocusOtherPanel]
+);
 
 /// Registers the workspace's own keybindings. Called once from [`run`],
-/// before any window opens. `Some("Workspace")` scopes both bindings to
-/// elements tagged with that key context -- see the root view's
-/// `.key_context("Workspace")` in [`Workspace::render`].
+/// before any window opens. `Some("Workspace")` scopes the splitter
+/// bindings to elements tagged with that key context -- see the root
+/// view's `.key_context("Workspace")` in [`Workspace::render`].
 fn bind_workspace_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-left", ResizeSplitterLeft, Some("Workspace")),
         KeyBinding::new("ctrl-right", ResizeSplitterRight, Some("Workspace")),
+        KeyBinding::new("tab", FocusOtherPanel, Some("FileTable")),
     ]);
 }
 
@@ -68,6 +83,7 @@ pub fn run() {
         duet_widgets::init(cx);
         bind_workspace_keys(cx);
         crate::file_table::bind_file_table_keys(cx);
+        bind_panel_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -98,18 +114,19 @@ pub fn run() {
                 });
 
                 spawn_entry_count_demo(tokio_handle.clone(), workspace.clone(), cx);
-                // Focuses the left panel itself, not the workspace root --
-                // T-4.2.2's cursor movement is bound to `FileTable`'s own
-                // key context, and there's no click-to-focus or Tab-based
-                // panel switching yet (`focus.other_panel` is T-4.3.x's
-                // job) for a user to reach it any other way. `Workspace`'s
-                // own "Workspace"-context bindings (Ctrl+Left/Right
-                // splitter resize) still fire from here: GPUI's action
-                // dispatch walks the focused element's ancestor chain, and
-                // `Workspace`'s root div stays an ancestor of the left
-                // panel regardless of which of the two holds focus.
+                // Focuses the left panel's active tab directly, not the
+                // workspace root -- T-4.2.2's cursor movement is bound to
+                // `FileTable`'s own key context, and this is the only way
+                // to reach it before any click lands (T-4.3.8's mouse
+                // support). `Workspace`'s own "Workspace"-context bindings
+                // (Ctrl+Left/Right splitter resize) still fire from here:
+                // GPUI's action dispatch walks the focused element's whole
+                // ancestor chain, and `Workspace`'s root div stays an
+                // ancestor of the left panel regardless of which of the
+                // two (or which tab within it) holds focus.
                 let left_panel = workspace.read(cx).left_panel.clone();
-                window.focus(&left_panel.read(cx).focus_handle(cx));
+                let handle = left_panel.read(cx).active_focus_handle(cx);
+                window.focus(&handle);
 
                 // `gpui-component` widgets (the command-line `Input` among
                 // them -- see `duet_widgets::layout::Root`'s doc comment)
@@ -169,11 +186,14 @@ pub struct Workspace {
     /// builder argument.
     resizable_state: Entity<ResizableState>,
 
-    /// T-4.2.1: the left panel's real, virtualised directory table --
-    /// `duet_index::DirectoryModel`/`EntryStore` backed, not a placeholder.
-    /// The right panel stays a placeholder for now (T-4.2.2 onward builds
-    /// out per-panel selection/cursor/navigation before both are real).
-    left_panel: Entity<FileTable>,
+    /// T-4.2.1/T-4.3.2: both panels, each a real, independent tab
+    /// container (`crate::panel::Panel`) over the virtualised directory
+    /// table (`duet_index::DirectoryModel`/`EntryStore` backed). Neither
+    /// is a placeholder any more -- see [`Self::new`]'s doc comment for
+    /// why making the right panel real landed as part of T-4.3.2 rather
+    /// than its own task.
+    left_panel: Entity<Panel>,
+    right_panel: Entity<Panel>,
 
     function_keys: Vec<FKeySlot>,
     command_line: Entity<InputState>,
@@ -182,6 +202,17 @@ pub struct Workspace {
     /// `$XDG_CONFIG_HOME` can't be resolved -- splitter-ratio persistence
     /// is then skipped, not fatal).
     settings_path: Option<PathBuf>,
+
+    /// `~/.local/state/duet/session.json` (or `None` for the same reason
+    /// `settings_path` can be) -- T-4.3.2's tab-list persistence. Every
+    /// structural tab change and every real directory change in either
+    /// panel re-saves this (see [`Self::new`]'s `cx.observe` calls and
+    /// `crate::file_table::FileTableEvent::DirectoryChanged`'s doc
+    /// comment), not just at graceful shutdown -- T-4.3.7's later AC
+    /// ("kill -9 then restart restores the full workspace") only holds if
+    /// saves are already this eager by the time that task adds to the
+    /// same file.
+    session_path: Option<PathBuf>,
 
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
@@ -218,12 +249,50 @@ impl Workspace {
                 .placeholder("Command line (not wired to a shell yet -- T-5.3.5)")
         });
 
-        // T-4.2.1: list the process's current directory in the left panel --
-        // same directory the T-4.1.1 executor-wiring demo below counts, so
-        // the status bar's "N entries in <dir>" line and the left panel's
-        // actual row count are checkable against each other.
+        // T-4.2.1: the process's current directory is every fallback tab's
+        // fallback directory -- same directory the T-4.1.1 executor-wiring
+        // demo below counts, so the status bar's "N entries in <dir>" line
+        // and a freshly-installed left panel's actual row count are
+        // checkable against each other.
         let initial_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let left_panel = cx.new(|cx| FileTable::new(initial_dir, tokio_handle.clone(), window, cx));
+
+        // T-4.3.2: both panels are real now (the right one was still
+        // `placeholder_panel` through T-4.2.x -- closing that gap landed
+        // here rather than its own task since "each panel hosts N tabs"
+        // can't be demonstrated on a panel that doesn't exist yet).
+        // `session.json`'s tab list restores both from the last run;
+        // `resolve_panel_session` degrades to one fresh tab at
+        // `initial_dir` on first launch, a missing/corrupt file, or every
+        // saved tab's directory having since vanished.
+        let session_path = duet_config::paths::session_path().ok();
+        let session = session_path.as_deref().and_then(|path| {
+            duet_config::session::load(path)
+                .inspect_err(|err| {
+                    tracing::info!(
+                        target: "duet_ui::workspace",
+                        "using default session ({path:?} not loaded: {err})"
+                    );
+                })
+                .ok()
+        });
+        let (left_tabs, left_active) =
+            resolve_panel_session(session.as_ref().map(|s| &s.left), &initial_dir);
+        let (right_tabs, right_active) =
+            resolve_panel_session(session.as_ref().map(|s| &s.right), &initial_dir);
+
+        let left_panel =
+            cx.new(|cx| Panel::new(left_tabs, left_active, tokio_handle.clone(), window, cx));
+        let right_panel =
+            cx.new(|cx| Panel::new(right_tabs, right_active, tokio_handle.clone(), window, cx));
+        // Every structural tab change (`Panel::new_tab`/`close_active`/...)
+        // and every real per-tab directory change (via each `FileTable`'s
+        // `DirectoryChanged` event, which `Panel` already re-notifies on --
+        // see `Panel::add_tab_entry`'s doc comment) calls `cx.notify()` on
+        // the panel entity, which is exactly what these observers fire on.
+        cx.observe(&left_panel, |this, _panel, cx| this.persist_session(cx))
+            .detach();
+        cx.observe(&right_panel, |this, _panel, cx| this.persist_session(cx))
+            .detach();
 
         Self {
             demo: DemoState::Loading,
@@ -231,9 +300,11 @@ impl Workspace {
             splitter_ratio,
             resizable_state: cx.new(|_| ResizableState::default()),
             left_panel,
+            right_panel,
             function_keys: function_bar::build_function_bar(),
             command_line,
             settings_path,
+            session_path,
             theme: None,
         }
     }
@@ -298,6 +369,61 @@ impl Workspace {
             .detach();
     }
 
+    /// `Tab` (`focus.other_panel`): moves keyboard focus to whichever
+    /// panel doesn't currently have it. "Doesn't currently have it" is
+    /// derived from real focus state (`left_panel`'s active tab's
+    /// `FocusHandle`), not a separately tracked "which side is active"
+    /// field -- same reasoning as [`Self::dual_pane`]'s `left_active`/
+    /// `right_active`, and for the same reason: one source of truth,
+    /// nothing to drift out of sync. Defaults to focusing the left panel
+    /// if, somehow, neither currently holds focus (e.g. the command line
+    /// does) -- an arbitrary but reasonable landing spot, not a state that
+    /// should be reachable in practice since nothing else binds `Tab`.
+    fn focus_other_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let left_focused = self
+            .left_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window);
+        let target = if left_focused {
+            &self.right_panel
+        } else {
+            &self.left_panel
+        };
+        let handle = target.read(cx).active_focus_handle(cx);
+        window.focus(&handle);
+    }
+
+    /// Gathers both panels' *live* tab lists (real current directories,
+    /// not whatever was last saved -- see `Panel::snapshot`'s doc comment)
+    /// and writes them to `session.json` off the UI thread, matching
+    /// [`Self::persist_splitter_ratio`]'s pattern exactly. Called by the
+    /// `cx.observe` subscriptions [`Self::new`] sets up on both panels, so
+    /// this fires on every structural tab change and every real directory
+    /// change in either panel -- see the `session_path` field's doc
+    /// comment for why that eagerness matters. Best-effort: a failure is
+    /// logged, never surfaced as a crash.
+    fn persist_session(&self, cx: &mut Context<Self>) {
+        let Some(path) = self.session_path.clone() else {
+            return;
+        };
+        let session = duet_config::Session {
+            schema_version: duet_config::session::SESSION_SCHEMA_VERSION,
+            left: self.left_panel.read(cx).snapshot(cx),
+            right: self.right_panel.read(cx).snapshot(cx),
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = duet_config::session::save(&path, &session) {
+                    tracing::warn!(
+                        target: "duet_ui::workspace",
+                        "failed to persist session: {err}"
+                    );
+                }
+            })
+            .detach();
+    }
+
     fn dual_pane(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let theme = cx.theme();
@@ -313,17 +439,15 @@ impl Workspace {
         // header treatment": derived directly from real keyboard focus
         // (`FocusHandle::is_focused`) rather than a separately-tracked
         // `active_panel` field, so there's exactly one source of truth
-        // and no way for the two to drift apart. The right panel is
-        // never "active" yet -- it's still a placeholder with no real
-        // `FocusHandle` of its own (T-4.2.x builds it out), so treating
-        // it as active whenever focus merely isn't on the left panel
-        // (e.g. it's on the command line) would be actively misleading,
-        // not just incomplete. Tab-based switching between the two (the
-        // other half of FR-NAV-02) is T-4.3.x's job.
-        let left_panel = self.left_panel.read(cx);
-        let left_active = left_panel.focus_handle(cx).is_focused(window);
-        let left_header = left_panel.current_dir().display().to_string();
-        let left_footer = panel_footer_text(left_panel, cx);
+        // and no way for the two to drift apart. Both panels are real now
+        // (T-4.3.2) -- the header/footer text is always the *active tab's*
+        // path/stats within whichever panel, since that's the only thing
+        // meaningfully "this panel's" state once a panel can hold more
+        // than one directory at a time.
+        let (left_header, left_footer, left_active) =
+            panel_header_footer_active(&self.left_panel, window, cx);
+        let (right_header, right_footer, right_active) =
+            panel_header_footer_active(&self.right_panel, window, cx);
 
         h_resizable("workspace-splitter")
             .with_state(&self.resizable_state)
@@ -331,7 +455,7 @@ impl Workspace {
                 resizable_panel()
                     .size(left_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(left_panel_view(
+                    .child(panel_view(
                         &self.left_panel,
                         left_header,
                         left_footer,
@@ -344,9 +468,11 @@ impl Workspace {
                 resizable_panel()
                     .size(right_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(placeholder_panel(
-                        "Right panel",
-                        false,
+                    .child(panel_view(
+                        &self.right_panel,
+                        right_header,
+                        right_footer,
+                        right_active,
                         tokens,
                         theme.border,
                     )),
@@ -480,6 +606,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ResizeSplitterRight, _window, cx| {
                 this.resize_splitter_by(SPLITTER_KEYBOARD_STEP, cx);
             }))
+            .on_action(cx.listener(|this, _: &FocusOtherPanel, window, cx| {
+                this.focus_other_panel(window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
@@ -532,8 +661,8 @@ fn panel_footer_text(table: &FileTable, cx: &App) -> SharedString {
 /// (the current path) above the panel's real content and a footer
 /// (selection stats + free space) below it, both switching color with
 /// `active` the same way the panel's own body background already does
-/// ([`left_panel_view`]/[`placeholder_panel`]), plus a colored
-/// bottom-border "underline" on the header specifically: with only a
+/// ([`panel_view`]), plus a colored bottom-border "underline" on the
+/// header specifically: with only a
 /// background-brightness difference between active/inactive, a panel
 /// showing few or muted colors (some themes, most content) could still
 /// leave "which one is active" genuinely ambiguous at a glance -- the
@@ -583,12 +712,32 @@ fn panel_chrome(
         )
 }
 
-/// Wraps the real, virtualised [`FileTable`] (T-4.2.1) in the same
-/// [`panel_chrome`] [`placeholder_panel`] below uses, so the left panel's
-/// chrome matches the still-placeholder right panel until T-4.2.x makes
-/// both real.
-fn left_panel_view(
-    table: &Entity<FileTable>,
+/// Reads whichever `FileTable` is currently `panel`'s active tab and
+/// derives the three things [`Workspace::dual_pane`] needs from it: the
+/// header text (its path), the footer text ([`panel_footer_text`]), and
+/// whether it holds real keyboard focus. A standalone function (not a
+/// `Panel` method) because it needs `Window` for the focus check, which
+/// `Panel`'s own read-only accessors deliberately don't take (nothing
+/// inside `panel.rs` itself needs to know about focus).
+fn panel_header_footer_active(
+    panel: &Entity<Panel>,
+    window: &Window,
+    cx: &App,
+) -> (String, SharedString, bool) {
+    let panel = panel.read(cx);
+    let table = panel.active_table().read(cx);
+    let active = table.focus_handle(cx).is_focused(window);
+    let header = table.current_dir().display().to_string();
+    let footer = panel_footer_text(table, cx);
+    (header, footer, active)
+}
+
+/// Wraps a real [`Panel`] (T-4.3.2 -- both sides, now that the right panel
+/// is no longer a placeholder) in [`panel_chrome`]. One function for both
+/// sides: nothing here is left/right-specific, only which `Entity<Panel>`
+/// and pre-computed header/footer/active values the caller passes in.
+fn panel_view(
+    panel: &Entity<Panel>,
     header_text: impl Into<SharedString>,
     footer_text: impl Into<SharedString>,
     active: bool,
@@ -618,49 +767,45 @@ fn left_panel_view(
             footer_text,
             active,
             tokens,
-            table.clone(),
+            panel.clone(),
         ))
 }
 
-/// A placeholder panel standing in for a future `PanelView` (T-4.2.x).
-/// Proves the resizable dual-pane shape and is themed by
-/// [`TokenPalette`]; it renders no directory data of its own yet, so its
-/// header/footer are static placeholders rather than anything real.
-fn placeholder_panel(
-    label: &'static str,
-    active: bool,
-    tokens: &TokenPalette,
-    border: gpui::Hsla,
-) -> impl IntoElement {
-    let (bg, fg) = if active {
-        (tokens.color.panel_bg_active, tokens.color.panel_fg_active)
-    } else {
-        (
-            tokens.color.panel_bg_inactive,
-            tokens.color.panel_fg_inactive,
-        )
-    };
-    gpui::div()
-        .size_full()
-        .bg(bg)
-        .border_1()
-        .border_color(if active {
-            tokens.color.border_focus
-        } else {
-            border
-        })
-        .rounded_md()
-        .child(panel_chrome(
-            "\u{2014}",
-            "0 of 0 files selected, 0 B of 0 B bytes",
-            active,
-            tokens,
-            v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .child(gpui::div().text_color(fg).child(label)),
-        ))
+/// Resolves one panel's initial tab list at startup: `session`'s saved
+/// tabs (T-4.3.2), filtered down to the ones whose directory still exists
+/// (a saved tab pointing at a since-deleted directory is silently dropped,
+/// not surfaced as an error -- opening to a broken tab would be worse than
+/// just not restoring it), or a single fresh tab at `fallback_dir` if
+/// `session` is `None` (first launch, missing/corrupt `session.json`) or
+/// every saved tab got filtered out. `session.active_tab` is clamped into
+/// the *filtered* list, which can point at a different tab than originally
+/// saved if entries before it were dropped -- an accepted imprecision for
+/// a rare edge case (a tab's directory vanishing between runs), not worth
+/// re-deriving which original tab the saved index meant.
+fn resolve_panel_session(
+    session: Option<&duet_config::SessionPanel>,
+    fallback_dir: &Path,
+) -> (Vec<SessionTab>, usize) {
+    if let Some(session) = session {
+        let tabs: Vec<SessionTab> = session
+            .tabs
+            .iter()
+            .filter(|t| t.dir.is_dir())
+            .cloned()
+            .collect();
+        if !tabs.is_empty() {
+            let active = session.active_tab.min(tabs.len() - 1);
+            return (tabs, active);
+        }
+    }
+    (
+        vec![SessionTab {
+            dir: fallback_dir.to_path_buf(),
+            locked: false,
+            lock_dir_change: false,
+        }],
+        0,
+    )
 }
 
 /// Reads `panels.splitter_ratio` from `settings.toml` at `path`. Any
@@ -844,5 +989,91 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("show_hidden = true"), "{on_disk}");
         assert!(on_disk.contains("splitter_ratio = 0.8"), "{on_disk}");
+    }
+
+    /// T-4.3.2: `resolve_panel_session` is the pure (GPUI-free) half of
+    /// startup session-loading -- everything about it that doesn't need a
+    /// real `Panel`/`FileTable`/window to exercise, unlike `Panel`'s own
+    /// tab-command tests (`panel.rs`, which need `gpui::TestAppContext`).
+    #[test]
+    fn resolve_panel_session_falls_back_to_a_single_tab_at_fallback_dir_when_session_is_none() {
+        let fallback = PathBuf::from("/tmp");
+        let (tabs, active) = resolve_panel_session(None, &fallback);
+        assert_eq!(
+            tabs,
+            vec![SessionTab {
+                dir: fallback,
+                locked: false,
+                lock_dir_change: false,
+            }]
+        );
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn resolve_panel_session_filters_out_tabs_whose_directory_no_longer_exists() {
+        let real = tempfile::tempdir().unwrap();
+        let gone = real.path().join("this-directory-was-deleted");
+        let session = duet_config::SessionPanel {
+            tabs: vec![
+                SessionTab {
+                    dir: gone,
+                    locked: false,
+                    lock_dir_change: false,
+                },
+                SessionTab {
+                    dir: real.path().to_path_buf(),
+                    locked: true,
+                    lock_dir_change: false,
+                },
+            ],
+            active_tab: 1,
+        };
+        let (tabs, active) = resolve_panel_session(Some(&session), Path::new("/tmp"));
+        assert_eq!(tabs.len(), 1, "the deleted-directory tab must be dropped");
+        assert_eq!(tabs[0].dir, real.path());
+        assert!(tabs[0].locked, "surviving tabs keep their lock flags");
+        assert_eq!(active, 0, "re-clamped into the filtered list");
+    }
+
+    #[test]
+    fn resolve_panel_session_falls_back_when_every_saved_tab_dir_is_gone() {
+        let real = tempfile::tempdir().unwrap();
+        let gone = real.path().join("nope");
+        let session = duet_config::SessionPanel {
+            tabs: vec![SessionTab {
+                dir: gone,
+                locked: false,
+                lock_dir_change: false,
+            }],
+            active_tab: 0,
+        };
+        let fallback = PathBuf::from("/tmp");
+        let (tabs, active) = resolve_panel_session(Some(&session), &fallback);
+        assert_eq!(
+            tabs,
+            vec![SessionTab {
+                dir: fallback,
+                locked: false,
+                lock_dir_change: false,
+            }]
+        );
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn resolve_panel_session_clamps_active_tab_into_range() {
+        let real = tempfile::tempdir().unwrap();
+        let session = duet_config::SessionPanel {
+            tabs: vec![SessionTab {
+                dir: real.path().to_path_buf(),
+                locked: false,
+                lock_dir_change: false,
+            }],
+            active_tab: 99,
+        };
+        let (tabs, active) = resolve_panel_session(Some(&session), Path::new("/tmp"));
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(active, 0);
     }
 }

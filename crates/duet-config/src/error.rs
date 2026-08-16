@@ -100,6 +100,22 @@ pub enum ConfigError {
     )]
     NoConfigDir,
 
+    /// The XDG state directory could not be resolved (no `$HOME` and no
+    /// `$XDG_STATE_HOME`) -- see [`crate::paths::xdg_state_home`].
+    #[error("could not resolve the XDG state directory: neither $XDG_STATE_HOME nor $HOME is set")]
+    NoStateDir,
+
+    /// `session.json`'s bytes are not valid JSON, or parsed JSON that
+    /// doesn't match [`crate::session::Session`]'s shape.
+    #[error("failed to parse {path} as session JSON: {source}")]
+    SessionParse {
+        /// The file that failed to parse.
+        path: PathBuf,
+        /// The underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// A miscellaneous OS-level failure with no more specific variant above
     /// (e.g. the watcher's background thread failed to spawn).
     #[error("I/O error: {0}")]

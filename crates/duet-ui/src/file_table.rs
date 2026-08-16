@@ -42,6 +42,7 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use duet_index::{DirectoryModel, SortColumn};
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
@@ -52,9 +53,9 @@ use duet_widgets::table::{
 use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt;
 use gpui::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, Render, SharedString, Styled as _, Window,
-    actions, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
+    Styled as _, Window, actions, div, px,
 };
 
 /// Column indices this delegate ships with -- a reasonable subset
@@ -319,6 +320,43 @@ impl FileTableDelegate {
         let usable = (available - TABLE_CHROME_RESERVE).max(0.0);
         self.columns = columns_with_widths(&self.base_columns, responsive::column_widths(usable));
         true
+    }
+
+    /// The current `[Name, Size, Modified]` column widths (px) together
+    /// with the panel width they were computed for -- `None` until the
+    /// measuring canvas has actually run at least once (see
+    /// `apply_responsive_widths`). T-4.3.2's `Panel::add_tab_entry` uses
+    /// this to seed a freshly-created sibling tab's initial widths
+    /// directly from one that's already been measured (every tab in a
+    /// `Panel` renders at the same panel width, so a sibling's answer is
+    /// exactly right, not an approximation), skipping the one-frame
+    /// narrow-then-corrects dance [`Self::new`] otherwise commits to.
+    /// Purely cosmetic -- `apply_responsive_widths` would converge to the
+    /// same answer regardless -- but without this, a tab opened mid-
+    /// session (unlike the very first tab at app startup, which rides
+    /// along with several other early re-renders that mask the same
+    /// glitch) visibly flashes narrow until some unrelated later action
+    /// happens to trigger the next repaint.
+    pub(crate) fn responsive_seed(&self) -> Option<([f32; 3], f32)> {
+        let available = self.last_available_width?;
+        Some((
+            [
+                f32::from(self.columns[COL_NAME].width),
+                f32::from(self.columns[COL_SIZE].width),
+                f32::from(self.columns[COL_MODIFIED].width),
+            ],
+            available,
+        ))
+    }
+
+    /// The inverse of [`Self::responsive_seed`]: applies an already-known
+    /// widths/available-width pair directly, without going through
+    /// [`Self::apply_responsive_widths`]'s own recomputation -- there's
+    /// nothing to recompute, the caller already has the exact answer that
+    /// call would produce.
+    fn seed_column_widths(&mut self, widths: [f32; 3], available: f32) {
+        self.columns = columns_with_widths(&self.base_columns, widths);
+        self.last_available_width = Some(available);
     }
 
     pub fn model(&self) -> &DirectoryModel {
@@ -1116,7 +1154,41 @@ pub struct FileTable {
     /// between the two stacks without disturbing either past that.
     history_back: Vec<PathBuf>,
     history_forward: Vec<PathBuf>,
+    /// T-4.3.2's tab lock (`tab.lock`, *without* `tab.lock_dir_change`):
+    /// when `Some`, `navigate_to` hands off to this callback instead of
+    /// navigating in place -- see `navigate_to`'s doc comment. `None` for
+    /// an unlocked tab (the default for every tab, and the only state a
+    /// bare `FileTable` constructed outside a `Panel` -- e.g. in a test --
+    /// ever has). Set via [`Self::set_locked_navigation`] by `Panel`,
+    /// which owns the actual lock flags this reduces to a single "redirect
+    /// or don't" callback; this module deliberately has no `Panel`/tab
+    /// concept of its own, matching every other crate-internal boundary in
+    /// this codebase (a `FileTable` must remain meaningful standalone).
+    locked_navigation: Option<LockedNavigationHandler>,
 }
+
+/// `dir` is where the locked tab's navigation attempt was headed;
+/// `Rc`, not `Box`, because [`FileTable::navigate_to`] clones it out of
+/// `self` before calling it (so the call itself doesn't hold `self`
+/// borrowed) -- a `Box` can't be cheaply cloned, an `Rc` can.
+pub(crate) type LockedNavigationHandler = Rc<dyn Fn(PathBuf, &mut Window, &mut App)>;
+
+/// Fired by [`FileTable::navigate_to`] once `current_dir` actually changes
+/// -- deliberately *not* fired by ordinary cursor movement, selection, or
+/// sort/loading-state changes, all of which also call `cx.notify()` for
+/// their own reasons but don't represent "this tab is now showing a
+/// different directory." T-4.3.2's `Panel` (the per-side tab container)
+/// subscribes to exactly this event per tab so it knows when to persist
+/// `session.json` -- without a narrowly-scoped event to key off, the only
+/// alternative would be re-persisting on every keystroke that moves the
+/// cursor, which is both wasteful I/O and irrelevant churn (cursor
+/// position isn't part of what T-4.3.2 persists; that's T-4.3.7's job).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTableEvent {
+    DirectoryChanged,
+}
+
+impl EventEmitter<FileTableEvent> for FileTable {}
 
 impl FileTable {
     /// Starts listing `dir` in the background and returns immediately with
@@ -1128,13 +1200,23 @@ impl FileTable {
     /// unusual but possible stall on some remote-backed or heavily
     /// loaded filesystems) can never delay the directory listing itself
     /// from appearing.
+    ///
+    /// `width_seed`: see `FileTableDelegate::responsive_seed`'s doc
+    /// comment -- `Some((widths, available))` from an already-measured
+    /// sibling tab in the same `Panel` skips this table's first-frame
+    /// narrow-column flash; `None` (a brand-new panel, nothing to copy
+    /// from yet) falls back to the ordinary narrow-then-corrects default.
     pub fn new(
         dir: PathBuf,
         tokio_handle: tokio::runtime::Handle,
+        width_seed: Option<([f32; 3], f32)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = FileTableDelegate::new(DirectoryModel::new());
+        let mut delegate = FileTableDelegate::new(DirectoryModel::new());
+        if let Some((widths, available)) = width_seed {
+            delegate.seed_column_widths(widths, available);
+        }
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(
             dir.clone(),
@@ -1179,7 +1261,16 @@ impl FileTable {
             tokio_handle,
             history_back: Vec::new(),
             history_forward: Vec::new(),
+            locked_navigation: None,
         }
+    }
+
+    /// See the `locked_navigation` field's doc comment. `Panel` calls this
+    /// with `Some(..)` when a tab is locked without `lock_dir_change`, and
+    /// with `None` to unlock it (or to allow in-place navigation again
+    /// under `lock_dir_change`).
+    pub fn set_locked_navigation(&mut self, handler: Option<LockedNavigationHandler>) {
+        self.locked_navigation = handler;
     }
 
     /// Exposes the underlying table state -- e.g. for
@@ -1193,6 +1284,11 @@ impl FileTable {
     /// comment.
     pub fn current_dir(&self) -> &std::path::Path {
         &self.current_dir
+    }
+
+    /// See `FileTableDelegate::responsive_seed`.
+    pub(crate) fn responsive_seed(&self, cx: &App) -> Option<([f32; 3], f32)> {
+        self.state.read(cx).delegate().responsive_seed()
     }
 
     /// The volume's free/total space as of the last successful query, or
@@ -1341,18 +1437,34 @@ impl FileTable {
     /// adding to either.
     ///
     /// `select_name`: see `spawn_directory_load`'s doc comment.
+    ///
+    /// T-4.3.2's tab lock: if [`Self::locked_navigation`] is set (this
+    /// tab is locked *without* `lock_dir_change`), this doesn't navigate
+    /// at all -- it hands `dir` to that callback instead, which opens a
+    /// new, unlocked tab at `dir` and leaves this tab exactly where it
+    /// was, matching TC's real locked-tab behaviour. `window` only exists
+    /// on this signature for that redirect (constructing the new tab's
+    /// `FileTable` needs a live `Window`, same as this one's own
+    /// constructor does) -- the ordinary in-place-navigation path below
+    /// never touches it.
     fn navigate_to(
         &mut self,
         dir: PathBuf,
         push_history: bool,
         select_name: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(handler) = self.locked_navigation.clone() {
+            handler(dir, window, cx);
+            return;
+        }
         if push_history {
             self.history_back.push(self.current_dir.clone());
             self.history_forward.clear();
         }
         self.current_dir = dir.clone();
+        cx.emit(FileTableEvent::DirectoryChanged);
         let generation = self.state.update(cx, |state, cx| {
             let generation = state.delegate_mut().bump_nav_generation();
             state.delegate_mut().set_loading(true);
@@ -1377,15 +1489,15 @@ impl FileTable {
     /// directory (`nav.follow_symlink`) and opening/executing a file (the
     /// other half of plain Enter's real TC behaviour, `nav.open_or_enter`)
     /// are both out of scope here; see the module doc comment.
-    fn enter_cursor_directory(&mut self, cx: &mut Context<Self>) {
+    fn enter_cursor_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).delegate().cursor_on_parent() {
-            self.navigate_to_parent(cx);
+            self.navigate_to_parent(window, cx);
             return;
         }
         let name = self.state.read(cx).delegate().cursor_dir_name();
         if let Some(name) = name {
             let target = self.current_dir.join(name);
-            self.navigate_to(target, true, None, cx);
+            self.navigate_to(target, true, None, window, cx);
         }
     }
 
@@ -1394,7 +1506,7 @@ impl FileTable {
     /// cursor onto the directory just left ("the detail that makes
     /// navigation feel right" per this task's own AC). A no-op already
     /// at the root (`Path::parent()` returns `None`).
-    fn navigate_to_parent(&mut self, cx: &mut Context<Self>) {
+    fn navigate_to_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(parent) = self.current_dir.parent().map(PathBuf::from) else {
             return;
         };
@@ -1402,15 +1514,15 @@ impl FileTable {
             .current_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        self.navigate_to(parent, true, child_name, cx);
+        self.navigate_to(parent, true, child_name, window, cx);
     }
 
     /// Ctrl+\ (`nav.root`): jumps to `/`. "Root of the *active drive*"
     /// once real multi-mount navigation exists (a later task); today
     /// there's only ever the one filesystem, so this simplifies to the
     /// filesystem root outright.
-    fn navigate_to_root(&mut self, cx: &mut Context<Self>) {
-        self.navigate_to(PathBuf::from("/"), true, None, cx);
+    fn navigate_to_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_to(PathBuf::from("/"), true, None, window, cx);
     }
 
     /// `nav.home`: jumps to `$HOME`, a no-op if it isn't set. Bound to
@@ -1422,30 +1534,30 @@ impl FileTable {
     /// unreachable, the call T-4.2.3's `select_same_name` made) because
     /// this task's own AC names "home" as one of the four required
     /// navigation capabilities, unlike that one.
-    fn navigate_to_home(&mut self, cx: &mut Context<Self>) {
+    fn navigate_to_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(home) = std::env::var_os("HOME") {
-            self.navigate_to(PathBuf::from(home), true, None, cx);
+            self.navigate_to(PathBuf::from(home), true, None, window, cx);
         }
     }
 
     /// Alt+Left (`nav.history_back`): moves to the previous directory in
     /// this panel's own history, if any.
-    fn navigate_history_back(&mut self, cx: &mut Context<Self>) {
+    fn navigate_history_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(prev) = self.history_back.pop() else {
             return;
         };
         self.history_forward.push(self.current_dir.clone());
-        self.navigate_to(prev, false, None, cx);
+        self.navigate_to(prev, false, None, window, cx);
     }
 
     /// Alt+Right (`nav.history_forward`): the redo half of
     /// [`Self::navigate_history_back`].
-    fn navigate_history_forward(&mut self, cx: &mut Context<Self>) {
+    fn navigate_history_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(next) = self.history_forward.pop() else {
             return;
         };
         self.history_back.push(self.current_dir.clone());
-        self.navigate_to(next, false, None, cx);
+        self.navigate_to(next, false, None, window, cx);
     }
 }
 
@@ -1545,23 +1657,23 @@ impl Render for FileTable {
                     this.extend_selection_by_page(1, cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &EnterDirectory, _window, cx| {
-                this.enter_cursor_directory(cx);
+            .on_action(cx.listener(|this, _: &EnterDirectory, window, cx| {
+                this.enter_cursor_directory(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NavigateParent, _window, cx| {
-                this.navigate_to_parent(cx);
+            .on_action(cx.listener(|this, _: &NavigateParent, window, cx| {
+                this.navigate_to_parent(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NavigateRoot, _window, cx| {
-                this.navigate_to_root(cx);
+            .on_action(cx.listener(|this, _: &NavigateRoot, window, cx| {
+                this.navigate_to_root(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &NavigateHome, _window, cx| {
-                this.navigate_to_home(cx);
+            .on_action(cx.listener(|this, _: &NavigateHome, window, cx| {
+                this.navigate_to_home(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &HistoryBack, _window, cx| {
-                this.navigate_history_back(cx);
+            .on_action(cx.listener(|this, _: &HistoryBack, window, cx| {
+                this.navigate_history_back(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &HistoryForward, _window, cx| {
-                this.navigate_history_forward(cx);
+            .on_action(cx.listener(|this, _: &HistoryForward, window, cx| {
+                this.navigate_history_forward(window, cx);
             }))
             // 20% smaller than `gpui-component`'s 16px default, scoped to
             // just this panel (cascades into `Table`'s header/row text) --
