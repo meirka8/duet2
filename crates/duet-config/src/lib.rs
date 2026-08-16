@@ -58,6 +58,8 @@ pub mod keymap;
 pub mod migrate;
 /// XDG config path resolution.
 pub mod paths;
+/// `session.json` loading: panes, tabs, cwds (T-4.3.2's slice).
+pub mod session;
 /// `settings.toml` loading: the fully typed, primary config file.
 pub mod settings;
 /// `themes/*.toml` loading (color/spacing token files).
@@ -67,6 +69,7 @@ mod watch;
 pub use document::ConfigFile;
 pub use error::{ConfigError, Result};
 pub use migrate::{Migration, MigrationRegistry};
+pub use session::{Session, SessionPanel, SessionTab};
 pub use settings::{Settings, SettingsFile};
 pub use theme::{ThemeDocument, ThemeTokensDocument};
 pub use watch::{ConfigWatcher, watch};

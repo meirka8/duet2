@@ -57,6 +57,16 @@ tracing = { workspace = true }
 # (see workspace.rs's tests module) -- the same crate duet-config already
 # uses for its own file-round-trip tests.
 tempfile = "3"
+# T-4.3.2: `Panel`'s tab commands construct real `FileTable`/`TableState`
+# entities, which need a live `Window` (see `panel.rs`'s `add_tab_entry`) --
+# unlike `FileTableDelegate`'s own tests (plain Rust structs, no GPUI
+# platform needed), there's no way to exercise `Panel` under plain `cargo
+# test` without one. `test-support` is GPUI's own answer to exactly this
+# (already proven out in `spikes/s6-text-input`'s headless IME/clipboard
+# tests): a fake platform (`TestAppContext`) that `#[gpui::test]` spins up
+# per test, real enough to construct real windows and entities but with no
+# actual display connection.
+gpui = { version = "0.2.2", features = ["test-support"] }
 # T-4.2.1's 1M-row benchmark (`examples/bench_file_table.rs`) reuses
 # T-3.3.4's deterministic in-memory corpus generator (`duet_bench::corpus`)
 # rather than hand-rolling a second synthetic-entry generator. Dev-only:

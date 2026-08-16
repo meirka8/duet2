@@ -31,6 +31,31 @@ pub fn duet_config_dir() -> Result<PathBuf> {
     Ok(xdg_config_home()?.join("duet"))
 }
 
+/// Resolves `$XDG_STATE_HOME`, falling back to `$HOME/.local/state` per the
+/// XDG Base Directory Specification. State (`session.json`, operation
+/// journals, history) is not user-editable config, so it lives in a
+/// separate tree from [`xdg_config_home`] -- see design.md §10's directory
+/// layout.
+pub fn xdg_state_home() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join(".local").join("state"));
+    }
+    Err(ConfigError::NoStateDir)
+}
+
+/// `~/.local/state/duet` (or `$XDG_STATE_HOME/duet`).
+pub fn duet_state_dir() -> Result<PathBuf> {
+    Ok(xdg_state_home()?.join("duet"))
+}
+
+/// `~/.local/state/duet/session.json` -- panes, tabs, cwds (design.md §10).
+pub fn session_path() -> Result<PathBuf> {
+    Ok(duet_state_dir()?.join("session.json"))
+}
+
 /// `~/.config/duet/settings.toml`.
 pub fn settings_path() -> Result<PathBuf> {
     Ok(duet_config_dir()?.join("settings.toml"))
@@ -97,6 +122,54 @@ mod tests {
                 assert_eq!(
                     xdg_config_home().unwrap(),
                     PathBuf::from("/tmp/home-fallback/.config")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xdg_state_home_prefers_explicit_var() {
+        temp_env(
+            &[
+                ("XDG_STATE_HOME", Some("/tmp/xdg-state-explicit")),
+                ("HOME", Some("/tmp/home-fallback")),
+            ],
+            || {
+                assert_eq!(
+                    xdg_state_home().unwrap(),
+                    PathBuf::from("/tmp/xdg-state-explicit")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xdg_state_home_falls_back_to_home_dot_local_state() {
+        temp_env(
+            &[
+                ("XDG_STATE_HOME", None),
+                ("HOME", Some("/tmp/home-fallback")),
+            ],
+            || {
+                assert_eq!(
+                    xdg_state_home().unwrap(),
+                    PathBuf::from("/tmp/home-fallback/.local/state")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn session_path_appends_duet_session_json() {
+        temp_env(
+            &[
+                ("XDG_STATE_HOME", Some("/tmp/xdg-state-explicit")),
+                ("HOME", None),
+            ],
+            || {
+                assert_eq!(
+                    session_path().unwrap(),
+                    PathBuf::from("/tmp/xdg-state-explicit/duet/session.json")
                 );
             },
         );
