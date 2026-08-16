@@ -148,7 +148,23 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let table = cx.new(|cx| FileTable::new(dir, self.tokio_handle.clone(), window, cx));
+        // Seeds the new tab's column widths from an already-measured
+        // sibling in this same panel, if one exists -- see
+        // `FileTable::responsive_seed`'s doc comment. Every tab in a
+        // `Panel` renders at the same panel width, so any existing tab's
+        // answer is exactly right for a new one too; this is what stops a
+        // tab opened mid-session (Ctrl+T, a tab-strip click, ...) from
+        // visibly flashing a too-narrow Name column for one frame before
+        // some unrelated later action happens to trigger the repaint that
+        // would otherwise be the first thing to reveal the corrected
+        // width (UAT: "defaults to a much narrower name column... resizes
+        // immediately after whatever navigation action").
+        let width_seed = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.table.read(cx).responsive_seed(cx));
+        let table =
+            cx.new(|cx| FileTable::new(dir, self.tokio_handle.clone(), width_seed, window, cx));
         cx.subscribe(
             &table,
             |_this, _table, event: &FileTableEvent, cx| match event {
@@ -634,6 +650,51 @@ mod tests {
                         "a plain new tab is never locked, even if the source tab was"
                     );
                 });
+            },
+        );
+    }
+
+    /// UAT regression: a brand-new tab must start with the *same* column
+    /// widths an already-measured sibling in the same panel has, not the
+    /// narrow default `FileTableDelegate::new` otherwise starts every
+    /// table at. Without seeding, the new tab renders one narrow-Name-
+    /// column frame that only self-corrects once some unrelated later
+    /// action happens to trigger a repaint (cursor movement, another
+    /// navigation, ...) -- exactly what was reported.
+    #[gpui::test]
+    fn new_tab_seeds_column_widths_from_an_already_measured_sibling(cx: &mut TestAppContext) {
+        let (dir_a, _dir_b) = two_dirs();
+        with_panel(
+            cx,
+            vec![session_tab(dir_a.path().to_path_buf(), false, false)],
+            0,
+            |panel, vcx| {
+                // A real paint, so the first tab's canvas-based width
+                // measurement actually runs once -- mirrors what happens
+                // on the real window's first frame.
+                let _ = vcx.update(|window, cx| window.draw(cx));
+
+                let seed_before = panel.read_with(vcx, |panel, cx| {
+                    panel.tabs[0].table.read(cx).responsive_seed(cx)
+                });
+                assert!(
+                    seed_before.is_some(),
+                    "the first tab must be measured after a real paint"
+                );
+
+                panel.update_in(vcx, |panel, window, cx| panel.new_tab(window, cx));
+
+                let (seed_a, seed_b) = panel.read_with(vcx, |panel, cx| {
+                    (
+                        panel.tabs[0].table.read(cx).responsive_seed(cx),
+                        panel.tabs[1].table.read(cx).responsive_seed(cx),
+                    )
+                });
+                assert_eq!(
+                    seed_a, seed_b,
+                    "the new tab must start seeded with its sibling's already-measured \
+                     widths, not the narrow default"
+                );
             },
         );
     }

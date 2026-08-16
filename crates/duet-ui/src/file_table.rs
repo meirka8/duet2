@@ -322,6 +322,43 @@ impl FileTableDelegate {
         true
     }
 
+    /// The current `[Name, Size, Modified]` column widths (px) together
+    /// with the panel width they were computed for -- `None` until the
+    /// measuring canvas has actually run at least once (see
+    /// `apply_responsive_widths`). T-4.3.2's `Panel::add_tab_entry` uses
+    /// this to seed a freshly-created sibling tab's initial widths
+    /// directly from one that's already been measured (every tab in a
+    /// `Panel` renders at the same panel width, so a sibling's answer is
+    /// exactly right, not an approximation), skipping the one-frame
+    /// narrow-then-corrects dance [`Self::new`] otherwise commits to.
+    /// Purely cosmetic -- `apply_responsive_widths` would converge to the
+    /// same answer regardless -- but without this, a tab opened mid-
+    /// session (unlike the very first tab at app startup, which rides
+    /// along with several other early re-renders that mask the same
+    /// glitch) visibly flashes narrow until some unrelated later action
+    /// happens to trigger the next repaint.
+    pub(crate) fn responsive_seed(&self) -> Option<([f32; 3], f32)> {
+        let available = self.last_available_width?;
+        Some((
+            [
+                f32::from(self.columns[COL_NAME].width),
+                f32::from(self.columns[COL_SIZE].width),
+                f32::from(self.columns[COL_MODIFIED].width),
+            ],
+            available,
+        ))
+    }
+
+    /// The inverse of [`Self::responsive_seed`]: applies an already-known
+    /// widths/available-width pair directly, without going through
+    /// [`Self::apply_responsive_widths`]'s own recomputation -- there's
+    /// nothing to recompute, the caller already has the exact answer that
+    /// call would produce.
+    fn seed_column_widths(&mut self, widths: [f32; 3], available: f32) {
+        self.columns = columns_with_widths(&self.base_columns, widths);
+        self.last_available_width = Some(available);
+    }
+
     pub fn model(&self) -> &DirectoryModel {
         &self.model
     }
@@ -1163,13 +1200,23 @@ impl FileTable {
     /// unusual but possible stall on some remote-backed or heavily
     /// loaded filesystems) can never delay the directory listing itself
     /// from appearing.
+    ///
+    /// `width_seed`: see `FileTableDelegate::responsive_seed`'s doc
+    /// comment -- `Some((widths, available))` from an already-measured
+    /// sibling tab in the same `Panel` skips this table's first-frame
+    /// narrow-column flash; `None` (a brand-new panel, nothing to copy
+    /// from yet) falls back to the ordinary narrow-then-corrects default.
     pub fn new(
         dir: PathBuf,
         tokio_handle: tokio::runtime::Handle,
+        width_seed: Option<([f32; 3], f32)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = FileTableDelegate::new(DirectoryModel::new());
+        let mut delegate = FileTableDelegate::new(DirectoryModel::new());
+        if let Some((widths, available)) = width_seed {
+            delegate.seed_column_widths(widths, available);
+        }
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(
             dir.clone(),
@@ -1237,6 +1284,11 @@ impl FileTable {
     /// comment.
     pub fn current_dir(&self) -> &std::path::Path {
         &self.current_dir
+    }
+
+    /// See `FileTableDelegate::responsive_seed`.
+    pub(crate) fn responsive_seed(&self, cx: &App) -> Option<([f32; 3], f32)> {
+        self.state.read(cx).delegate().responsive_seed()
     }
 
     /// The volume's free/total space as of the last successful query, or
