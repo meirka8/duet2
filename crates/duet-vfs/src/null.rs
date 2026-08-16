@@ -14,7 +14,7 @@ use futures_core::stream::BoxStream;
 
 use crate::{
     AsyncReadSeek, AsyncWriteCommit, ChangeEvent, CopyOutcome, DirEntry, FileSystem, ListOpts,
-    Mode, RemoveKind, RenameFlags, WriteOpts,
+    Mode, RemoveKind, RenameFlags, VolumeStats, WriteOpts,
 };
 
 /// A `FileSystem` with no entries and no ability to create any.
@@ -46,6 +46,10 @@ impl FileSystem for NullFs {
     }
 
     async fn stat(&self, p: &VPath, _follow: bool) -> Result<Metadata> {
+        Err(not_found(p))
+    }
+
+    async fn volume_stats(&self, p: &VPath) -> Result<VolumeStats> {
         Err(not_found(p))
     }
 
@@ -126,6 +130,13 @@ mod tests {
         let err = fs.stat(&p(), false).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert_eq!(err.path(), Some(&p()));
+    }
+
+    #[tokio::test]
+    async fn volume_stats_reports_not_found() {
+        let fs: Arc<dyn FileSystem> = Arc::new(NullFs);
+        let err = fs.volume_stats(&p()).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
     #[tokio::test]

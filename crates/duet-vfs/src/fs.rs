@@ -7,7 +7,7 @@ use duet_types::{Caps, MetaPatch, Metadata, Result, VPath};
 use futures_core::stream::BoxStream;
 
 use crate::{AsyncReadSeek, AsyncWriteCommit, ChangeEvent, CopyOutcome, DirEntry};
-use crate::{ListOpts, Mode, RemoveKind, RenameFlags, WriteOpts};
+use crate::{ListOpts, Mode, RemoveKind, RenameFlags, VolumeStats, WriteOpts};
 
 /// A mounted filesystem backend: local disk, an archive opened as a
 /// directory, or a remote protocol (SFTP/FTP/WebDAV/S3/SMB).
@@ -87,6 +87,18 @@ pub trait FileSystem: Send + Sync {
     ///   other unclassified failure.
     /// - `Retryable` — transient I/O.
     async fn stat(&self, p: &VPath, follow: bool) -> Result<Metadata>;
+
+    /// Free/total space for the volume containing `p` (T-4.2.7's per-panel
+    /// free-space indicator).
+    ///
+    /// # Errors
+    /// - `NotFound` — `p` does not exist.
+    /// - `Permission` — a directory component of `p` is not searchable.
+    /// - `Fatal` — the backend has no meaningful concept of "volume" (an
+    ///   archive or a backend where the question doesn't apply), or any
+    ///   other unclassified failure.
+    /// - `Retryable` — transient I/O.
+    async fn volume_stats(&self, p: &VPath) -> Result<VolumeStats>;
 
     /// Opens `p` for reading, returning a seekable async reader.
     ///

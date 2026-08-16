@@ -298,7 +298,7 @@ impl Workspace {
             .detach();
     }
 
-    fn dual_pane(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn dual_pane(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let theme = cx.theme();
         let total = px(900.); // A reasonable initial estimate; the widget's own
@@ -309,13 +309,36 @@ impl Workspace {
         let left_w = total * self.splitter_ratio;
         let right_w = total * (1.0 - self.splitter_ratio);
 
+        // FR-NAV-02's "active panel indicated by cursor rendering and
+        // header treatment": derived directly from real keyboard focus
+        // (`FocusHandle::is_focused`) rather than a separately-tracked
+        // `active_panel` field, so there's exactly one source of truth
+        // and no way for the two to drift apart. The right panel is
+        // never "active" yet -- it's still a placeholder with no real
+        // `FocusHandle` of its own (T-4.2.x builds it out), so treating
+        // it as active whenever focus merely isn't on the left panel
+        // (e.g. it's on the command line) would be actively misleading,
+        // not just incomplete. Tab-based switching between the two (the
+        // other half of FR-NAV-02) is T-4.3.x's job.
+        let left_panel = self.left_panel.read(cx);
+        let left_active = left_panel.focus_handle(cx).is_focused(window);
+        let left_header = left_panel.current_dir().display().to_string();
+        let left_footer = panel_footer_text(left_panel, cx);
+
         h_resizable("workspace-splitter")
             .with_state(&self.resizable_state)
             .child(
                 resizable_panel()
                     .size(left_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(left_panel_view(&self.left_panel, tokens, theme.border)),
+                    .child(left_panel_view(
+                        &self.left_panel,
+                        left_header,
+                        left_footer,
+                        left_active,
+                        tokens,
+                        theme.border,
+                    )),
             )
             .child(
                 resizable_panel()
@@ -394,40 +417,6 @@ impl Workspace {
             .text_size(px(12.))
             .child(gpui::div().child(status_text))
             .child(gpui::div().child(theme_text))
-            // FR-SEL-05's "n of m files selected, x of y bytes" (T-4.2.3).
-            // The free-space indicator and active-panel treatment this
-            // slot will eventually also carry are T-4.2.7's job.
-            .child(gpui::div().child(self.selection_stats_text(cx)))
-    }
-
-    /// See `status_bar_row`'s FR-SEL-05 slot. Reads straight through to
-    /// `left_panel`'s live `DirectoryModel` rather than caching a copy --
-    /// `DirectoryModel::selection_stats()` is already `O(1)`, and
-    /// `FileTableDelegate::total_bytes_in_view` is cached per generation,
-    /// so there's nothing to gain by duplicating either here. GPUI's own
-    /// per-view accessed-entity tracking (confirmed by reading
-    /// `gpui-0.2.2/src/view.rs`) is what makes this live: reading
-    /// `left_panel`'s entity during `Workspace`'s render marks `Workspace`
-    /// dependent on it, so `left_panel`'s `cx.notify()` after any
-    /// selection command re-renders this text without an explicit
-    /// `cx.observe` subscription.
-    fn selection_stats_text(&self, cx: &Context<Self>) -> SharedString {
-        let panel = self.left_panel.read(cx);
-        let state = panel.state().read(cx);
-        let model = state.delegate().model();
-        let stats = model.selection_stats();
-
-        let mut selected_bytes = String::new();
-        write_byte_count(&mut selected_bytes, stats.total_bytes);
-        let mut total_bytes = String::new();
-        write_byte_count(&mut total_bytes, state.delegate().total_bytes_in_view());
-
-        format!(
-            "{} of {} files selected, {selected_bytes} of {total_bytes} bytes",
-            stats.count,
-            model.order().len(),
-        )
-        .into()
     }
 
     fn function_key_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -473,7 +462,7 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let bg = theme.background;
         let fg = theme.foreground;
@@ -491,34 +480,152 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ResizeSplitterRight, _window, cx| {
                 this.resize_splitter_by(SPLITTER_KEYBOARD_STEP, cx);
             }))
-            .child(gpui::div().flex_1().p_2().child(self.dual_pane(cx)))
+            .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
             .child(self.function_key_bar(cx))
     }
 }
 
+/// T-4.2.7's per-panel footer text: `FR-SEL-05`'s "n of m files selected,
+/// x of y bytes" (T-4.2.3's stats, relocated here from a one-off slot in
+/// the *global* status bar -- TC's own footer is per-panel, not
+/// window-wide, and now that there's real per-panel chrome to put it in
+/// this is where it belongs) plus, once the first `volume_stats` query
+/// lands, the free-space figure the AC asks for. Reads `table`'s live
+/// state directly rather than caching a copy -- `selection_stats()`/
+/// `total_bytes_in_view()` are already `O(1)`/cached, so there's nothing
+/// to gain by duplicating either here. Liveness needs no explicit
+/// `cx.observe`: GPUI's own per-view accessed-entity tracking (confirmed
+/// by reading `gpui-0.2.2/src/view.rs`) means `Workspace` reading
+/// `table`'s entity during render is enough for `table`'s `cx.notify()`
+/// (after a selection command, or once the volume-stats query completes)
+/// to re-render this text.
+fn panel_footer_text(table: &FileTable, cx: &App) -> SharedString {
+    let state = table.state().read(cx);
+    let model = state.delegate().model();
+    let stats = model.selection_stats();
+
+    let mut selected_bytes = String::new();
+    write_byte_count(&mut selected_bytes, stats.total_bytes);
+    let mut total_bytes = String::new();
+    write_byte_count(&mut total_bytes, state.delegate().total_bytes_in_view());
+
+    let mut text = format!(
+        "{} of {} files selected, {selected_bytes} of {total_bytes} bytes",
+        stats.count,
+        model.order().len(),
+    );
+
+    if let Some(vol) = table.volume_stats() {
+        let mut available = String::new();
+        write_byte_count(&mut available, vol.available_bytes);
+        let mut total = String::new();
+        write_byte_count(&mut total, vol.total_bytes);
+        text.push_str(&format!(" \u{2014} {available} free of {total}"));
+    }
+
+    text.into()
+}
+
+/// The path/free-space chrome common to every panel (T-4.2.7) -- a header
+/// (the current path) above the panel's real content and a footer
+/// (selection stats + free space) below it, both switching color with
+/// `active` the same way the panel's own body background already does
+/// ([`left_panel_view`]/[`placeholder_panel`]), plus a colored
+/// bottom-border "underline" on the header specifically: with only a
+/// background-brightness difference between active/inactive, a panel
+/// showing few or muted colors (some themes, most content) could still
+/// leave "which one is active" genuinely ambiguous at a glance -- the
+/// AC's actual bar. The underline is a second, independent signal that
+/// doesn't depend on the theme's brightness contrast being strong enough
+/// on its own.
+fn panel_chrome(
+    header_text: impl Into<SharedString>,
+    footer_text: impl Into<SharedString>,
+    active: bool,
+    tokens: &TokenPalette,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    let underline = if active {
+        tokens.color.border_focus
+    } else {
+        tokens.color.border_default
+    };
+    v_flex()
+        .size_full()
+        .child(
+            gpui::div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .text_size(px(11.))
+                .text_color(tokens.color.header_fg)
+                .bg(tokens.color.header_bg)
+                .border_b_1()
+                .border_color(underline)
+                .truncate()
+                .child(header_text.into()),
+        )
+        .child(gpui::div().flex_1().min_h(px(0.)).child(body))
+        .child(
+            gpui::div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .text_size(px(11.))
+                .text_color(tokens.color.statusbar_fg)
+                .bg(tokens.color.statusbar_bg)
+                .border_t_1()
+                .border_color(tokens.color.border_default)
+                .truncate()
+                .child(footer_text.into()),
+        )
+}
+
 /// Wraps the real, virtualised [`FileTable`] (T-4.2.1) in the same
-/// themed frame [`placeholder_panel`] below uses, so the left panel's chrome
-/// matches the still-placeholder right panel until T-4.2.2 onward makes
+/// [`panel_chrome`] [`placeholder_panel`] below uses, so the left panel's
+/// chrome matches the still-placeholder right panel until T-4.2.x makes
 /// both real.
 fn left_panel_view(
     table: &Entity<FileTable>,
+    header_text: impl Into<SharedString>,
+    footer_text: impl Into<SharedString>,
+    active: bool,
     tokens: &TokenPalette,
     border: gpui::Hsla,
 ) -> impl IntoElement {
-    v_flex()
+    let (bg, _fg) = if active {
+        (tokens.color.panel_bg_active, tokens.color.panel_fg_active)
+    } else {
+        (
+            tokens.color.panel_bg_inactive,
+            tokens.color.panel_fg_inactive,
+        )
+    };
+    gpui::div()
         .size_full()
-        .bg(tokens.color.panel_bg_active)
+        .bg(bg)
         .border_1()
-        .border_color(border)
+        .border_color(if active {
+            tokens.color.border_focus
+        } else {
+            border
+        })
         .rounded_md()
-        .child(table.clone())
+        .child(panel_chrome(
+            header_text,
+            footer_text,
+            active,
+            tokens,
+            table.clone(),
+        ))
 }
 
 /// A placeholder panel standing in for a future `PanelView` (T-4.2.x).
 /// Proves the resizable dual-pane shape and is themed by
-/// [`TokenPalette`]; it renders no directory data of its own yet.
+/// [`TokenPalette`]; it renders no directory data of its own yet, so its
+/// header/footer are static placeholders rather than anything real.
 fn placeholder_panel(
     label: &'static str,
     active: bool,
@@ -533,15 +640,27 @@ fn placeholder_panel(
             tokens.color.panel_fg_inactive,
         )
     };
-    v_flex()
+    gpui::div()
         .size_full()
-        .items_center()
-        .justify_center()
         .bg(bg)
         .border_1()
-        .border_color(border)
+        .border_color(if active {
+            tokens.color.border_focus
+        } else {
+            border
+        })
         .rounded_md()
-        .child(gpui::div().text_color(fg).child(label))
+        .child(panel_chrome(
+            "\u{2014}",
+            "0 of 0 files selected, 0 B of 0 B bytes",
+            active,
+            tokens,
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(gpui::div().text_color(fg).child(label)),
+        ))
 }
 
 /// Reads `panels.splitter_ratio` from `settings.toml` at `path`. Any
