@@ -23,9 +23,30 @@ use crate::io;
 /// event worth a backup-and-migrate pipeline over.
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
-/// One tab's persisted state -- T-4.3.2's slice: which directory it's
-/// showing and its two TC lock flags. Cursor position, sort column, and
-/// view mode join this struct in T-4.3.7.
+/// Which column a tab was last sorted by, for [`SessionTab::sort_column`].
+/// Mirrors `duet_index::SortColumn`'s Name/Size/Modified variants (the
+/// only three `duet-ui`'s `FileTableDelegate` ever actually sorts by --
+/// `Kind` is a real `SortColumn` variant but isn't reachable through any
+/// column this app renders) without this crate depending on `duet-index`
+/// just for a persistence enum; `duet-ui` translates between the two
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SessionSortColumn {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One tab's persisted state: which directory it's showing, its two TC
+/// lock flags (T-4.3.2), and its cursor position + sort state (T-4.3.7).
+/// View mode does *not* appear here -- T-4.2.5 (Full/Brief/Thumbnails/
+/// Tree) was never implemented, so there is nothing to persist; add it
+/// when that task lands, not speculatively ahead of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTab {
     pub dir: PathBuf,
@@ -33,6 +54,25 @@ pub struct SessionTab {
     pub locked: bool,
     #[serde(default)]
     pub lock_dir_change: bool,
+    /// The name of the entry under the cursor when last saved. `None` for
+    /// an empty listing, the synthetic ".." row, or a tab that's never had
+    /// its cursor position observed. `#[serde(default)]` so a
+    /// `session.json` written by T-4.3.2 (before this field existed)
+    /// still loads. Restored by name, not row index -- directory contents
+    /// can change between runs; a name that no longer exists on restore
+    /// just falls back to row 0, the same graceful-miss behavior
+    /// `FileTableDelegate::select_row_by_name` already has for T-4.3.1's
+    /// "cursor restores to the child directory when going up".
+    #[serde(default)]
+    pub cursor_name: Option<String>,
+    /// Sort column + direction (T-4.3.7). Both default (missing key =
+    /// `Name` ascending, `duet_index::SortOptions::default()`'s own
+    /// answer) for the same backward-compatibility reason as
+    /// `cursor_name`.
+    #[serde(default)]
+    pub sort_column: SessionSortColumn,
+    #[serde(default = "default_true")]
+    pub sort_ascending: bool,
 }
 
 /// One panel's persisted tab list plus which tab was active.
@@ -110,11 +150,17 @@ mod tests {
                         dir: PathBuf::from("/home/user"),
                         locked: false,
                         lock_dir_change: false,
+                        cursor_name: Some("Documents".to_string()),
+                        sort_column: SessionSortColumn::Modified,
+                        sort_ascending: false,
                     },
                     SessionTab {
                         dir: PathBuf::from("/home/user/projects"),
                         locked: true,
                         lock_dir_change: false,
+                        cursor_name: None,
+                        sort_column: SessionSortColumn::Name,
+                        sort_ascending: true,
                     },
                 ],
                 active_tab: 1,
@@ -124,6 +170,9 @@ mod tests {
                     dir: PathBuf::from("/tmp"),
                     locked: false,
                     lock_dir_change: true,
+                    cursor_name: Some("scratch.txt".to_string()),
+                    sort_column: SessionSortColumn::Size,
+                    sort_ascending: true,
                 }],
                 active_tab: 0,
             },
@@ -181,6 +230,27 @@ mod tests {
         let session = load(&path).unwrap();
         assert!(!session.left.tabs[0].locked);
         assert!(!session.left.tabs[0].lock_dir_change);
+    }
+
+    /// T-4.3.7: a `session.json` written by T-4.3.2 (before cursor_name/
+    /// sort_column/sort_ascending existed) must still load, with those
+    /// three fields defaulting to "no cursor position recorded, Name
+    /// ascending" -- the same answer a fresh listing starts at anyway, so
+    /// an old session file degrades to indistinguishable-from-normal, not
+    /// broken.
+    #[test]
+    fn missing_cursor_and_sort_fields_default_to_name_ascending_no_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"left":{"tabs":[{"dir":"/a"}],"active_tab":0},"right":{"tabs":[],"active_tab":0}}"#,
+        )
+        .unwrap();
+        let session = load(&path).unwrap();
+        assert_eq!(session.left.tabs[0].cursor_name, None);
+        assert_eq!(session.left.tabs[0].sort_column, SessionSortColumn::Name);
+        assert!(session.left.tabs[0].sort_ascending);
     }
 
     #[test]

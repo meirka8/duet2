@@ -69,7 +69,7 @@ mod watch;
 pub use document::ConfigFile;
 pub use error::{ConfigError, Result};
 pub use migrate::{Migration, MigrationRegistry};
-pub use session::{Session, SessionPanel, SessionTab};
+pub use session::{Session, SessionPanel, SessionSortColumn, SessionTab};
 pub use settings::{Settings, SettingsFile};
 pub use theme::{ThemeDocument, ThemeTokensDocument};
 pub use watch::{ConfigWatcher, watch};

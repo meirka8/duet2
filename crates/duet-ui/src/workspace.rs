@@ -6,15 +6,17 @@
 //! command-line row, all themed by [`crate::theme_controller`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use duet_config::SessionTab;
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
     input::{Input, InputState},
-    layout::{Root, h_flex, v_flex},
+    layout::{Root, WindowExt, h_flex, v_flex},
     resizable::{ResizableState, h_resizable, resizable_panel},
     theme::{ActiveTheme as _, TokenPalette},
+    toast::Notification,
 };
 use futures_util::StreamExt;
 use gpui::{
@@ -150,6 +152,22 @@ const SPLITTER_MAX_RATIO: f32 = 0.85;
 /// `Ctrl+Left`/`Ctrl+Right`'s step size per keypress.
 const SPLITTER_KEYBOARD_STEP: f32 = 0.02;
 
+/// T-4.3.7's "kill -9 restores the full workspace": cursor position and
+/// sort state change far more often (every arrow key, every header
+/// click) than tab structure does. Hooking a dedicated event into every
+/// single cursor-moving/sort-changing call site across `FileTable` (the
+/// way `FileTableEvent::DirectoryChanged` does for directory changes)
+/// would be a lot of invasive surface area for what's fundamentally a
+/// "don't lose more than a few seconds of scrolling" guarantee, not a
+/// pixel-perfect one. A periodic re-save (see [`Workspace::new`]'s
+/// spawned loop) covers exactly that gap cheaply instead: every few
+/// seconds, unconditionally re-persist whatever the current cursor/sort
+/// state is, alongside the already-eager, event-driven saves structural
+/// tab changes and real directory changes get. Short enough that a kill
+/// -9 loses at most a few seconds of cursor movement, not imperceptible
+/// enough to matter for a background file write nobody's watching.
+const SESSION_PERIODIC_SAVE_INTERVAL: Duration = Duration::from_secs(3);
+
 /// The root workspace view: the dual-pane splitter, the function-key bar,
 /// the status bar, and the command-line row (T-4.1.4), themed live by
 /// [`ThemeController`] (T-4.1.5).
@@ -208,11 +226,27 @@ pub struct Workspace {
     /// structural tab change and every real directory change in either
     /// panel re-saves this (see [`Self::new`]'s `cx.observe` calls and
     /// `crate::file_table::FileTableEvent::DirectoryChanged`'s doc
-    /// comment), not just at graceful shutdown -- T-4.3.7's later AC
-    /// ("kill -9 then restart restores the full workspace") only holds if
-    /// saves are already this eager by the time that task adds to the
-    /// same file.
+    /// comment), plus a periodic re-save regardless of any event
+    /// (`SESSION_PERIODIC_SAVE_INTERVAL`) for state that changes too
+    /// often to hook individually (cursor position, sort -- T-4.3.7). Not
+    /// just at graceful shutdown -- the AC ("kill -9 then restart
+    /// restores the full workspace") only holds if saves are already
+    /// this eager.
     session_path: Option<PathBuf>,
+
+    /// A one-shot notice to surface via `window.push_notification` on the
+    /// first render after startup, then cleared -- T-4.3.7's "a corrupt
+    /// session file degrades to defaults with a notice". `None` covers
+    /// both "nothing went wrong" and "first launch, no `session.json`
+    /// yet" (a missing file is not a notice-worthy problem); only set
+    /// when `session.json` exists but failed to load. Can't push the
+    /// notification directly from [`Self::new`] -- `gpui-component`'s
+    /// `Root` (what `WindowExt::push_notification` routes through)
+    /// doesn't exist yet at that point in `run`'s window-open callback
+    /// (`Root::new(workspace, ..)` wraps `workspace` *after*
+    /// `Workspace::new` returns), so this bridges the one-frame gap the
+    /// same way the `theme` field below does for `ThemeController`.
+    pending_notice: Option<String>,
 
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
@@ -264,17 +298,19 @@ impl Workspace {
         // `resolve_panel_session` degrades to one fresh tab at
         // `initial_dir` on first launch, a missing/corrupt file, or every
         // saved tab's directory having since vanished.
+        //
+        // T-4.3.7: a missing file (first launch, or `session.json` never
+        // written yet) is the ordinary case and gets no user-facing
+        // notice, only a log line -- but a file that *exists* and still
+        // failed to load (corrupt JSON, a schema version this build
+        // predates, permission denied, ...) is a real "we lost your
+        // session" event, surfaced via `pending_notice` once a window
+        // exists to show it in (see that field's doc comment).
         let session_path = duet_config::paths::session_path().ok();
-        let session = session_path.as_deref().and_then(|path| {
-            duet_config::session::load(path)
-                .inspect_err(|err| {
-                    tracing::info!(
-                        target: "duet_ui::workspace",
-                        "using default session ({path:?} not loaded: {err})"
-                    );
-                })
-                .ok()
-        });
+        let (session, pending_notice) = session_path
+            .as_deref()
+            .map(load_session_with_notice)
+            .unwrap_or((None, None));
         let (left_tabs, left_active) =
             resolve_panel_session(session.as_ref().map(|s| &s.left), &initial_dir);
         let (right_tabs, right_active) =
@@ -294,6 +330,28 @@ impl Workspace {
         cx.observe(&right_panel, |this, _panel, cx| this.persist_session(cx))
             .detach();
 
+        // T-4.3.7's periodic catch-up save -- see
+        // `SESSION_PERIODIC_SAVE_INTERVAL`'s doc comment for why this
+        // exists alongside the event-driven saves above rather than
+        // instead of them. Runs for the process's whole lifetime (there's
+        // no "stop" -- it simply stops being polled once `Workspace` is
+        // dropped, at which point `this.update` starts failing and the
+        // loop exits on its own).
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SESSION_PERIODIC_SAVE_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.persist_session(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
@@ -305,6 +363,7 @@ impl Workspace {
             command_line,
             settings_path,
             session_path,
+            pending_notice,
             theme: None,
         }
     }
@@ -593,6 +652,16 @@ impl Render for Workspace {
         let bg = theme.background;
         let fg = theme.foreground;
 
+        // T-4.3.7: the one-shot "your session.json was corrupt" notice --
+        // see the `pending_notice` field's doc comment for why this can't
+        // happen any earlier than the first render (no `Root` exists yet
+        // during `Workspace::new`, and `push_notification` requires one).
+        // `.take()` so it fires exactly once, no matter how many renders
+        // follow.
+        if let Some(notice) = self.pending_notice.take() {
+            window.push_notification(Notification::warning(notice), cx);
+        }
+
         v_flex()
             .id("workspace-root")
             .key_context("Workspace")
@@ -771,6 +840,40 @@ fn panel_view(
         ))
 }
 
+/// Loads `session.json` at `path`, distinguishing "no file yet" (the
+/// ordinary first-launch case, gets only a log line) from "a file exists
+/// but failed to load" (corrupt JSON, a schema version this build
+/// predates, permission denied, ... -- a real "we lost your session"
+/// event, T-4.3.7's "degrades to defaults with a notice" AC). Returns
+/// `(session, notice)`: `session` is `None` in both failure cases either
+/// way (there's nothing to restore from), `notice` is `Some` only for the
+/// second one, meant for `Workspace::pending_notice`. A pure wrapper
+/// around `duet_config::session::load` (aside from the two `tracing`
+/// calls) specifically so this branching is unit-testable without a real
+/// `Window`/`Workspace`, same reasoning as [`resolve_panel_session`].
+fn load_session_with_notice(path: &Path) -> (Option<duet_config::Session>, Option<String>) {
+    match duet_config::session::load(path) {
+        Ok(session) => (Some(session), None),
+        Err(duet_config::ConfigError::Read { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "no existing session at {path:?}; starting fresh"
+            );
+            (None, None)
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "duet_ui::workspace",
+                "session.json failed to load ({path:?}): {err}; starting fresh"
+            );
+            let notice = format!("Couldn't restore your last session ({err}) -- starting fresh.");
+            (None, Some(notice))
+        }
+    }
+}
+
 /// Resolves one panel's initial tab list at startup: `session`'s saved
 /// tabs (T-4.3.2), filtered down to the ones whose directory still exists
 /// (a saved tab pointing at a since-deleted directory is silently dropped,
@@ -803,6 +906,9 @@ fn resolve_panel_session(
             dir: fallback_dir.to_path_buf(),
             locked: false,
             lock_dir_change: false,
+            cursor_name: None,
+            sort_column: duet_config::SessionSortColumn::Name,
+            sort_ascending: true,
         }],
         0,
     )
@@ -991,6 +1097,68 @@ mod tests {
         assert!(on_disk.contains("splitter_ratio = 0.8"), "{on_disk}");
     }
 
+    fn session_tab(dir: PathBuf, locked: bool) -> SessionTab {
+        SessionTab {
+            dir,
+            locked,
+            lock_dir_change: false,
+            cursor_name: None,
+            sort_column: duet_config::SessionSortColumn::Name,
+            sort_ascending: true,
+        }
+    }
+
+    /// T-4.3.7: a missing `session.json` (first launch) is silent -- no
+    /// notice, since there's nothing wrong to report.
+    #[test]
+    fn load_session_with_notice_is_silent_when_the_file_is_simply_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let (session, notice) = load_session_with_notice(&path);
+        assert!(session.is_none());
+        assert!(notice.is_none(), "a fresh install must not nag the user");
+    }
+
+    /// T-4.3.7's AC: "a corrupt session file degrades to defaults with a
+    /// notice" -- unlike the missing-file case, a file that exists but
+    /// fails to parse must produce a user-facing notice.
+    #[test]
+    fn load_session_with_notice_surfaces_a_notice_for_a_corrupt_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, "not valid json { [ }").unwrap();
+        let (session, notice) = load_session_with_notice(&path);
+        assert!(session.is_none());
+        assert!(
+            notice.is_some(),
+            "an existing-but-corrupt file must be reported, not silently swallowed"
+        );
+    }
+
+    /// A well-formed `session.json` loads with no notice at all.
+    #[test]
+    fn load_session_with_notice_is_silent_on_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let real = tempfile::tempdir().unwrap();
+        let written = duet_config::Session {
+            schema_version: duet_config::session::SESSION_SCHEMA_VERSION,
+            left: duet_config::SessionPanel {
+                tabs: vec![session_tab(real.path().to_path_buf(), false)],
+                active_tab: 0,
+            },
+            right: duet_config::SessionPanel {
+                tabs: vec![session_tab(real.path().to_path_buf(), false)],
+                active_tab: 0,
+            },
+        };
+        duet_config::session::save(&path, &written).unwrap();
+
+        let (session, notice) = load_session_with_notice(&path);
+        assert!(notice.is_none());
+        assert_eq!(session, Some(written));
+    }
+
     /// T-4.3.2: `resolve_panel_session` is the pure (GPUI-free) half of
     /// startup session-loading -- everything about it that doesn't need a
     /// real `Panel`/`FileTable`/window to exercise, unlike `Panel`'s own
@@ -999,14 +1167,7 @@ mod tests {
     fn resolve_panel_session_falls_back_to_a_single_tab_at_fallback_dir_when_session_is_none() {
         let fallback = PathBuf::from("/tmp");
         let (tabs, active) = resolve_panel_session(None, &fallback);
-        assert_eq!(
-            tabs,
-            vec![SessionTab {
-                dir: fallback,
-                locked: false,
-                lock_dir_change: false,
-            }]
-        );
+        assert_eq!(tabs, vec![session_tab(fallback, false)]);
         assert_eq!(active, 0);
     }
 
@@ -1016,16 +1177,8 @@ mod tests {
         let gone = real.path().join("this-directory-was-deleted");
         let session = duet_config::SessionPanel {
             tabs: vec![
-                SessionTab {
-                    dir: gone,
-                    locked: false,
-                    lock_dir_change: false,
-                },
-                SessionTab {
-                    dir: real.path().to_path_buf(),
-                    locked: true,
-                    lock_dir_change: false,
-                },
+                session_tab(gone, false),
+                session_tab(real.path().to_path_buf(), true),
             ],
             active_tab: 1,
         };
@@ -1041,23 +1194,12 @@ mod tests {
         let real = tempfile::tempdir().unwrap();
         let gone = real.path().join("nope");
         let session = duet_config::SessionPanel {
-            tabs: vec![SessionTab {
-                dir: gone,
-                locked: false,
-                lock_dir_change: false,
-            }],
+            tabs: vec![session_tab(gone, false)],
             active_tab: 0,
         };
         let fallback = PathBuf::from("/tmp");
         let (tabs, active) = resolve_panel_session(Some(&session), &fallback);
-        assert_eq!(
-            tabs,
-            vec![SessionTab {
-                dir: fallback,
-                locked: false,
-                lock_dir_change: false,
-            }]
-        );
+        assert_eq!(tabs, vec![session_tab(fallback, false)]);
         assert_eq!(active, 0);
     }
 
@@ -1065,11 +1207,7 @@ mod tests {
     fn resolve_panel_session_clamps_active_tab_into_range() {
         let real = tempfile::tempdir().unwrap();
         let session = duet_config::SessionPanel {
-            tabs: vec![SessionTab {
-                dir: real.path().to_path_buf(),
-                locked: false,
-                lock_dir_change: false,
-            }],
+            tabs: vec![session_tab(real.path().to_path_buf(), false)],
             active_tab: 99,
         };
         let (tabs, active) = resolve_panel_session(Some(&session), Path::new("/tmp"));
