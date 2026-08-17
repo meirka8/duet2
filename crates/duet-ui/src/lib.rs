@@ -17,6 +17,7 @@
 //! (`docs/config-schema.md` §4), live desktop light/dark follow, and
 //! `themes/*.toml` loading with hot reload (`theme_controller`).
 
+mod command_palette;
 pub mod file_table;
 mod function_bar;
 pub mod panel;
