@@ -901,17 +901,13 @@ impl Render for Workspace {
     }
 }
 
-/// T-4.3.6: the palette's overlay chrome -- a full-window backdrop (purely
-/// visual; closing is via Escape, `ListDelegate::cancel`, not a
-/// click-outside handler, since GPUI's mouse-click propagation semantics
-/// weren't worth taking on faith without being able to verify them
-/// interactively in this sandbox) behind a centered card wrapping the
-/// real `duet_widgets::list::List` widget, which already owns the query
-/// input, the virtualised results list, and all of Up/Down/Enter/Escape's
-/// keyboard handling (`CommandPaletteDelegate` supplies the data and the
-/// `confirm`/`cancel` callbacks). `.absolute()` positions this against the
-/// nearest positioned ancestor, which is why `Workspace::render`'s root
-/// carries `.relative()`.
+/// T-4.3.6: the palette's overlay chrome -- a full-window backdrop behind
+/// a centered card wrapping the real `duet_widgets::list::List` widget,
+/// which already owns the query input, the virtualised results list, and
+/// all of Up/Down/Enter/Escape's keyboard handling (`CommandPaletteDelegate`
+/// supplies the data and the `confirm`/`cancel` callbacks). `.absolute()`
+/// positions this against the nearest positioned ancestor, which is why
+/// `Workspace::render`'s root carries `.relative()`.
 ///
 /// `max_h` goes on `List::new(state)` itself, not the wrapping card --
 /// matching `gpui-component`'s own established usage
@@ -920,19 +916,34 @@ impl Render for Workspace {
 /// `v_flex()`). `List::render` explicitly pulls `max_size.height` out of
 /// its *own* style into `options.max_height`, which is what actually
 /// bounds the internal virtualized results view -- setting it on an
-/// ancestor div instead (the original bug here: UAT reported the palette
+/// ancestor div instead (an earlier bug here: UAT reported the palette
 /// opening but search always returning nothing, and typing feeling
 /// stuttery) leaves that bound unset, so the virtualized list has no
 /// definite height to lay out into at all.
+///
+/// `.occlude()` on both the backdrop and the card, plus `.on_mouse_down_out`
+/// on the card, mirror `select.rs`'s own popup exactly -- without the
+/// backdrop's `.occlude()`, a click anywhere on it falls straight through
+/// to whatever panel is underneath (UAT: "click on a panel while the
+/// palette is open activates that panel, the palette doesn't close, and
+/// controls freeze" -- clicking moved real GPUI focus onto the panel
+/// while `command_palette` stayed `Some`, leaving the still-rendered
+/// overlay visually on top but no longer the thing anything was actually
+/// talking to). `on_mouse_down_out` listens window-wide regardless of the
+/// card's own size (it's a capture-phase, `window.mouse_position()`-based
+/// check, not scoped to the backdrop's bounds), so a click on the
+/// backdrop -- now that it can't reach the panel underneath either --
+/// closes the palette the same way Escape does.
 fn command_palette_overlay(
     state: &Entity<ListState<CommandPaletteDelegate>>,
-    cx: &Context<Workspace>,
+    cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     let tokens = TokenPalette::current(cx);
     gpui::div()
         .id("command-palette-backdrop")
         .absolute()
         .size_full()
+        .occlude()
         .flex()
         .items_start()
         .justify_center()
@@ -941,12 +952,16 @@ fn command_palette_overlay(
         .child(
             gpui::div()
                 .id("command-palette-card")
+                .occlude()
                 .w(px(560.))
                 .bg(tokens.color.panel_bg_active)
                 .border_1()
                 .border_color(tokens.color.border_focus)
                 .rounded_md()
-                .child(List::new(state).max_h(px(420.))),
+                .child(List::new(state).max_h(px(420.)))
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_command_palette(window, cx);
+                })),
         )
 }
 
@@ -1433,6 +1448,47 @@ mod tests {
                 assert!(
                     left_handle.is_focused(window),
                     "closing the palette must restore focus to whatever had it before"
+                );
+            });
+        });
+    }
+
+    /// UAT regression: a real mouse click on the backdrop (well outside
+    /// the centered card -- the palette's own top padding is 96px, so a
+    /// click near the window's top-left corner is always on the backdrop
+    /// regardless of window size) must close the palette, not fall
+    /// through and activate whatever panel is underneath. Drives this
+    /// through a real simulated click (`VisualTestContext::simulate_click`),
+    /// not a direct method call -- this is specifically what the
+    /// `.occlude()`/`on_mouse_down_out` wiring exists to guarantee.
+    #[gpui::test]
+    fn clicking_the_backdrop_closes_the_palette_instead_of_reaching_the_panel_underneath(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.simulate_click(gpui::point(px(5.), px(5.)), gpui::Modifiers::default());
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.command_palette.is_none(),
+                    "a click on the backdrop must close the palette"
+                );
+            });
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "the click must not have reached the panel underneath -- closing the \
+                     palette should simply restore focus to what had it before, not leave \
+                     the panel independently focused via a click that fell through"
                 );
             });
         });
