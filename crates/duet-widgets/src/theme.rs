@@ -513,6 +513,24 @@ impl TokenPalette {
             theme.progress_bar = self.color.progress_bar;
             theme.input = self.color.border_default;
             theme.caret = self.color.cursor_bg;
+            // T-4.3.8 UAT: `Table`'s own row-hover style (`table_hover`)
+            // replaces a row's background outright -- it doesn't touch
+            // text color, and it applies the same way to every row,
+            // cursor or not. That rules out a light/bright hover color
+            // (a first attempt using `info`, a light "sky" cyan, made
+            // hovering any *ordinary* row -- by far the common case --
+            // show `panel_fg_active`'s light text on a light background,
+            // "almost indistinguishable" per UAT) as well as a dark one
+            // close to the row's own base background (would fail the
+            // *cursor* row's dark `cursor_fg` text the same way the
+            // stock gray originally did). `tab_active_bg` is this
+            // palette's own "elevated/currently-relevant surface" role --
+            // a genuine middle tone in both built-in themes -- so it
+            // holds up reasonably against light default-row text (the
+            // common case) without being actively unreadable against the
+            // cursor row's dark text on the rare occasion the two
+            // coincide.
+            theme.table_hover = self.color.tab_active_bg;
         }
         cx.set_global(self);
     }
