@@ -33,7 +33,9 @@ use gpui::{
 };
 
 use crate::command_palette::CommandPaletteDelegate;
-use crate::file_table::{FileTable, MouseMode, write_byte_count};
+use crate::file_table::{
+    FileTable, FileTableSettings, MouseMode, QuickSearchMode, write_byte_count,
+};
 use crate::function_bar::{self, FKeySlot};
 use crate::panel::{Panel, bind_panel_keys};
 use crate::theme_controller::ThemeController;
@@ -338,10 +340,20 @@ impl Workspace {
             .map(load_splitter_ratio)
             .unwrap_or(0.5)
             .clamp(SPLITTER_MIN_RATIO, SPLITTER_MAX_RATIO);
-        let mouse_mode = settings_path
-            .as_deref()
-            .map(load_mouse_mode)
-            .unwrap_or_default();
+        let file_table_settings = FileTableSettings {
+            mouse_mode: settings_path
+                .as_deref()
+                .map(load_mouse_mode)
+                .unwrap_or_default(),
+            quick_search_default_mode: settings_path
+                .as_deref()
+                .map(load_quick_search_default_mode)
+                .unwrap_or_default(),
+            quick_search_idle_timeout: settings_path
+                .as_deref()
+                .map(load_quick_search_idle_timeout)
+                .unwrap_or(Duration::from_millis(1200)),
+        };
 
         let command_line = cx.new(|cx| {
             InputState::new(window, cx)
@@ -386,7 +398,7 @@ impl Workspace {
                 left_tabs,
                 left_active,
                 tokio_handle.clone(),
-                mouse_mode,
+                file_table_settings,
                 window,
                 cx,
             )
@@ -396,7 +408,7 @@ impl Workspace {
                 right_tabs,
                 right_active,
                 tokio_handle.clone(),
-                mouse_mode,
+                file_table_settings,
                 window,
                 cx,
             )
@@ -1023,6 +1035,17 @@ fn panel_footer_text(table: &FileTable, cx: &App) -> SharedString {
         text.push_str(&format!(" \u{2014} {available} free of {total}"));
     }
 
+    // T-4.3.3 (FR-NAV-07/FR-NAV-13): the quick-search/quick-filter
+    // indicator, appended here rather than as a separate overlay --
+    // `panel_footer_text` already reads `table`'s live state on every
+    // render with no explicit `cx.observe` needed (see this function's
+    // own doc comment), and design.md itself leaves the indicator's
+    // placement open ("anchored to the panel's footer or near the
+    // cursor row").
+    if let Some(indicator) = table.quick_search_indicator_text(cx) {
+        text.push_str(&format!(" \u{2014} {indicator}"));
+    }
+
     text.into()
 }
 
@@ -1250,6 +1273,46 @@ fn load_mouse_mode(path: &std::path::Path) -> MouseMode {
             );
             MouseMode::from_settings_str(&duet_config::Settings::default().selection.mouse_mode)
         })
+}
+
+/// Reads `navigation.quick_search_mode` (FR-NAV-07) from `settings.toml`
+/// at `path`, same fallback tolerance as [`load_mouse_mode`].
+fn load_quick_search_default_mode(path: &std::path::Path) -> QuickSearchMode {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| QuickSearchMode::from_settings_str(&settings.navigation.quick_search_mode))
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default quick-search mode (settings.toml not loaded yet: {err})"
+            );
+            QuickSearchMode::from_settings_str(
+                &duet_config::Settings::default()
+                    .navigation
+                    .quick_search_mode,
+            )
+        })
+}
+
+/// Reads `navigation.quick_search_idle_timeout_ms` (FR-NAV-13) from
+/// `settings.toml` at `path`, same fallback tolerance as
+/// [`load_mouse_mode`]. Clamped to `docs/config-schema.md`'s documented
+/// `200..=5000` range so a hand-edited out-of-range value can't produce a
+/// timer that fires instantly or never.
+fn load_quick_search_idle_timeout(path: &std::path::Path) -> Duration {
+    let ms = duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| settings.navigation.quick_search_idle_timeout_ms)
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default quick-search idle timeout (settings.toml not loaded yet: {err})"
+            );
+            duet_config::Settings::default()
+                .navigation
+                .quick_search_idle_timeout_ms
+        });
+    Duration::from_millis(ms.clamp(200, 5000) as u64)
 }
 
 /// Writes `panels.splitter_ratio = ratio` to `settings.toml` at `path`,

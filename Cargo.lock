@@ -1707,6 +1707,7 @@ dependencies = [
  "duet-widgets",
  "futures-util",
  "gpui",
+ "nucleo-matcher",
  "tempfile",
  "tokio",
  "tracing",

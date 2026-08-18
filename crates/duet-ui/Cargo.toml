@@ -51,6 +51,14 @@ duet-config = { path = "../duet-config" }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+# T-4.3.3: FR-NAV-13's quick-search fuzzy-subsequence scoring. Same crate
+# (and exact version) `duet-commands`' command palette (T-4.3.6) already
+# depends on, per design.md §9.2's own note that both features should
+# reuse one fuzzy-matching implementation rather than carry two -- see
+# `duet-commands/src/palette.rs`'s module doc comment for the identical
+# reasoning. `duet-commands` doesn't re-export the crate, so this needs
+# its own direct dependency line rather than reaching it transitively.
+nucleo-matcher = "0.3.1"
 
 [dev-dependencies]
 # T-4.1.4: exercises splitter-ratio persistence against real temp files

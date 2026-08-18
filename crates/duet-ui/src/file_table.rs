@@ -43,8 +43,9 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
-use duet_index::{DirectoryModel, SortColumn};
+use duet_index::{DirectoryModel, FilterSpec, SortColumn};
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
 use duet_widgets::menu::{PopupMenu, PopupMenuItem};
@@ -54,10 +55,12 @@ use duet_widgets::table::{
 use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton, ParentElement as _,
-    Render, SharedString, Styled as _, Window, actions, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    HighlightStyle, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
+    ParentElement as _, Render, SharedString, Styled as _, StyledText, Window, actions, div, px,
 };
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Column indices this delegate ships with -- a reasonable subset
 /// (name/size/modified). The full column set (permissions, owner,
@@ -257,6 +260,14 @@ pub struct FileTableDelegate {
     /// `FileTable` built outside a `Panel` (e.g. most tests), where
     /// middle-click is simply inert.
     new_tab_handler: Option<NewTabHandler>,
+    /// FR-NAV-07/FR-NAV-13: the active quick-search/quick-filter session,
+    /// if any. See [`QuickSearchState`]'s doc comment.
+    quick_search: Option<QuickSearchState>,
+    /// Which regime plain typing starts a new session in -- read once
+    /// from `settings.toml`'s `navigation.quick_search_mode` by
+    /// `FileTable::new`, same "no live-reload path yet" story as
+    /// `mouse_mode`.
+    quick_search_default_mode: QuickSearchMode,
 }
 
 impl FileTableDelegate {
@@ -313,6 +324,8 @@ impl FileTableDelegate {
             cursor_on_parent: false,
             mouse_mode: MouseMode::default(),
             new_tab_handler: None,
+            quick_search: None,
+            quick_search_default_mode: QuickSearchMode::default(),
         };
         delegate.rebuild_row_text();
         delegate.set_cursor_row(Some(0));
@@ -471,6 +484,15 @@ impl FileTableDelegate {
         self.mouse_mode = mode;
     }
 
+    /// See the `quick_search_default_mode` field's doc comment.
+    pub(crate) fn set_quick_search_default_mode(&mut self, mode: QuickSearchMode) {
+        self.quick_search_default_mode = mode;
+    }
+
+    fn quick_search_default_mode(&self) -> QuickSearchMode {
+        self.quick_search_default_mode
+    }
+
     /// See the `new_tab_handler` field's doc comment.
     pub(crate) fn set_new_tab_handler(&mut self, handler: Option<NewTabHandler>) {
         self.new_tab_handler = handler;
@@ -531,6 +553,209 @@ impl FileTableDelegate {
         }
     }
 
+    /// FR-NAV-07/FR-NAV-13: clears the active quick-search/quick-filter
+    /// session, if any, restoring the model's filter back to `None`. A
+    /// no-op if no session is active. Lives here (not solely as a
+    /// `FileTable` method) so `context_menu`'s right-click handling
+    /// (which only ever gets `&mut self`, never `FileTable`'s own
+    /// `Context`) can call it directly too -- `FileTable::exit_quick_search`
+    /// is a thin wrapper adding the `cx.notify()` a keyboard/mouse/timer
+    /// -driven exit needs.
+    fn clear_quick_search(&mut self) {
+        let Some(session) = self.quick_search.take() else {
+            return;
+        };
+        if session.mode == QuickSearchMode::Filter {
+            self.model.set_filter(None);
+            self.rebuild_row_text();
+            self.sync_cursor_row_from_model();
+        }
+    }
+
+    /// The active session's mode, if any -- `None` when no quick-search
+    /// /quick-filter regime is active.
+    pub(crate) fn quick_search_mode(&self) -> Option<QuickSearchMode> {
+        self.quick_search.as_ref().map(|s| s.mode)
+    }
+
+    /// The active session's generation counter, if any -- what
+    /// `FileTable`'s idle-timeout timer compares against to detect a
+    /// stale (superseded by a newer keystroke) timer. See
+    /// `QuickSearchState::generation`'s doc comment.
+    pub(crate) fn quick_search_generation(&self) -> Option<u64> {
+        self.quick_search.as_ref().map(|s| s.generation)
+    }
+
+    /// FR-NAV-07/FR-NAV-13's user-facing indicator text -- `None` when no
+    /// session is active. `Jump` mode shows the literal query and the
+    /// current match's ordinal position among every match (design.md's
+    /// own example: "find: rmr (2/5)"); a query matching nothing reads
+    /// "(no match)" rather than a bogus "0/0". `Filter` mode shows the
+    /// query and how many entries currently pass it -- its own indicator
+    /// format, deliberately different from `Jump`'s ordinal (design.md:
+    /// filter mode "keeps its own match-count indicator... unaffected"
+    /// by the ordinal-position requirement, which is specific to `Jump`).
+    pub(crate) fn quick_search_indicator_text(&self) -> Option<String> {
+        let session = self.quick_search.as_ref()?;
+        Some(match session.mode {
+            QuickSearchMode::Jump => match &session.jump_match {
+                Some(m) => format!("find: {} ({}/{})", session.query, m.ordinal, m.total),
+                None => format!("find: {} (no match)", session.query),
+            },
+            QuickSearchMode::Filter => {
+                let count = session.filter_match_count.unwrap_or(0);
+                let noun = if count == 1 { "match" } else { "matches" };
+                format!("filter: {} ({count} {noun})", session.query)
+            }
+        })
+    }
+
+    /// Re-scores (`Jump`) or re-filters (`Filter`) against the active
+    /// session's current query buffer -- a no-op if no session is
+    /// active. The one place every keystroke's effect on the model/
+    /// cursor actually happens; `FileTable::push_quick_search_char`/
+    /// `toggle_quick_filter` both call this after touching
+    /// `self.quick_search` itself.
+    /// Returns the display row the caller should scroll into view, if
+    /// any -- `apply_quick_search_jump`/`_filter` both move the cursor
+    /// (directly, or via `sync_cursor_row_from_model`) but neither has
+    /// access to the `TableState` that `scroll_to_row` lives on, only
+    /// `FileTable::apply_quick_search` (this delegate method's one
+    /// caller) does.
+    fn apply_quick_search(&mut self) -> Option<usize> {
+        let session = self.quick_search.as_ref()?;
+        let mode = session.mode;
+        // Cloning just the query string (not the whole session) sidesteps
+        // needing `self.quick_search` borrowed immutably (to read it) and
+        // mutably (to write `jump_match`/`filter_match_count` back) at
+        // the same time -- cheap, since a typed query is always short.
+        let query = session.query.clone();
+        match mode {
+            QuickSearchMode::Jump => self.apply_quick_search_jump(&query),
+            QuickSearchMode::Filter => self.apply_quick_search_filter(&query),
+        }
+    }
+
+    /// `Jump` mode's per-keystroke work (FR-NAV-13): fuzzy-scores every
+    /// visible entry against `query` (nucleo's subsequence matcher, same
+    /// crate/usage `duet-commands`' command palette already establishes
+    /// -- see `duet-commands/src/palette.rs`'s module doc comment),
+    /// jumps the cursor to the single highest-scoring match (ties broken
+    /// by distance from the cursor's row *before this keystroke* --
+    /// FR-NAV-13's literal tiebreak rule), and records that match's
+    /// *ordinal position in listing order* among every entry that
+    /// matched at all -- not its score rank, which would trivially
+    /// always be 1 since the cursor always jumps to the best scorer. (The
+    /// `find: rmr (2/5)` example in design.md only makes sense under
+    /// this reading: the winner is always the best match, but it isn't
+    /// always the first one you'd encounter scrolling down from the
+    /// top.) A query matching nothing clears `jump_match` and leaves the
+    /// cursor where it was. Returns the winner's display row (UAT: the
+    /// cursor was jumping to matches outside the visible scroll range
+    /// with nothing bringing the viewport along -- `FileTable::
+    /// apply_quick_search` scrolls to whatever this returns).
+    fn apply_quick_search_jump(&mut self, query: &str) -> Option<usize> {
+        let anchor_row = self.cursor_row.unwrap_or(0);
+        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut buf = Vec::new();
+
+        let mut matched: Vec<(usize, u32)> = self
+            .model
+            .ordered_names()
+            .enumerate()
+            .filter_map(|(row, (_, name))| {
+                let score = pattern.score(Utf32Str::new(name, &mut buf), &mut matcher)?;
+                Some((row, score))
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                let da = (a.0 as i64 - anchor_row as i64).unsigned_abs();
+                let db = (b.0 as i64 - anchor_row as i64).unsigned_abs();
+                da.cmp(&db)
+            })
+        });
+
+        let winner = matched.first().map(|&(winner_row, _)| {
+            let total = matched.len();
+            let ordinal = matched.iter().filter(|&&(row, _)| row < winner_row).count() + 1;
+            let winner_name = self
+                .model
+                .entries()
+                .name(EntryId::new(self.model.order()[winner_row]))
+                .to_string();
+            let mut indices = Vec::new();
+            pattern.indices(
+                Utf32Str::new(&winner_name, &mut buf),
+                &mut matcher,
+                &mut indices,
+            );
+            indices.sort_unstable();
+            indices.dedup();
+            (
+                winner_row,
+                JumpMatch {
+                    ordinal,
+                    total,
+                    model_row: winner_row,
+                    indices,
+                },
+            )
+        });
+
+        if let Some(session) = self.quick_search.as_mut() {
+            session.jump_match = winner.as_ref().map(|(_, m)| m.clone());
+        }
+        winner.map(|(winner_row, _)| {
+            let display_row = winner_row + self.parent_offset();
+            self.move_cursor_to(display_row);
+            display_row
+        })
+    }
+
+    /// `Filter` mode's per-keystroke work (FR-NAV-07): narrows
+    /// `model.order()` to entries whose name contains `query`
+    /// (case-insensitive substring -- `FilterSpec::quick_filter`'s
+    /// existing behavior, not fuzzy; see [`QuickSearchMode`]'s doc
+    /// comment for why reusing it as-is is the right call here).
+    /// `show_hidden: true` is load-bearing, not a default left alone: no
+    /// filter is ever otherwise applied in this app today (`order()` ==
+    /// `full_order()` always, until this method's first call),
+    /// `FilterSpec::default()`'s `show_hidden: false` would hide
+    /// dotfiles as an unintended side effect of adding quick-filter.
+    ///
+    /// UAT: narrowing the listing routinely filters out whatever entry
+    /// the cursor was previously on -- `sync_cursor_row_from_model`
+    /// alone then leaves `cursor_row` at `None` (its own, correct
+    /// behavior: the entry it was tracking is no longer visible), which
+    /// left the filtered view with *no* cursor highlighted at all and
+    /// nothing for Enter/arrow keys to act on, even though the match
+    /// count shown was already correct. Falls back to row 0 -- the
+    /// first (and typically only, or close to it) remaining visible
+    /// entry -- whenever that happens, so a narrowed listing always has
+    /// an actionable cursor. Returns the (possibly just-reset) cursor's
+    /// display row so `FileTable::apply_quick_search` can scroll it into
+    /// view, same as `apply_quick_search_jump`.
+    fn apply_quick_search_filter(&mut self, query: &str) -> Option<usize> {
+        self.model.set_filter(Some(FilterSpec {
+            show_hidden: true,
+            quick_filter: Some(query.into()),
+            mask: None,
+        }));
+        self.rebuild_row_text();
+        self.sync_cursor_row_from_model();
+        if self.cursor_row.is_none() && !self.model.order().is_empty() {
+            self.cursor_on_parent = false;
+            self.set_cursor_row(Some(0));
+        }
+        let count = self.model.order().len();
+        if let Some(session) = self.quick_search.as_mut() {
+            session.filter_match_count = Some(count);
+        }
+        self.display_row()
+    }
+
     /// The row-preparation half of [`Self::context_menu`] (`TableDelegate`
     /// impl, below) -- moves the cursor to `row_ix` (display-row terms)
     /// and, in `MouseMode::Norton`, also toggles that row's selection
@@ -548,6 +773,9 @@ impl FileTableDelegate {
         if self.model_row(row_ix).is_none() {
             return false;
         }
+        // A right-click is as much a "mouse click" as a left one --
+        // FR-NAV-13's exit list applies the same way.
+        self.clear_quick_search();
         self.move_cursor_to(row_ix);
         if self.mouse_mode == MouseMode::Norton {
             self.toggle_cursor_selection();
@@ -1046,6 +1274,38 @@ impl TableDelegate for FileTableDelegate {
         if col_ix == COL_SIZE || col_ix == COL_MODIFIED {
             cell = cell.text_right();
         }
+
+        // T-4.3.3: bold the characters `Jump` mode's fuzzy matcher
+        // actually matched, on whichever row is currently the best match
+        // -- the same "show your work" convention every mainstream fuzzy
+        // finder (fzf, VS Code's Quick Open, ...) uses. Plain `BOLD`
+        // weight only, deliberately no color change: this row is also
+        // always the cursor row (`Jump` mode moves the cursor to its own
+        // match), so a highlight color would have to work against both
+        // `cursor_bg`'s light background *and* an ordinary row's dark
+        // one -- the exact contrast trap `duet-widgets::theme`'s
+        // `table_hover` mapping already got wrong once this same task
+        // (see that fix's own commit); weight alone sidesteps it
+        // entirely.
+        if col_ix == COL_NAME {
+            let model_row =
+                (!self.has_parent_row || row_ix != 0).then(|| row_ix - self.parent_offset());
+            let indices = model_row.and_then(|model_row| {
+                let jump_match = self.quick_search.as_ref()?.jump_match.as_ref()?;
+                (jump_match.model_row == model_row).then(|| jump_match.indices.clone())
+            });
+            if let Some(indices) = indices {
+                let highlight = HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                };
+                let ranges = char_indices_to_byte_ranges(&text, &indices);
+                return cell.child(
+                    StyledText::new(text)
+                        .with_highlights(ranges.into_iter().map(|range| (range, highlight))),
+                );
+            }
+        }
         cell.child(text)
     }
 
@@ -1132,6 +1392,35 @@ impl TableDelegate for FileTableDelegate {
             move |_, _, cx| with_delegate(cx, FileTableDelegate::select_same_extension)
         }))
     }
+}
+
+/// Converts `nucleo_matcher`'s per-*character* match indices (positions
+/// into the `Utf32Str` it scored, per `Pattern::indices`'s own doc
+/// comment -- not byte offsets) into the byte ranges `StyledText::
+/// with_highlights` needs, merging adjacent characters into a single
+/// range rather than emitting one run per character. `indices` need not
+/// be sorted/deduplicated on entry -- this sorts its own copy first,
+/// matching `Pattern::indices`'s documented raw-output caveat.
+fn char_indices_to_byte_ranges(name: &str, indices: &[u32]) -> Vec<std::ops::Range<usize>> {
+    let mut indices = indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut target = indices.iter().copied();
+    let mut next_target = target.next();
+    for (char_ord, (byte_off, ch)) in name.char_indices().enumerate() {
+        if next_target != Some(char_ord as u32) {
+            continue;
+        }
+        let end = byte_off + ch.len_utf8();
+        match ranges.last_mut() {
+            Some(r) if r.end == byte_off => r.end = end,
+            _ => ranges.push(byte_off..end),
+        }
+        next_target = target.next();
+    }
+    ranges
 }
 
 /// Directories show `<DIR>` (a Total-Commander-style convention) rather
@@ -1287,6 +1576,17 @@ actions!(
     ]
 );
 
+// T-4.3.3's quick-search (FR-NAV-13) and quick-filter (FR-NAV-07)
+// regimes. Plain printable characters are deliberately *not* bound
+// actions here (there is no `KeyBinding` for "any letter") -- they're
+// captured by a raw `on_key_down` listener on this view's root `div()`
+// in `render()` instead, since GPUI's action-binding system is
+// chord-based, not a catch-all for arbitrary text input. `QuickSearchCancel`
+// (Escape) and `QuickFilterToggle` (`Ctrl+P`, this codebase's own choice
+// -- see `QuickSearchMode`'s doc comment) are the only two regime
+// -related *actions*.
+actions!(duet_file_table, [QuickSearchCancel, QuickFilterToggle]);
+
 /// Registers [`FileTable`]'s keybindings. Called once from
 /// `workspace::run`, before any window opens -- see `bind_workspace_keys`
 /// for the identical pattern this mirrors. `Some("FileTable")` scopes
@@ -1335,6 +1635,8 @@ pub fn bind_file_table_keys(cx: &mut App) {
         KeyBinding::new("alt-home", NavigateHome, Some("FileTable")),
         KeyBinding::new("alt-left", HistoryBack, Some("FileTable")),
         KeyBinding::new("alt-right", HistoryForward, Some("FileTable")),
+        KeyBinding::new("escape", QuickSearchCancel, Some("FileTable")),
+        KeyBinding::new("ctrl-p", QuickFilterToggle, Some("FileTable")),
     ]);
 }
 
@@ -1381,6 +1683,13 @@ pub struct FileTable {
     /// concept of its own, matching every other crate-internal boundary in
     /// this codebase (a `FileTable` must remain meaningful standalone).
     locked_navigation: Option<LockedNavigationHandler>,
+    /// FR-NAV-13's idle-timeout duration (`settings.toml`'s
+    /// `navigation.quick_search_idle_timeout_ms`, default 1200ms) -- read
+    /// once from settings, same as `mouse_mode`/`quick_search_default_mode`.
+    /// Lives here rather than on `FileTableDelegate` since only the
+    /// idle-timer `cx.spawn` (this struct's own job, not rendering) reads
+    /// it.
+    quick_search_idle_timeout: Duration,
 }
 
 /// `dir` is where the locked tab's navigation attempt was headed;
@@ -1495,6 +1804,121 @@ impl MouseMode {
     }
 }
 
+/// FR-NAV-07/FR-NAV-13: the two regimes a quick-search session can be in.
+/// `Jump` moves the cursor to the best fuzzy match on every keystroke
+/// (fuzzy *subsequence*, not prefix, matching per FR-NAV-13); `Filter`
+/// hides non-matching rows instead of moving the cursor
+/// (`FilterSpec::quick_filter`'s existing case-insensitive substring
+/// match, not fuzzy -- neither FR-NAV-07 nor FR-NAV-13 requires filter
+/// mode to be fuzzy, and reusing `FilterSpec` as-is needs no
+/// `duet_index` changes at all).
+///
+/// Which one *plain* typing starts is `settings.toml`'s own
+/// `navigation.quick_search_mode`; `Ctrl+P` (`QuickFilterToggle`)
+/// explicitly switches the *active* session between the two regardless
+/// of that default, preserving the query buffer across the switch --
+/// this codebase's own resolution (in direct consultation, not a
+/// TC-verified convention) of FR-NAV-07's underspecified "a
+/// modifier-prefixed mode filters the panel instead of jumping": Shift
+/// can't be the modifier (queries need uppercase letters), and
+/// `docs/keymap-tc.csv`'s own guess at a chord is tagged "uncertain"
+/// confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum QuickSearchMode {
+    #[default]
+    Jump,
+    Filter,
+}
+
+impl QuickSearchMode {
+    /// Parses `settings.toml`'s raw `navigation.quick_search_mode`
+    /// string. Same tolerance-over-strictness policy as
+    /// [`MouseMode::from_settings_str`].
+    pub(crate) fn from_settings_str(value: &str) -> Self {
+        match value {
+            "jump" => Self::Jump,
+            "filter" => Self::Filter,
+            other => {
+                tracing::warn!(
+                    target: "duet_ui::file_table",
+                    "unknown navigation.quick_search_mode {other:?}, defaulting to jump"
+                );
+                Self::Jump
+            }
+        }
+    }
+
+    /// `Ctrl+P`'s effect on an already-active (or about-to-start) session.
+    fn toggled(self) -> Self {
+        match self {
+            Self::Jump => Self::Filter,
+            Self::Filter => Self::Jump,
+        }
+    }
+}
+
+/// `Jump` mode's current best match -- what the indicator ("find: rmr
+/// (2/5)") and the matched row's character-highlighting both read. Only
+/// ever `Some` on a [`QuickSearchState`] whose `mode` is `Jump`.
+#[derive(Debug, Clone)]
+struct JumpMatch {
+    /// 1-based rank among every entry that matched at all, ordered by
+    /// score (descending), ties broken by distance from the cursor's row
+    /// *before this keystroke* (ascending) -- FR-NAV-13's literal
+    /// tiebreak rule ("entries physically nearer the current cursor row
+    /// breaking ties in favour of the smaller visual jump").
+    ordinal: usize,
+    total: usize,
+    /// The matched entry's *model*-row index (`model.order()` space, not
+    /// display-row) -- `render_tr`/`render_td` translate as needed, same
+    /// as every other model-row-space field on this delegate.
+    model_row: usize,
+    /// Character indices into the entry's name that `nucleo_matcher`
+    /// scored as part of the match, sorted and deduplicated (raw
+    /// `Pattern::indices` output isn't -- see that method's own doc
+    /// comment) -- what `render_td` highlights in the Name cell.
+    indices: Vec<u32>,
+}
+
+/// Transient per-tab quick-search/quick-filter session state (design.md
+/// §9.2: "A small piece of transient state on the tab... not part of
+/// `DirectoryModel` itself since it's UI-session state, not data").
+/// [`FileTableDelegate::quick_search`] is `None` whenever no regime is
+/// active -- the common case; the whole struct is dropped (not reset
+/// field-by-field) on every exit condition (Escape, idle timeout,
+/// jump-mode cursor movement, focus loss), which is also what clears
+/// `DirectoryModel`'s filter back to `None` in `Filter` mode -- see
+/// `FileTable`'s `exit_quick_search`.
+#[derive(Debug, Clone)]
+struct QuickSearchState {
+    mode: QuickSearchMode,
+    /// Characters typed so far this session.
+    query: String,
+    /// Bumped on every keystroke and on regime start; the idle-timeout
+    /// timer captures the generation it was scheduled for and no-ops if
+    /// it's since changed, so a stale timer from an earlier keystroke can
+    /// never cancel a session a newer keystroke kept alive.
+    generation: u64,
+    /// `Jump` mode's current best match, `None` if the query currently
+    /// matches nothing. Always `None` while `mode` is `Filter`.
+    jump_match: Option<JumpMatch>,
+    /// `Filter` mode's current visible-row count (`model.order().len()`
+    /// after the filter applies). Always `None` while `mode` is `Jump`.
+    filter_match_count: Option<usize>,
+}
+
+/// `settings.toml` values read once by `Workspace::new` and passed down
+/// unchanged to every `FileTable` a `Panel` creates -- bundled together
+/// (rather than three more `FileTable::new` parameters, which would push
+/// it well past a readable arg count) since they're always read/threaded
+/// as a group and share the same "no live-reload path yet" story.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FileTableSettings {
+    pub(crate) mouse_mode: MouseMode,
+    pub(crate) quick_search_default_mode: QuickSearchMode,
+    pub(crate) quick_search_idle_timeout: Duration,
+}
+
 impl FileTable {
     /// Starts listing `dir` in the background and returns immediately with
     /// an empty, `loading` table -- `spawn_directory_load` populates it
@@ -1530,7 +1954,7 @@ impl FileTable {
         tokio_handle: tokio::runtime::Handle,
         width_seed: Option<([f32; 3], f32)>,
         restore: TabRestore,
-        mouse_mode: MouseMode,
+        settings: FileTableSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1538,7 +1962,8 @@ impl FileTable {
         if let Some((widths, available)) = width_seed {
             delegate.seed_column_widths(widths, available);
         }
-        delegate.set_mouse_mode(mouse_mode);
+        delegate.set_mouse_mode(settings.mouse_mode);
+        delegate.set_quick_search_default_mode(settings.quick_search_default_mode);
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(
             dir.clone(),
@@ -1594,15 +2019,34 @@ impl FileTable {
         )
         .detach();
 
+        let focus_handle = cx.focus_handle();
+        // FR-NAV-13: "panel losing focus" is one of quick-search's exit
+        // conditions. `window.on_focus_out` (not a builder method chained
+        // onto a `div()` -- it's `Window`'s own subscription API) fires
+        // whenever `focus_handle` or a descendant of it loses focus; its
+        // listener only gets `&mut Window`/`&mut App`, not this entity's
+        // own `Context`, so reaching back in goes through a captured
+        // `WeakEntity` + `update`, same as every other cross-entity
+        // callback in this module. `.detach()` keeps the `Subscription`
+        // alive for the table's whole lifetime, same as every other
+        // `cx.subscribe(...).detach()` here.
+        let weak_this = cx.entity().downgrade();
+        window
+            .on_focus_out(&focus_handle, cx, move |_event, _window, cx| {
+                let _ = weak_this.update(cx, |this, cx| this.exit_quick_search(cx));
+            })
+            .detach();
+
         Self {
             state,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             current_dir: dir,
             volume_stats: None,
             tokio_handle,
             history_back: Vec::new(),
             history_forward: Vec::new(),
             locked_navigation: None,
+            quick_search_idle_timeout: settings.quick_search_idle_timeout,
         }
     }
 
@@ -1652,6 +2096,12 @@ impl FileTable {
     /// the cursor onto later.
     pub(crate) fn cursor_entry_name(&self, cx: &App) -> Option<String> {
         self.state.read(cx).delegate().cursor_entry_name()
+    }
+
+    /// See `FileTableDelegate::quick_search_indicator_text`'s doc
+    /// comment.
+    pub(crate) fn quick_search_indicator_text(&self, cx: &App) -> Option<String> {
+        self.state.read(cx).delegate().quick_search_indicator_text()
     }
 
     /// The tab's current sort column + direction -- T-4.3.7's
@@ -1814,6 +2264,8 @@ impl FileTable {
     /// sitting on it would silently act on whatever real entry the cursor
     /// last meaningfully pointed at instead.
     fn handle_left_click(&mut self, row_ix: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        // FR-NAV-13's exit list explicitly includes "mouse click".
+        self.exit_quick_search(cx);
         let Some(model_row) = self.state.read(cx).delegate().model_row(row_ix) else {
             self.move_cursor_to(row_ix, cx);
             return;
@@ -1831,6 +2283,144 @@ impl FileTable {
             self.with_selection(cx, |delegate| delegate.deselect_all());
             self.toggle_selection(cx);
         }
+    }
+
+    /// FR-NAV-07/FR-NAV-13: clears the active quick-search/quick-filter
+    /// session, if any -- the single exit path every exit condition
+    /// (Escape, idle timeout, jump-mode cursor movement, mouse click,
+    /// navigation, focus loss) funnels through. A no-op if no session is
+    /// active, so every caller can invoke this unconditionally rather
+    /// than checking first. See `FileTableDelegate::clear_quick_search`
+    /// for the actual state-clearing logic this wraps with `cx.notify()`.
+    fn exit_quick_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.delegate_mut().clear_quick_search();
+            cx.notify();
+        });
+    }
+
+    /// The "non-search cursor movement" half of FR-NAV-13's exit list
+    /// (arrows, Home/End, PgUp/PgDn) -- unlike [`Self::exit_quick_search`],
+    /// this only exits an active *jump*-mode session. Filter mode is
+    /// deliberately *not* exited by cursor movement -- this codebase's
+    /// own judgment call (design.md doesn't say either way): every
+    /// mainstream type-ahead filter (Explorer, VS Code's Quick Open, ...)
+    /// lets you arrow through the already-filtered results without
+    /// cancelling the filter, and cancelling it here would make filter
+    /// mode useless for anything beyond a single keystroke.
+    fn exit_quick_search_if_jump(&mut self, cx: &mut Context<Self>) {
+        let is_jump =
+            self.state.read(cx).delegate().quick_search_mode() == Some(QuickSearchMode::Jump);
+        if is_jump {
+            self.exit_quick_search(cx);
+        }
+    }
+
+    /// FR-NAV-07/FR-NAV-13: appends `c` to the active session's query
+    /// buffer, starting a new one (in `quick_search_default_mode`) if
+    /// none is active yet. The `on_key_down` listener in [`Self::render`]
+    /// is this method's only caller -- see that listener's own doc
+    /// comment for why raw keystroke capture is even safe to add without
+    /// double-handling any of this view's already-bound actions.
+    fn push_quick_search_char(&mut self, c: char, cx: &mut Context<Self>) {
+        let generation = self.state.update(cx, |state, _cx| {
+            let default_mode = state.delegate().quick_search_default_mode();
+            let delegate = state.delegate_mut();
+            let session = delegate
+                .quick_search
+                .get_or_insert_with(|| QuickSearchState {
+                    mode: default_mode,
+                    query: String::new(),
+                    generation: 0,
+                    jump_match: None,
+                    filter_match_count: None,
+                });
+            session.query.push(c);
+            session.generation += 1;
+            session.generation
+        });
+        self.apply_quick_search(cx);
+        self.schedule_quick_search_idle_timeout(generation, cx);
+    }
+
+    /// `Ctrl+P` (`QuickFilterToggle`): starts a fresh session in `Filter`
+    /// mode if none is active (this codebase's own choice -- Ctrl+P
+    /// always means "filter," regardless of `quick_search_default_mode`,
+    /// so its behavior is simple to document even though it's
+    /// occasionally redundant with plain typing when the configured
+    /// default already is `Filter`), or flips the active session's mode
+    /// between `Jump`/`Filter` otherwise -- the query buffer carries over
+    /// either way, immediately re-applied under the new mode.
+    fn toggle_quick_filter(&mut self, cx: &mut Context<Self>) {
+        let generation = self.state.update(cx, |state, _cx| {
+            let delegate = state.delegate_mut();
+            match delegate.quick_search.as_mut() {
+                Some(session) => {
+                    session.mode = session.mode.toggled();
+                    session.generation += 1;
+                }
+                None => {
+                    delegate.quick_search = Some(QuickSearchState {
+                        mode: QuickSearchMode::Filter,
+                        query: String::new(),
+                        generation: 0,
+                        jump_match: None,
+                        filter_match_count: None,
+                    });
+                }
+            }
+            delegate
+                .quick_search
+                .as_ref()
+                .expect("just set above")
+                .generation
+        });
+        self.apply_quick_search(cx);
+        self.schedule_quick_search_idle_timeout(generation, cx);
+    }
+
+    /// The wrapper `push_quick_search_char`/`toggle_quick_filter` both
+    /// call after touching `self.quick_search` itself -- see
+    /// `FileTableDelegate::apply_quick_search`'s own doc comment for the
+    /// actual scoring/filtering work.
+    fn apply_quick_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            // UAT: the cursor was jumping to the best match even when it
+            // fell outside the currently visible scroll range, with
+            // nothing bringing the viewport along -- always scroll to
+            // wherever the cursor actually ends up after each keystroke,
+            // same as every other cursor-moving command in this file
+            // already does.
+            if let Some(row) = state.delegate_mut().apply_quick_search() {
+                state.scroll_to_row(row, cx);
+            }
+            cx.notify();
+        });
+    }
+
+    /// FR-NAV-13's idle-timeout exit condition: schedules
+    /// `exit_quick_search` to run `self.quick_search_idle_timeout` after
+    /// this keystroke, unless a newer keystroke (a higher `generation`)
+    /// has since landed. `cx.spawn` futures in this codebase have no
+    /// exposed cancellation handle (unlike, say,
+    /// `Workspace`'s `SESSION_PERIODIC_SAVE_INTERVAL` loop, which polls
+    /// indefinitely rather than needing a one-shot reset per keystroke),
+    /// so comparing generations after the timer fires is what makes an
+    /// earlier keystroke's stale timer a no-op once a newer one has kept
+    /// the session alive.
+    fn schedule_quick_search_idle_timeout(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let timeout = self.quick_search_idle_timeout;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(timeout).await;
+            let _ = this.update(cx, |this, cx| {
+                let still_current =
+                    this.state.read(cx).delegate().quick_search_generation() == Some(generation);
+                if still_current {
+                    this.exit_quick_search(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// The core "change directory" primitive T-4.3.1's other navigation
@@ -1882,6 +2472,13 @@ impl FileTable {
             handler(dir, window, cx);
             return;
         }
+        // A quick-search session's `JumpMatch`/filter both refer to
+        // *this* listing -- navigating away invalidates them outright
+        // (this is also the single choke point every other navigation
+        // method funnels through, so this alone covers Enter/Backspace/
+        // Ctrl+\/Alt+Home/Alt+Left/Alt+Right too, not just this call
+        // site).
+        self.exit_quick_search(cx);
         if push_history {
             self.history_back.push(self.current_dir.clone());
             self.history_forward.clear();
@@ -2016,6 +2613,44 @@ impl Render for FileTable {
             // after a matching mouse-up) so focus moves immediately on
             // press, matching how clicking into any other focusable
             // widget behaves.
+            // FR-NAV-07/FR-NAV-13's quick-search/quick-filter character
+            // capture. GPUI's action-binding system is chord-based (one
+            // exact keystroke string per `KeyBinding`) -- there's no way
+            // to bind "any printable character," so this raw listener is
+            // the only mechanism available for it. It's safe to add
+            // without risking a double-handled keystroke: `Escape`,
+            // `Ctrl+P`, the arrow keys, and every other bound chord in
+            // this file are all matched *actions*, and GPUI's own
+            // `Window::dispatch_key_event` sets `propagate_event = false`
+            // ("Actions stop propagation by default during the bubble
+            // phase") the moment a bound action is dispatched, *before*
+            // the raw key-down listeners below it in the dispatch order
+            // ever run (confirmed by reading `gpui-0.2.2/src/window.rs`)
+            // -- so this listener only ever sees keystrokes nothing else
+            // already claimed.
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    let modifiers = &event.keystroke.modifiers;
+                    if modifiers.control
+                        || modifiers.alt
+                        || modifiers.platform
+                        || modifiers.function
+                    {
+                        return;
+                    }
+                    let Some(key_char) = event.keystroke.key_char.as_deref() else {
+                        return;
+                    };
+                    let mut chars = key_char.chars();
+                    let Some(c) = chars.next() else {
+                        return;
+                    };
+                    if chars.next().is_some() {
+                        return;
+                    }
+                    this.push_quick_search_char(c, cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _event, window, _cx| {
@@ -2023,22 +2658,34 @@ impl Render for FileTable {
                 }),
             )
             .on_action(cx.listener(|this, _: &CursorUp, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &CursorDown, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor(1, cx);
             }))
             .on_action(cx.listener(|this, _: &CursorHome, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor_to(0, cx);
             }))
             .on_action(cx.listener(|this, _: &CursorEnd, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor_to(usize::MAX, cx);
             }))
             .on_action(cx.listener(|this, _: &CursorPageUp, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor_by_page(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &CursorPageDown, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
                 this.move_cursor_by_page(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickSearchCancel, _window, cx| {
+                this.exit_quick_search(cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickFilterToggle, _window, cx| {
+                this.toggle_quick_filter(cx);
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleSelectionAndAdvance, _window, cx| {
@@ -2244,6 +2891,19 @@ fn spawn_directory_load(
                 delegate.select_row_by_name(name);
             }
             delegate.set_loading(false);
+            // UAT: navigating up (Backspace) correctly moved the cursor
+            // back onto the child directory just left (`select_name`),
+            // but never scrolled the viewport to follow -- if that entry
+            // sat below the fold in the parent's (often much longer)
+            // listing, the cursor looked like it vanished off the
+            // bottom, the exact same class of bug T-4.3.3's own
+            // quick-search jump had. Scrolling here unconditionally
+            // (not just when `select_name` found something) also covers
+            // an ordinary fresh load landing on row 0, which is a no-op
+            // if the view is already scrolled to the top.
+            if let Some(row) = delegate.display_row() {
+                state.scroll_to_row(row, cx);
+            }
             cx.notify();
             true
         });
@@ -2371,6 +3031,38 @@ mod tests {
     use duet_types::{EntryKind, Metadata, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn char_indices_to_byte_ranges_merges_adjacent_characters() {
+        // "gamma.txt", matched at char indices 0,1,2 (contiguous "gam")
+        // -- must merge into one range, not three.
+        let ranges = char_indices_to_byte_ranges("gamma.txt", &[0, 1, 2]);
+        assert_eq!(ranges, vec![0..3]);
+    }
+
+    #[test]
+    fn char_indices_to_byte_ranges_keeps_non_adjacent_characters_separate() {
+        // "gamma.txt", matched at 0 ('g') and 4 ('a', the second one) --
+        // two disjoint single-character ranges.
+        let ranges = char_indices_to_byte_ranges("gamma.txt", &[0, 4]);
+        assert_eq!(ranges, vec![0..1, 4..5]);
+    }
+
+    #[test]
+    fn char_indices_to_byte_ranges_accounts_for_multi_byte_characters() {
+        // "café.txt" -- 'é' is 2 bytes in UTF-8, so the char *after* it
+        // ('.') must start at byte 5, not byte 4.
+        let name = "café.txt";
+        assert_eq!(name.len(), 9); // 8 chars, 'é' costs 2 bytes
+        let ranges = char_indices_to_byte_ranges(name, &[3, 4]); // 'é', '.'
+        assert_eq!(ranges, vec![3..6]); // 'é' (2 bytes) + '.' (1 byte)
+    }
+
+    #[test]
+    fn char_indices_to_byte_ranges_tolerates_unsorted_and_duplicate_input() {
+        let ranges = char_indices_to_byte_ranges("gamma.txt", &[2, 0, 1, 1]);
+        assert_eq!(ranges, vec![0..3]);
+    }
 
     fn meta(kind: EntryKind, size: u64, mtime_secs: i64) -> Metadata {
         let mut m = Metadata::minimal(kind);
@@ -2697,6 +3389,33 @@ mod tests {
     }
 
     #[test]
+    fn quick_search_mode_parses_the_two_documented_settings_toml_values() {
+        assert_eq!(
+            QuickSearchMode::from_settings_str("jump"),
+            QuickSearchMode::Jump
+        );
+        assert_eq!(
+            QuickSearchMode::from_settings_str("filter"),
+            QuickSearchMode::Filter
+        );
+    }
+
+    #[test]
+    fn quick_search_mode_falls_back_to_jump_for_an_unrecognized_value() {
+        assert_eq!(
+            QuickSearchMode::from_settings_str("bogus"),
+            QuickSearchMode::Jump
+        );
+        assert_eq!(QuickSearchMode::default(), QuickSearchMode::Jump);
+    }
+
+    #[test]
+    fn quick_search_mode_toggled_flips_between_jump_and_filter() {
+        assert_eq!(QuickSearchMode::Jump.toggled(), QuickSearchMode::Filter);
+        assert_eq!(QuickSearchMode::Filter.toggled(), QuickSearchMode::Jump);
+    }
+
+    #[test]
     fn file_table_delegate_defaults_to_windows_mouse_mode_until_set() {
         let mut delegate = FileTableDelegate::new(five_file_model());
         assert_eq!(delegate.mouse_mode(), MouseMode::Windows);
@@ -2762,6 +3481,123 @@ mod tests {
                 "{mode:?}: right-click must only move the cursor, never select"
             );
         }
+    }
+
+    #[test]
+    fn quick_search_indicator_text_is_none_when_no_session_active() {
+        let delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.quick_search_indicator_text(), None);
+    }
+
+    #[test]
+    fn quick_search_indicator_text_shows_jump_ordinal() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Jump,
+            query: "rmr".to_string(),
+            generation: 1,
+            jump_match: Some(JumpMatch {
+                ordinal: 2,
+                total: 5,
+                model_row: 0,
+                indices: vec![],
+            }),
+            filter_match_count: None,
+        });
+        assert_eq!(
+            delegate.quick_search_indicator_text(),
+            Some("find: rmr (2/5)".to_string())
+        );
+    }
+
+    #[test]
+    fn quick_search_indicator_text_shows_no_match_for_jump_with_nothing_found() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Jump,
+            query: "zzz".to_string(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: None,
+        });
+        assert_eq!(
+            delegate.quick_search_indicator_text(),
+            Some("find: zzz (no match)".to_string())
+        );
+    }
+
+    #[test]
+    fn quick_search_indicator_text_shows_filter_match_count() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Filter,
+            query: "f".to_string(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: Some(3),
+        });
+        assert_eq!(
+            delegate.quick_search_indicator_text(),
+            Some("filter: f (3 matches)".to_string())
+        );
+    }
+
+    /// UAT regression: `apply_quick_search_jump` moved the cursor but
+    /// nothing brought the viewport along, leaving the cursor jumping to
+    /// matches outside the visible scroll range. `FileTable::
+    /// apply_quick_search` fixes this by scrolling to whatever row this
+    /// method returns -- this test is the delegate-level half of that
+    /// fix: the row it returns must actually be the winner's *display*
+    /// row (accounting for the synthetic ".." row), not its model row.
+    #[test]
+    fn apply_quick_search_jump_returns_the_winners_display_row() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Jump,
+            query: "f3".to_string(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: None,
+        });
+
+        let row = delegate.apply_quick_search_jump("f3");
+
+        // "f3" is model row 3; with the ".." row ahead of it, that's
+        // display row 4 -- the exact translation `select_row_by_name`'s
+        // own regression test (T-4.3.7) already established elsewhere in
+        // this file.
+        assert_eq!(row, Some(4));
+        assert_eq!(delegate.cursor_row(), Some(3));
+    }
+
+    /// UAT regression: narrowing the listing routinely filters out
+    /// whatever entry the cursor was previously on, which used to leave
+    /// `cursor_row` at `None` entirely -- no cursor highlighted, nothing
+    /// for Enter/arrow keys to act on, even though the match count shown
+    /// was already correct.
+    #[test]
+    fn apply_quick_search_filter_resets_cursor_to_row_zero_when_previous_entry_is_filtered_out() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.move_cursor_to(2); // land on "f2"
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Filter,
+            query: String::new(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: None,
+        });
+
+        // Only "f4" matches -- "f2" (the cursor's entry) is filtered out.
+        let row = delegate.apply_quick_search_filter("f4");
+
+        assert_eq!(
+            row,
+            Some(0),
+            "cursor must reset to the first remaining visible row"
+        );
+        assert_eq!(delegate.cursor_row(), Some(0));
+        assert_eq!(delegate.model().order().len(), 1);
     }
 
     #[test]
