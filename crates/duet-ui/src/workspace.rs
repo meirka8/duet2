@@ -761,6 +761,14 @@ impl Workspace {
                 self.focus_other_panel(window, cx);
                 true
             }
+            "hotlist.open" => {
+                self.open_hotlist_for_panel(self.palette_target_panel, window, cx);
+                true
+            }
+            "hotlist.add" => {
+                self.add_dir_to_hotlist_for_panel(self.palette_target_panel, window, cx);
+                true
+            }
             _ => false,
         };
         if !handled {
@@ -791,16 +799,36 @@ impl Workspace {
     }
 
     /// `Ctrl+D` (`OpenHotlist`, T-4.3.5, FR-NAV-08): opens the directory
-    /// hotlist overlay. A no-op if it's already open (same reasoning as
-    /// `open_command_palette`: reopening shouldn't stack a second one).
-    /// Captures which panel currently has focus and the focus to restore
-    /// on close.
+    /// hotlist overlay, targeting whichever panel currently has focus.
     fn open_hotlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.focused_panel_side(window, cx);
+        self.open_hotlist_for_panel(target, window, cx);
+    }
+
+    /// The `hotlist.open` half of [`Self::dispatch_palette_command`] and
+    /// [`Self::open_hotlist`]'s shared implementation, taking `target`
+    /// explicitly rather than deriving it from window focus: when this
+    /// runs from the palette, focus is still on the palette's own list at
+    /// this point (the palette closes *after* dispatch returns), so
+    /// [`Self::focused_panel_side`] would see the palette itself, not the
+    /// panel the user actually meant -- `dispatch_palette_command` already
+    /// knows the right answer via `palette_target_panel` (captured back
+    /// when the palette *opened*, before it stole focus) and passes that
+    /// straight through instead.
+    ///
+    /// A no-op if the overlay is already open (same reasoning as
+    /// `open_command_palette`: reopening shouldn't stack a second one).
+    fn open_hotlist_for_panel(
+        &mut self,
+        target: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.hotlist.is_some() {
             return;
         }
 
-        self.hotlist_target_panel = self.focused_panel_side(window, cx);
+        self.hotlist_target_panel = target;
         self.hotlist_previous_focus = window.focused(cx);
 
         let entries = self.hotlist_entries.clone();
@@ -847,11 +875,26 @@ impl Workspace {
 
     /// `Ctrl+Shift+D` (`AddCurrentDirToHotlist`, `hotlist.add`):
     /// bookmarks whichever panel currently has focus's active tab's
-    /// current directory. A no-op (with an explanatory toast, not
-    /// silence) if that directory is already bookmarked -- TC's own
-    /// hotlist doesn't allow duplicate entries either.
+    /// current directory.
     fn add_current_dir_to_hotlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let panel = match self.focused_panel_side(window, cx) {
+        let target = self.focused_panel_side(window, cx);
+        self.add_dir_to_hotlist_for_panel(target, window, cx);
+    }
+
+    /// The `hotlist.add` half of [`Self::dispatch_palette_command`] and
+    /// [`Self::add_current_dir_to_hotlist`]'s shared implementation -- see
+    /// [`Self::open_hotlist_for_panel`]'s doc comment for why `target` is
+    /// taken explicitly rather than re-derived from window focus here. A
+    /// no-op (with an explanatory toast, not silence) if `target`'s
+    /// directory is already bookmarked -- TC's own hotlist doesn't allow
+    /// duplicate entries either.
+    fn add_dir_to_hotlist_for_panel(
+        &mut self,
+        target: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match target {
             PanelSide::Left => &self.left_panel,
             PanelSide::Right => &self.right_panel,
         };
@@ -1989,6 +2032,137 @@ mod tests {
                 assert!(
                     ws.command_palette.is_none(),
                     "dispatching a command must close the palette"
+                );
+            });
+        });
+    }
+
+    /// Regression test for a UAT-reported bug: `hotlist.open`/`hotlist.add`
+    /// were missing from `dispatch_palette_command`'s match entirely (so
+    /// selecting either from the palette just showed the "isn't wired up
+    /// yet" notice), and once wired naively (calling `open_hotlist`/
+    /// `add_current_dir_to_hotlist`, which both re-derive the target panel
+    /// from *live window focus*) they'd silently target the wrong panel:
+    /// at the moment `dispatch_palette_command` runs, focus is still on
+    /// the palette's own list (the palette only closes *after* dispatch
+    /// returns), so `focused_panel_side` sees neither panel focused and
+    /// falls back to `PanelSide::Left` regardless of which panel the user
+    /// actually meant. This drives the real `CommandPaletteDelegate::
+    /// confirm` path (not `dispatch_palette_command` called directly, so
+    /// focus is genuinely on the palette when it runs) with the *right*
+    /// panel focused beforehand, and confirms `hotlist.open` still targets
+    /// the right panel.
+    #[gpui::test]
+    fn dispatch_palette_command_for_hotlist_open_targets_the_captured_palette_panel(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let right_handle = workspace.read_with(vcx, |ws, cx| {
+                ws.right_panel.read(cx).active_focus_handle(cx)
+            });
+            vcx.update(|window, _cx| window.focus(&right_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.command_palette.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state
+                    .delegate_mut()
+                    .perform_search("hotlist.open", window, cx)
+                    .detach();
+            });
+            vcx.run_until_parked();
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_target_panel,
+                    PanelSide::Right,
+                    "hotlist.open dispatched from the palette must target the panel that \
+                     was focused when the palette *opened*, not whatever has focus at \
+                     dispatch time (the palette itself)"
+                );
+                assert!(ws.hotlist.is_some());
+                assert!(ws.command_palette.is_none());
+            });
+        });
+    }
+
+    /// Same regression as the test above, for `hotlist.add`: bookmarks
+    /// whichever panel was focused *before* the palette opened, not
+    /// wherever `focused_panel_side` lands when called from inside
+    /// dispatch (with focus still on the palette).
+    #[gpui::test]
+    fn dispatch_palette_command_for_hotlist_add_bookmarks_the_captured_palette_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let right_dir = tempfile::tempdir().unwrap();
+        with_workspace(cx, |workspace, vcx| {
+            let left_dir = workspace.read_with(vcx, |ws, cx| {
+                ws.left_panel
+                    .read(cx)
+                    .active_table()
+                    .read(cx)
+                    .current_dir()
+                    .to_path_buf()
+            });
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            right_table.update_in(vcx, |table, window, cx| {
+                table.navigate_to_path(right_dir.path().to_path_buf(), window, cx);
+            });
+            vcx.run_until_parked();
+
+            let right_handle = workspace.read_with(vcx, |ws, cx| {
+                ws.right_panel.read(cx).active_focus_handle(cx)
+            });
+            vcx.update(|window, _cx| window.focus(&right_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.command_palette.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state
+                    .delegate_mut()
+                    .perform_search("hotlist.add", window, cx)
+                    .detach();
+            });
+            vcx.run_until_parked();
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_entries.len(),
+                    1,
+                    "hotlist.add dispatched from the palette must actually bookmark \
+                     something, not just show the \"isn't wired up yet\" notice"
+                );
+                assert_eq!(
+                    ws.hotlist_entries[0].path,
+                    right_dir.path().to_string_lossy(),
+                    "must bookmark the panel that was focused when the palette opened \
+                     ({:?}), not the left panel's directory ({left_dir:?})",
+                    right_dir.path()
                 );
             });
         });
