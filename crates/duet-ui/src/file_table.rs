@@ -47,6 +47,7 @@ use std::rc::Rc;
 use duet_index::{DirectoryModel, SortColumn};
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
+use duet_widgets::menu::{PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
 };
@@ -54,8 +55,8 @@ use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Render, SharedString,
-    Styled as _, Window, actions, div, px,
+    InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton, ParentElement as _,
+    Render, SharedString, Styled as _, Window, actions, div, px,
 };
 
 /// Column indices this delegate ships with -- a reasonable subset
@@ -244,6 +245,18 @@ pub struct FileTableDelegate {
     /// are the translation boundary cursor *movement* and *rendering*
     /// go through instead.
     cursor_on_parent: bool,
+    /// FR-SEL-06: which mouse gesture selects a row. See [`MouseMode`]'s
+    /// own doc comment. Set once, at construction, by [`FileTable::new`]
+    /// -- there is no live-reload path yet.
+    mouse_mode: MouseMode,
+    /// T-4.3.8's middle-click "open in a new tab" gesture -- see
+    /// [`NewTabHandler`]'s doc comment and `render_tr`'s
+    /// `with_middle_click_new_tab`. Always `Some` once
+    /// `Panel::add_tab_entry` has wired it up (unlike `locked_navigation`,
+    /// this one is never conditional) -- `None` only for a bare
+    /// `FileTable` built outside a `Panel` (e.g. most tests), where
+    /// middle-click is simply inert.
+    new_tab_handler: Option<NewTabHandler>,
 }
 
 impl FileTableDelegate {
@@ -298,6 +311,8 @@ impl FileTableDelegate {
             nav_generation: 0,
             has_parent_row: false,
             cursor_on_parent: false,
+            mouse_mode: MouseMode::default(),
+            new_tab_handler: None,
         };
         delegate.rebuild_row_text();
         delegate.set_cursor_row(Some(0));
@@ -445,6 +460,99 @@ impl FileTableDelegate {
         if !has_parent {
             self.cursor_on_parent = false;
         }
+    }
+
+    /// See the `mouse_mode` field's doc comment.
+    pub(crate) fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    pub(crate) fn set_mouse_mode(&mut self, mode: MouseMode) {
+        self.mouse_mode = mode;
+    }
+
+    /// See the `new_tab_handler` field's doc comment.
+    pub(crate) fn set_new_tab_handler(&mut self, handler: Option<NewTabHandler>) {
+        self.new_tab_handler = handler;
+    }
+
+    /// Test-only: exposes the installed handler so `panel.rs`'s tests can
+    /// invoke `Panel::add_tab_entry`'s *real* production closure directly
+    /// -- its actual business logic (resolve a name against
+    /// `current_dir`, open a new tab, make it active) is what's worth
+    /// testing, not which exact pixel `gpui-component`'s `Table` maps to
+    /// a given row, which is that crate's own concern to get right.
+    #[cfg(test)]
+    pub(crate) fn new_tab_handler(&self) -> Option<NewTabHandler> {
+        self.new_tab_handler.clone()
+    }
+
+    /// T-4.3.8: middle-click a directory row to open it in a new tab --
+    /// see [`NewTabHandler`]'s doc comment for why the handler takes just
+    /// the entry's name. A no-op for a file row (nothing to open in a new
+    /// tab) or while no handler is installed (`new_tab_handler` is `None`
+    /// for a bare `FileTable` built outside a `Panel`, e.g. most tests --
+    /// see that field's doc comment). `MouseButton::Middle` is one of
+    /// `Div::on_mouse_down`'s own button-filtered overloads (confirmed by
+    /// reading `gpui-0.2.2/src/elements/div.rs`), so no manual
+    /// `event.button ==` check is needed here. Called from `render_tr`
+    /// (the `TableDelegate` impl below).
+    fn with_middle_click_new_tab(&self, row: TableRow, model_row: usize) -> TableRow {
+        let Some(handler) = self.new_tab_handler.clone() else {
+            return row;
+        };
+        let name = self.model.order().get(model_row).copied().and_then(|ix| {
+            let id = EntryId::new(ix);
+            (self.model.entries().kind(id) == EntryKind::Directory)
+                .then(|| self.model.entries().name(id).to_string())
+        });
+        let Some(name) = name else {
+            return row;
+        };
+        row.on_mouse_down(MouseButton::Middle, move |_event, window, cx| {
+            handler(name.clone(), window, cx);
+        })
+    }
+
+    /// Translates a *display*-row index (what `TableEvent::SelectRow`/
+    /// `DoubleClickedRow`/`Table`'s right-click all report) into
+    /// `model.order()` space, or `None` if it's the synthetic ".." row --
+    /// the inverse of [`Self::display_row`]. T-4.3.8's mouse handlers use
+    /// this to turn a click's row index into what the existing
+    /// selection methods (`extend_selection_to`, `toggle_cursor_selection`
+    /// via a cursor move, ...) already expect; none of them need to learn
+    /// about the pseudo-row themselves, same reasoning as
+    /// `set_display_cursor`'s doc comment.
+    pub(crate) fn model_row(&self, row_ix: usize) -> Option<usize> {
+        if self.has_parent_row && row_ix == 0 {
+            None
+        } else {
+            Some(row_ix - self.parent_offset())
+        }
+    }
+
+    /// The row-preparation half of [`Self::context_menu`] (`TableDelegate`
+    /// impl, below) -- moves the cursor to `row_ix` (display-row terms)
+    /// and, in `MouseMode::Norton`, also toggles that row's selection
+    /// (TC's own right-click convention -- see [`MouseMode`]'s doc
+    /// comment). Returns `false` (a no-op) for the synthetic ".." row,
+    /// same reasoning as every other mouse handler in this module.
+    ///
+    /// Split out from `context_menu` itself so it's directly unit
+    /// -testable: `context_menu` needs a real `PopupMenu` (buildable only
+    /// through `PopupMenu::build`, which itself needs a `Window`) and a
+    /// real `Context<TableState<Self>>` (only ever supplied by `Table`'s
+    /// own rendering, mid-paint) -- neither is obtainable from a plain
+    /// `#[test]`. This method needs neither.
+    fn prepare_context_menu_row(&mut self, row_ix: usize) -> bool {
+        if self.model_row(row_ix).is_none() {
+            return false;
+        }
+        self.move_cursor_to(row_ix);
+        if self.mouse_mode == MouseMode::Norton {
+            self.toggle_cursor_selection();
+        }
+        true
     }
 
     /// `0` or `1` -- how many rows the synthetic ".." row, if showing,
@@ -870,14 +978,16 @@ impl TableDelegate for FileTableDelegate {
             .copied()
             .is_some_and(|ix| self.model.is_selected(EntryId::new(ix)));
 
-        if is_cursor {
+        let row = if is_cursor {
             row.bg(tokens.color.cursor_bg)
                 .text_color(tokens.color.cursor_fg)
         } else if selected {
             row.bg(tokens.color.selection_bg)
         } else {
             row
-        }
+        };
+
+        self.with_middle_click_new_tab(row, model_row)
     }
 
     /// Cell content: a `SharedString` clone out of `row_text` -- an `Arc`
@@ -941,6 +1051,86 @@ impl TableDelegate for FileTableDelegate {
 
     fn loading(&self, _cx: &App) -> bool {
         self.loading
+    }
+
+    /// T-4.3.8's right-click menu (FR-SEL-06). `Table`'s own rendering
+    /// already calls this automatically for whichever row was last
+    /// right-clicked (`state.rs`'s `right_clicked_row`, set by
+    /// `on_row_right_click`) -- confirmed by reading
+    /// `gpui-component-0.5.1/src/table/state.rs:1307`'s `context_menu`
+    /// call site, so overriding just this one method is the whole
+    /// integration, no manual `render_tr` wiring needed.
+    ///
+    /// `row_ix` is display-row terms, same as every other `TableEvent`;
+    /// the synthetic ".." row gets no menu at all (there's no entry to
+    /// act on, and TC itself doesn't show one there either).
+    ///
+    /// Every item is built from the same selection primitives the
+    /// keyboard already uses (Ins/Num*/Ctrl+Num+/Ctrl+Num-/Shift+Num+),
+    /// via a cloned `Entity<TableState<Self>>` captured into each
+    /// `on_click` closure -- `PopupMenuItem::on_click`'s handler only
+    /// gets `&mut App`, not this method's own `Context`, so reaching back
+    /// into the delegate has to go through `Entity::update` the same way
+    /// any other later-invoked callback in this module does (see
+    /// `locked_navigation`'s doc comment) -- ordinary `update`, not
+    /// `update_in`, since none of these actions need a `Window`.
+    ///
+    /// Norton mode (FR-SEL-06): right-click both *toggles* the clicked
+    /// row's selection and shows this same menu -- TC's own convention,
+    /// applied before the menu is built so "Toggle Selection"'s checkmark
+    /// already reflects the post-toggle state. `Windows`/`None` leave
+    /// selection untouched on right-click, matching their own plain-click
+    /// semantics (see [`MouseMode`]'s doc comment) -- only the cursor
+    /// moves.
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        if !self.prepare_context_menu_row(row_ix) {
+            return menu;
+        }
+        let is_selected = self
+            .cursor_row
+            .and_then(|row| self.model.order().get(row))
+            .copied()
+            .is_some_and(|ix| self.model.is_selected(EntryId::new(ix)));
+
+        let entity = cx.entity();
+        let with_delegate = move |cx: &mut App, f: fn(&mut FileTableDelegate)| {
+            let entity = entity.clone();
+            entity.update(cx, |state, cx| {
+                f(state.delegate_mut());
+                cx.notify();
+            });
+        };
+
+        menu.item(
+            PopupMenuItem::new("Toggle Selection")
+                .checked(is_selected)
+                .on_click({
+                    let with_delegate = with_delegate.clone();
+                    move |_, _, cx| with_delegate(cx, FileTableDelegate::toggle_cursor_selection)
+                }),
+        )
+        .separator()
+        .item(PopupMenuItem::new("Select All").on_click({
+            let with_delegate = with_delegate.clone();
+            move |_, _, cx| with_delegate(cx, FileTableDelegate::select_all)
+        }))
+        .item(PopupMenuItem::new("Deselect All").on_click({
+            let with_delegate = with_delegate.clone();
+            move |_, _, cx| with_delegate(cx, FileTableDelegate::deselect_all)
+        }))
+        .item(PopupMenuItem::new("Invert Selection").on_click({
+            let with_delegate = with_delegate.clone();
+            move |_, _, cx| with_delegate(cx, FileTableDelegate::invert_selection)
+        }))
+        .item(PopupMenuItem::new("Select Same Extension").on_click({
+            move |_, _, cx| with_delegate(cx, FileTableDelegate::select_same_extension)
+        }))
     }
 }
 
@@ -1199,6 +1389,19 @@ pub struct FileTable {
 /// borrowed) -- a `Box` can't be cheaply cloned, an `Rc` can.
 pub(crate) type LockedNavigationHandler = Rc<dyn Fn(PathBuf, &mut Window, &mut App)>;
 
+/// T-4.3.8's middle-click "open in a new tab" gesture (this codebase's
+/// own reasonable default -- `design.md` gives no guidance on this
+/// specific mouse gesture, flagged as such in the PR). Takes the clicked
+/// entry's *name*, not a full `PathBuf` like [`LockedNavigationHandler`]
+/// -- `FileTableDelegate` (where the click is actually detected, inside
+/// `render_tr`) deliberately doesn't know `current_dir` (see
+/// `has_parent_row`'s doc comment), so `Panel::add_tab_entry`'s handler
+/// resolves the name against the table's *current* `current_dir` itself,
+/// read fresh at click time through a captured `WeakEntity<FileTable>`
+/// -- not whatever directory the tab happened to be showing when the
+/// handler was first installed.
+pub(crate) type NewTabHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
 /// Fired by [`FileTable::navigate_to`] once `current_dir` actually changes
 /// -- deliberately *not* fired by ordinary cursor movement, selection, or
 /// sort/loading-state changes, all of which also call `cx.notify()` for
@@ -1245,6 +1448,53 @@ impl Default for TabRestore {
     }
 }
 
+/// FR-SEL-06: which mouse gesture selects a row -- `windows` (plain
+/// left-click selects, matching Explorer) or `norton` (plain left-click
+/// only moves the cursor; right-click both toggles selection and shows
+/// the context menu, TC's own "Norton Commander" convention), or `none`
+/// (mouse never changes selection at all, only the keyboard does).
+/// Shift+click/Ctrl+click range/toggle-select and double-click-to-enter
+/// behave identically in every mode -- only the *plain*, unmodified
+/// click's effect on selection depends on this (T-4.3.8).
+///
+/// Read once from `settings.toml`'s `[selection] mouse_mode`
+/// (`duet_config::settings::Selection::mouse_mode`) by
+/// `workspace::load_mouse_mode` and threaded down through
+/// `Panel`/`FileTable::new` to every `FileTableDelegate` in the
+/// workspace -- there is no live-reload path yet (same as
+/// `splitter_ratio`'s initial value), so this is fixed for the process's
+/// lifetime once read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MouseMode {
+    #[default]
+    Windows,
+    Norton,
+    None,
+}
+
+impl MouseMode {
+    /// Parses `settings.toml`'s raw `mouse_mode` string. An unrecognized
+    /// value (a hand-edited file, or one written by a newer build) falls
+    /// back to `Windows` -- `Settings::default()`'s own documented
+    /// default -- logged once rather than failing startup, same
+    /// tolerance-over-strictness policy `duet-config`'s `#[serde(default)]`
+    /// fields already apply throughout.
+    pub(crate) fn from_settings_str(value: &str) -> Self {
+        match value {
+            "windows" => Self::Windows,
+            "norton" => Self::Norton,
+            "none" => Self::None,
+            other => {
+                tracing::warn!(
+                    target: "duet_ui::file_table",
+                    "unknown selection.mouse_mode {other:?}, defaulting to windows"
+                );
+                Self::Windows
+            }
+        }
+    }
+}
+
 impl FileTable {
     /// Starts listing `dir` in the background and returns immediately with
     /// an empty, `loading` table -- `spawn_directory_load` populates it
@@ -1266,6 +1516,10 @@ impl FileTable {
     /// first directory load only (subsequent navigation reads sort back
     /// out of the live model instead, per `navigate_to`'s doc comment).
     ///
+    /// `mouse_mode`: FR-SEL-06, see [`MouseMode`]'s doc comment -- read
+    /// once from `settings.toml` by `workspace::load_mouse_mode` and
+    /// passed down unchanged from every tab-creating call in `Panel`.
+    ///
     /// `pub(crate)`, not `pub`: only `Panel::add_tab_entry` ever
     /// constructs a `FileTable` now (T-4.3.2 made `Panel` the sole owner
     /// of tab lifecycle) -- taking `TabRestore` (itself `pub(crate)`) as
@@ -1276,6 +1530,7 @@ impl FileTable {
         tokio_handle: tokio::runtime::Handle,
         width_seed: Option<([f32; 3], f32)>,
         restore: TabRestore,
+        mouse_mode: MouseMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1283,6 +1538,7 @@ impl FileTable {
         if let Some((widths, available)) = width_seed {
             delegate.seed_column_widths(widths, available);
         }
+        delegate.set_mouse_mode(mouse_mode);
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         spawn_directory_load(
             dir.clone(),
@@ -1302,22 +1558,40 @@ impl FileTable {
         // `set_selected_row` with no gate, confirmed by reading
         // `gpui-component-0.5.1/src/table/state.rs`), completely separate
         // from `FileTableDelegate::cursor_row`/`model.selection()`. Left
-        // alone, a click paints a persistent highlight (`table_active`)
-        // that this delegate's own render_tr never reads and nothing
-        // clears -- a confusing "second cursor" that doesn't respond to
-        // any of T-4.2.2/T-4.2.3's real cursor/selection commands, since
-        // mouse support isn't wired up yet (T-4.3.8). Subscribing to
-        // `TableEvent` and immediately clearing it back neutralises that
-        // stray highlight until real click-driven cursor movement is
-        // built and can intentionally use this same mechanism.
-        cx.subscribe(&state, |_this, state, event, cx| {
-            if matches!(
-                event,
-                TableEvent::SelectRow(_) | TableEvent::SelectColumn(_)
-            ) {
-                state.update(cx, |state, cx| state.clear_selection(cx));
-            }
-        })
+        // alone, a click paints its own persistent highlight
+        // (`table_active`) on top of this delegate's own cursor/selection
+        // rendering -- a confusing "second cursor" -- so every event still
+        // clears it straight back out, same as before T-4.3.8: real
+        // click-driven cursor movement is [`FileTable::handle_left_click`]
+        // now, reading `event`/`window.modifiers()` itself rather than
+        // anything `TableState` tracked.
+        //
+        // `subscribe_in`, not `subscribe`: `DoubleClickedRow` needs
+        // `window` (`enter_cursor_directory` navigates), and unlike the
+        // cross-entity callbacks this module documents elsewhere
+        // (`locked_navigation`, stored and invoked far later with no
+        // `window` of its own), this one runs synchronously inside
+        // `TableState`'s own event emission -- `window` is simply
+        // threaded straight through, no `Window::spawn` dance needed.
+        cx.subscribe_in(
+            &state,
+            window,
+            |this, state, event, window, cx| match event {
+                TableEvent::SelectRow(row_ix) => {
+                    let row_ix = *row_ix;
+                    state.update(cx, |state, cx| state.clear_selection(cx));
+                    this.handle_left_click(row_ix, window.modifiers(), cx);
+                }
+                TableEvent::DoubleClickedRow(row_ix) => {
+                    this.move_cursor_to(*row_ix, cx);
+                    this.enter_cursor_directory(window, cx);
+                }
+                TableEvent::SelectColumn(_) => {
+                    state.update(cx, |state, cx| state.clear_selection(cx));
+                }
+                _ => {}
+            },
+        )
         .detach();
 
         Self {
@@ -1338,6 +1612,21 @@ impl FileTable {
     /// under `lock_dir_change`).
     pub fn set_locked_navigation(&mut self, handler: Option<LockedNavigationHandler>) {
         self.locked_navigation = handler;
+    }
+
+    /// See [`NewTabHandler`]'s doc comment. `Panel::add_tab_entry` calls
+    /// this once, right after constructing the table -- the handler it
+    /// builds captures this same table's own `WeakEntity` (to resolve a
+    /// click's target name against `current_dir` at click time), so it
+    /// can only be built once the table already exists.
+    pub(crate) fn set_new_tab_handler(
+        &mut self,
+        handler: Option<NewTabHandler>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, _cx| {
+            state.delegate_mut().set_new_tab_handler(handler);
+        });
     }
 
     /// Exposes the underlying table state -- e.g. for
@@ -1502,6 +1791,46 @@ impl FileTable {
             state.scroll_to_row(row, cx);
             cx.notify();
         });
+    }
+
+    /// T-4.3.8 (FR-SEL-06): a real left click's full effect, built entirely
+    /// out of the same primitives the keyboard already uses -- there's
+    /// nothing mouse-specific about *how* selection changes, only about
+    /// *when* each existing method fires. `row_ix` is a display-row index
+    /// (see [`FileTableDelegate::model_row`]'s doc comment); `modifiers`
+    /// is read live from `window.modifiers()` at the call site, since
+    /// `TableEvent::SelectRow` itself carries none.
+    ///
+    /// Shift+click (range-select) and Ctrl+click (toggle) behave the same
+    /// under every [`MouseMode`] -- only a *plain*, unmodified click's
+    /// effect on selection depends on it: `Windows` selects just this row
+    /// (Explorer's convention), `Norton`/`None` move the cursor only,
+    /// leaving selection for the right-click menu (Norton) or the
+    /// keyboard alone (`None`) to handle -- see `MouseMode`'s own doc
+    /// comment. Clicking the synthetic ".." row only ever moves the
+    /// cursor onto it, regardless of modifiers: there's no entry there to
+    /// select, and (per `cursor_row`/`cursor_on_parent`'s own doc
+    /// comments) blindly running the ordinary selection methods while
+    /// sitting on it would silently act on whatever real entry the cursor
+    /// last meaningfully pointed at instead.
+    fn handle_left_click(&mut self, row_ix: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        let Some(model_row) = self.state.read(cx).delegate().model_row(row_ix) else {
+            self.move_cursor_to(row_ix, cx);
+            return;
+        };
+        if modifiers.shift {
+            self.extend_selection_to_edge(model_row, cx);
+            return;
+        }
+        self.move_cursor_to(row_ix, cx);
+        if modifiers.control {
+            self.toggle_selection(cx);
+            return;
+        }
+        if self.state.read(cx).delegate().mouse_mode() == MouseMode::Windows {
+            self.with_selection(cx, |delegate| delegate.deselect_all());
+            self.toggle_selection(cx);
+        }
     }
 
     /// The core "change directory" primitive T-4.3.1's other navigation
@@ -1784,6 +2113,20 @@ impl Render for FileTable {
             // never the other way around; pinning `min_w` to zero here
             // rules that out regardless of how wide any column gets.
             .min_w(px(0.))
+            // T-4.3.8: mouse wheel scrolling needs no code here at all --
+            // `Table`'s rows are a `gpui-component` `TableState` built on
+            // top of GPUI's own `uniform_list`, which wires up wheel
+            // scroll natively through its `UniformListScrollHandle`
+            // (confirmed by reading `gpui-component-0.5.1/src/table/
+            // state.rs`'s `vertical_scroll_handle` field and
+            // `.track_scroll(...)` call). Verified end-to-end with a live
+            // launch over a 60-entry directory (more than fits one
+            // screen) rather than a synthetic `ScrollWheelEvent` test --
+            // simulating one accurately would mean hardcoding
+            // `gpui-component`'s internal row-height/hitbox geometry into
+            // this codebase's own tests, the exact coupling this task's
+            // click-handling tests (`panel.rs`) were deliberately built
+            // to avoid.
             .child(Table::new(&self.state).stripe(true).bordered(true))
             .child(
                 // Measures the panel's real width every frame (the same
@@ -2338,6 +2681,87 @@ mod tests {
         delegate.move_cursor_to(2);
         assert!(!delegate.select_row_by_name("does-not-exist"));
         assert_eq!(delegate.cursor_row(), Some(2), "cursor stays put on a miss");
+    }
+
+    #[test]
+    fn mouse_mode_parses_the_three_documented_settings_toml_values() {
+        assert_eq!(MouseMode::from_settings_str("windows"), MouseMode::Windows);
+        assert_eq!(MouseMode::from_settings_str("norton"), MouseMode::Norton);
+        assert_eq!(MouseMode::from_settings_str("none"), MouseMode::None);
+    }
+
+    #[test]
+    fn mouse_mode_falls_back_to_windows_for_an_unrecognized_value() {
+        assert_eq!(MouseMode::from_settings_str("bogus"), MouseMode::Windows);
+        assert_eq!(MouseMode::default(), MouseMode::Windows);
+    }
+
+    #[test]
+    fn file_table_delegate_defaults_to_windows_mouse_mode_until_set() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        assert_eq!(delegate.mouse_mode(), MouseMode::Windows);
+        delegate.set_mouse_mode(MouseMode::Norton);
+        assert_eq!(delegate.mouse_mode(), MouseMode::Norton);
+    }
+
+    #[test]
+    fn context_menu_row_prep_moves_the_cursor_to_the_right_clicked_row() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+
+        assert!(delegate.prepare_context_menu_row(3)); // display row 3 = model row 2 = f2
+        assert_eq!(delegate.cursor_row(), Some(2));
+        assert!(!delegate.cursor_on_parent());
+    }
+
+    #[test]
+    fn context_menu_row_prep_on_the_parent_row_is_a_no_op() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.move_cursor_to(2); // land on a real row first (model row 1)
+
+        assert!(!delegate.prepare_context_menu_row(0)); // ".."
+        assert_eq!(
+            delegate.cursor_row(),
+            Some(1),
+            "right-clicking \"..\" must not move the cursor"
+        );
+        assert!(!delegate.cursor_on_parent());
+    }
+
+    #[test]
+    fn context_menu_row_prep_toggles_selection_in_norton_mode_only() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.set_mouse_mode(MouseMode::Norton);
+
+        assert!(delegate.prepare_context_menu_row(2)); // model row 1 = f1
+        let id = EntryId::new(delegate.model().order()[1]);
+        assert!(
+            delegate.model().is_selected(id),
+            "Norton mode: right-click both moves the cursor and toggles selection"
+        );
+
+        assert!(delegate.prepare_context_menu_row(2)); // right-click it again
+        assert!(
+            !delegate.model().is_selected(id),
+            "a second right-click on the same row toggles it back off"
+        );
+    }
+
+    #[test]
+    fn context_menu_row_prep_does_not_touch_selection_outside_norton_mode() {
+        for mode in [MouseMode::Windows, MouseMode::None] {
+            let mut delegate = FileTableDelegate::new(five_file_model());
+            delegate.set_has_parent_row(true);
+            delegate.set_mouse_mode(mode);
+
+            assert!(delegate.prepare_context_menu_row(2));
+            assert!(
+                delegate.model().selection().is_empty(),
+                "{mode:?}: right-click must only move the cursor, never select"
+            );
+        }
     }
 
     #[test]

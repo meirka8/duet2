@@ -28,7 +28,9 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, actions, div, px,
 };
 
-use crate::file_table::{FileTable, FileTableEvent, LockedNavigationHandler, TabRestore};
+use crate::file_table::{
+    FileTable, FileTableEvent, LockedNavigationHandler, MouseMode, TabRestore,
+};
 
 /// `duet_config::SessionSortColumn` -> `duet_index::SortColumn`, for
 /// restoring a tab's sort from `session.json`.
@@ -130,6 +132,10 @@ pub struct Panel {
     /// (`tab.reopen_closed`, Ctrl+Shift+T).
     closed_stack: Vec<ClosedTab>,
     tokio_handle: tokio::runtime::Handle,
+    /// FR-SEL-06, see `file_table::MouseMode`'s doc comment -- read once
+    /// by `workspace::load_mouse_mode` and passed down unchanged to every
+    /// tab this panel creates.
+    mouse_mode: MouseMode,
 }
 
 impl Panel {
@@ -141,10 +147,16 @@ impl Panel {
     /// this asserts rather than silently substituting a default, per this
     /// project's "trust internal callers, validate only at real
     /// boundaries" convention.
-    pub fn new(
+    ///
+    /// `pub(crate)`, not `pub`: only `workspace::Workspace::new` ever
+    /// constructs a `Panel` (no external caller exists) -- `pub` would
+    /// leak `MouseMode` (`pub(crate)`, same reasoning as `TabRestore`)
+    /// through a public signature.
+    pub(crate) fn new(
         tabs: Vec<SessionTab>,
         active: usize,
         tokio_handle: tokio::runtime::Handle,
+        mouse_mode: MouseMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -154,6 +166,7 @@ impl Panel {
             active: 0,
             closed_stack: Vec::new(),
             tokio_handle,
+            mouse_mode,
         };
         for tab in tabs {
             let restore = TabRestore {
@@ -215,6 +228,7 @@ impl Panel {
                 self.tokio_handle.clone(),
                 width_seed,
                 restore,
+                self.mouse_mode,
                 window,
                 cx,
             )
@@ -226,6 +240,45 @@ impl Panel {
             },
         )
         .detach();
+
+        // T-4.3.8's middle-click "open in a new tab" -- see
+        // `NewTabHandler`'s doc comment for why this captures the
+        // table's own `WeakEntity` (to resolve the click's target name
+        // against `current_dir` fresh, at click time) alongside
+        // `weak_panel`. Reuses `open_redirected_tab` outright -- the
+        // "make a new, unlocked tab active at this directory, inheriting
+        // the current sort" behaviour it already gives the locked-tab
+        // redirect is exactly what a middle-click should do here too.
+        // Same `window.spawn`/`update_in` dance as `apply_lock_state`'s
+        // handler, for the same reason (neither `Window` nor
+        // `Context<FileTable>` implements `VisualContext`).
+        let weak_table = table.downgrade();
+        let weak_panel = cx.entity().downgrade();
+        table.update(cx, |table, cx| {
+            table.set_new_tab_handler(
+                Some(Rc::new(
+                    move |name: String, window: &mut Window, app: &mut App| {
+                        let weak_table = weak_table.clone();
+                        let weak_panel = weak_panel.clone();
+                        window
+                            .spawn(app, async move |cx| {
+                                let Ok(dir) = weak_table
+                                    .update(cx, |table, _cx| table.current_dir().join(&name))
+                                else {
+                                    return;
+                                };
+                                let _ =
+                                    weak_panel.update_in(cx, |panel: &mut Panel, window, cx| {
+                                        panel.open_redirected_tab(dir, window, cx);
+                                    });
+                            })
+                            .detach();
+                    },
+                )),
+                cx,
+            );
+        });
+
         self.tabs.push(TabEntry {
             table,
             locked,
@@ -627,8 +680,10 @@ impl Render for Panel {
 
 #[cfg(test)]
 mod tests {
+    use duet_types::EntryId;
     use duet_widgets::layout::Root;
-    use gpui::{TestAppContext, VisualTestContext};
+    use duet_widgets::table::{TableDelegate, TableEvent};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use tempfile::TempDir;
 
     use super::*;
@@ -662,6 +717,21 @@ mod tests {
         active: usize,
         f: impl FnOnce(Entity<Panel>, &mut VisualTestContext),
     ) {
+        with_panel_ext(cx, tabs, active, MouseMode::Windows, f);
+    }
+
+    /// [`with_panel`], with an explicit [`MouseMode`] -- T-4.3.8's mouse
+    /// tests need to exercise all three; every other (pre-existing) test
+    /// is indifferent to it, so `with_panel` itself just fixes it at the
+    /// default (`Windows`) rather than making every call site plumb one
+    /// through.
+    fn with_panel_ext(
+        cx: &mut TestAppContext,
+        tabs: Vec<SessionTab>,
+        active: usize,
+        mouse_mode: MouseMode,
+        f: impl FnOnce(Entity<Panel>, &mut VisualTestContext),
+    ) {
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -685,7 +755,8 @@ mod tests {
 
         let mut panel_cell: Option<Entity<Panel>> = None;
         let (_root, vcx) = cx.add_window_view(|window, cx| {
-            let panel = cx.new(|cx| Panel::new(tabs, active, tokio_handle.clone(), window, cx));
+            let panel =
+                cx.new(|cx| Panel::new(tabs, active, tokio_handle.clone(), mouse_mode, window, cx));
             panel_cell = Some(panel.clone());
             Root::new(panel, window, cx)
         });
@@ -1269,6 +1340,401 @@ mod tests {
                         "sort must carry forward across navigation, not reset"
                     );
                 });
+            },
+        );
+    }
+
+    // -- T-4.3.8 mouse support -----------------------------------------
+    //
+    // `FileTable::handle_left_click`/the `TableEvent` subscription it's
+    // wired through are private to `file_table.rs` (same-crate,
+    // different-module privacy) -- unreachable directly from here. These
+    // tests instead emit the exact `TableEvent` a real click would
+    // (`Table`'s own `on_row_left_click`/state.rs emits precisely
+    // `SelectRow`/`DoubleClickedRow` with a display-row index, confirmed
+    // by reading `gpui-component-0.5.1/src/table/state.rs`) straight onto
+    // `FileTable::state()` (`pub`), which drives the real production
+    // subscription exactly as a genuine click would -- only the upstream
+    // library's own pixel-to-row hit-testing goes unexercised, which is
+    // its concern, not this codebase's. `vcx.simulate_modifiers_change`
+    // sets the *real* `Window::modifiers()` T-4.3.8's click handler reads
+    // live (a `TableEvent` itself carries none) through the same
+    // `ModifiersChangedEvent` a real keyboard would send.
+
+    fn emit_table_event(table: &Entity<FileTable>, event: TableEvent, vcx: &mut VisualTestContext) {
+        let state = table.read_with(vcx, |table, _| table.state().clone());
+        state.update(vcx, |_, cx| cx.emit(event));
+        vcx.run_until_parked();
+    }
+
+    /// Every currently-selected entry's name, in `order()` (display)
+    /// order -- `DirectoryModel::selection()`/`is_selected` are both
+    /// `pub`, same as every other accessor these tests reach through.
+    fn selected_names(table: &FileTable, cx: &App) -> Vec<String> {
+        let delegate = table.state().read(cx).delegate();
+        let model = delegate.model();
+        model
+            .order()
+            .iter()
+            .copied()
+            .map(EntryId::new)
+            .filter(|&id| model.is_selected(id))
+            .map(|id| model.entries().name(id).to_string())
+            .collect()
+    }
+
+    /// Whether `table`'s current listing has finished loading --
+    /// `TableDelegate::loading` (a real trait method, not something
+    /// mouse-support-specific) is a more general "is there anything real
+    /// to click on yet" signal than `cursor_entry_name(cx).is_some()`,
+    /// which stays `None` forever for a directory that loads with no
+    /// entries at all (T-4.3.8's empty `child_dir` fixture).
+    fn listing_loaded(table: &FileTable, cx: &App) -> bool {
+        !table.state().read(cx).delegate().loading(cx)
+    }
+
+    /// Three real files, name-ascending order (`a_file.txt`,
+    /// `b_file.txt`, `c_file.txt`) -- every mouse test's shared fixture.
+    /// With `has_parent_row` (true for any non-root directory), display
+    /// rows are `0=".."`, `1=a_file.txt`, `2=b_file.txt`, `3=c_file.txt`.
+    fn three_file_dir() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a_file.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b_file.txt"), "").unwrap();
+        std::fs::write(dir.path().join("c_file.txt"), "").unwrap();
+        dir
+    }
+
+    #[gpui::test]
+    fn plain_click_in_windows_mode_selects_only_the_clicked_row(cx: &mut TestAppContext) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                vcx.simulate_modifiers_change(Modifiers::default());
+                emit_table_event(&table, TableEvent::SelectRow(2), vcx); // b_file.txt
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("b_file.txt".to_string()));
+                    assert_eq!(selected_names(table, cx), vec!["b_file.txt".to_string()]);
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn plain_click_in_norton_mode_moves_the_cursor_but_never_selects(cx: &mut TestAppContext) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Norton,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                vcx.simulate_modifiers_change(Modifiers::default());
+                emit_table_event(&table, TableEvent::SelectRow(3), vcx); // c_file.txt
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("c_file.txt".to_string()));
+                    assert!(
+                        selected_names(table, cx).is_empty(),
+                        "Norton mode: a plain click never selects"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn plain_click_in_none_mode_moves_the_cursor_but_never_selects(cx: &mut TestAppContext) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::None,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                vcx.simulate_modifiers_change(Modifiers::default());
+                emit_table_event(&table, TableEvent::SelectRow(1), vcx); // a_file.txt
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("a_file.txt".to_string()));
+                    assert!(selected_names(table, cx).is_empty());
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn shift_click_extends_selection_from_the_cursor_to_the_clicked_row(cx: &mut TestAppContext) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.cursor_entry_name(cx),
+                        Some("a_file.txt".to_string()),
+                        "sanity: a fresh listing starts the cursor on the first entry"
+                    );
+                });
+
+                vcx.simulate_modifiers_change(Modifiers {
+                    shift: true,
+                    ..Default::default()
+                });
+                emit_table_event(&table, TableEvent::SelectRow(3), vcx); // c_file.txt
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("c_file.txt".to_string()));
+                    let mut names = selected_names(table, cx);
+                    names.sort();
+                    assert_eq!(
+                        names,
+                        vec![
+                            "a_file.txt".to_string(),
+                            "b_file.txt".to_string(),
+                            "c_file.txt".to_string(),
+                        ],
+                        "the whole range from the cursor's starting row to the clicked row"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_click_toggles_only_the_clicked_row_leaving_other_selections_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+
+                vcx.simulate_modifiers_change(Modifiers::default());
+                emit_table_event(&table, TableEvent::SelectRow(2), vcx); // plain click b_file.txt
+
+                vcx.simulate_modifiers_change(Modifiers {
+                    control: true,
+                    ..Default::default()
+                });
+                emit_table_event(&table, TableEvent::SelectRow(3), vcx); // ctrl+click c_file.txt
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("c_file.txt".to_string()));
+                    let mut names = selected_names(table, cx);
+                    names.sort();
+                    assert_eq!(
+                        names,
+                        vec!["b_file.txt".to_string(), "c_file.txt".to_string()],
+                        "ctrl+click adds to the existing selection, it never replaces it"
+                    );
+                });
+
+                emit_table_event(&table, TableEvent::SelectRow(3), vcx); // ctrl+click c_file.txt again
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        selected_names(table, cx),
+                        vec!["b_file.txt".to_string()],
+                        "a second ctrl+click on the same row toggles it back off"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_the_parent_row_moves_the_cursor_and_never_touches_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = three_file_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                wait_until(vcx, |vcx| {
+                    panel.read_with(vcx, |panel, cx| {
+                        panel.tabs[0].table.read(cx).cursor_entry_name(cx).is_some()
+                    })
+                });
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+
+                vcx.simulate_modifiers_change(Modifiers::default());
+                emit_table_event(&table, TableEvent::SelectRow(1), vcx); // select a_file.txt
+
+                vcx.simulate_modifiers_change(Modifiers {
+                    control: true,
+                    ..Default::default()
+                });
+                emit_table_event(&table, TableEvent::SelectRow(0), vcx); // ctrl+click ".."
+
+                table.read_with(vcx, |table, cx| {
+                    let delegate = table.state().read(cx).delegate();
+                    assert!(
+                        delegate.cursor_on_parent(),
+                        "clicking \"..\" must move the display cursor onto it"
+                    );
+                    assert_eq!(
+                        selected_names(table, cx),
+                        vec!["a_file.txt".to_string()],
+                        "the \"..\" row has no entry to select -- selection must be untouched"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_on_a_directory_enters_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child_dir");
+        std::fs::create_dir(&child).unwrap();
+
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+                emit_table_event(&table, TableEvent::DoubleClickedRow(1), vcx); // the only real entry
+
+                wait_until(vcx, |vcx| {
+                    table.read_with(vcx, |table, _| table.current_dir() == child)
+                });
+                table.read_with(vcx, |table, _| {
+                    assert_eq!(
+                        table.current_dir(),
+                        child,
+                        "double-click must descend into it"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_on_the_parent_row_navigates_up(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child_dir");
+        std::fs::create_dir(&child).unwrap();
+
+        with_panel_ext(
+            cx,
+            vec![session_tab(child.clone(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                // Must wait for the *load* to finish, not just for
+                // `current_dir` to already read as `child` (that field is
+                // set synchronously by `navigate_to`/`FileTable::new`,
+                // before the background listing completes) --
+                // `has_parent_row` (what makes row 0 the ".." row at all)
+                // is only set once the async load actually applies.
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+                emit_table_event(&table, TableEvent::DoubleClickedRow(0), vcx); // ".."
+
+                let parent = dir.path().to_path_buf();
+                wait_until(vcx, |vcx| {
+                    table.read_with(vcx, |table, _| table.current_dir() == parent)
+                });
+            },
+        );
+    }
+
+    /// T-4.3.8's middle-click "open in a new tab" -- exercises the real
+    /// closure `add_tab_entry` installs (fetched via
+    /// `FileTableDelegate::new_tab_handler`, a `#[cfg(test)]`-only
+    /// accessor -- see its doc comment for why calling this directly,
+    /// rather than simulating a real mouse click at some row's computed
+    /// pixel position, is the right level to test this codebase's own
+    /// logic at).
+    #[gpui::test]
+    fn middle_click_handler_opens_the_directorys_own_tab_and_makes_it_active(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("child_dir")).unwrap();
+
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                let handler = table.read_with(vcx, |table, cx| {
+                    table
+                        .state()
+                        .read(cx)
+                        .delegate()
+                        .new_tab_handler()
+                        .expect("Panel::add_tab_entry always installs one")
+                });
+                vcx.update(|window, cx| handler("child_dir".to_string(), window, cx));
+                vcx.run_until_parked();
+
+                panel.read_with(vcx, |panel, _| {
+                    assert_eq!(
+                        panel.tabs.len(),
+                        2,
+                        "middle-click opens a new tab, it never replaces the current one"
+                    );
+                    assert_eq!(panel.active, 1, "the new tab becomes active");
+                });
+                let new_tab = panel.read_with(vcx, |panel, _| panel.tabs[1].table.clone());
+                assert_eq!(
+                    new_tab.read_with(vcx, |table, _| table.current_dir().to_path_buf()),
+                    dir.path().join("child_dir"),
+                    "must open the clicked entry's own directory, resolved against \
+                     current_dir at click time"
+                );
             },
         );
     }

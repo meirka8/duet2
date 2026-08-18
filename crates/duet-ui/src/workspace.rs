@@ -33,7 +33,7 @@ use gpui::{
 };
 
 use crate::command_palette::CommandPaletteDelegate;
-use crate::file_table::{FileTable, write_byte_count};
+use crate::file_table::{FileTable, MouseMode, write_byte_count};
 use crate::function_bar::{self, FKeySlot};
 use crate::panel::{Panel, bind_panel_keys};
 use crate::theme_controller::ThemeController;
@@ -338,6 +338,10 @@ impl Workspace {
             .map(load_splitter_ratio)
             .unwrap_or(0.5)
             .clamp(SPLITTER_MIN_RATIO, SPLITTER_MAX_RATIO);
+        let mouse_mode = settings_path
+            .as_deref()
+            .map(load_mouse_mode)
+            .unwrap_or_default();
 
         let command_line = cx.new(|cx| {
             InputState::new(window, cx)
@@ -377,10 +381,26 @@ impl Workspace {
         let (right_tabs, right_active) =
             resolve_panel_session(session.as_ref().map(|s| &s.right), &initial_dir);
 
-        let left_panel =
-            cx.new(|cx| Panel::new(left_tabs, left_active, tokio_handle.clone(), window, cx));
-        let right_panel =
-            cx.new(|cx| Panel::new(right_tabs, right_active, tokio_handle.clone(), window, cx));
+        let left_panel = cx.new(|cx| {
+            Panel::new(
+                left_tabs,
+                left_active,
+                tokio_handle.clone(),
+                mouse_mode,
+                window,
+                cx,
+            )
+        });
+        let right_panel = cx.new(|cx| {
+            Panel::new(
+                right_tabs,
+                right_active,
+                tokio_handle.clone(),
+                mouse_mode,
+                window,
+                cx,
+            )
+        });
         // Every structural tab change (`Panel::new_tab`/`close_active`/...)
         // and every real per-tab directory change (via each `FileTable`'s
         // `DirectoryChanged` event, which `Panel` already re-notifies on --
@@ -1211,6 +1231,24 @@ fn load_splitter_ratio(path: &std::path::Path) -> f32 {
                 "using default splitter ratio (settings.toml not loaded yet: {err})"
             );
             duet_config::Settings::default().panels.splitter_ratio
+        })
+}
+
+/// Reads `selection.mouse_mode` (FR-SEL-06) from `settings.toml` at
+/// `path`, same "missing/malformed file falls back to
+/// `Settings::default()`" tolerance as [`load_splitter_ratio`] --
+/// there's nothing to persist here (unlike `splitter_ratio`, this never
+/// changes at runtime yet), so this is the only place it's ever read.
+fn load_mouse_mode(path: &std::path::Path) -> MouseMode {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| MouseMode::from_settings_str(&settings.selection.mouse_mode))
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default mouse selection mode (settings.toml not loaded yet: {err})"
+            );
+            MouseMode::from_settings_str(&duet_config::Settings::default().selection.mouse_mode)
         })
 }
 
