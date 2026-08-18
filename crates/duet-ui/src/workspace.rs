@@ -912,6 +912,18 @@ impl Render for Workspace {
 /// `confirm`/`cancel` callbacks). `.absolute()` positions this against the
 /// nearest positioned ancestor, which is why `Workspace::render`'s root
 /// carries `.relative()`.
+///
+/// `max_h` goes on `List::new(state)` itself, not the wrapping card --
+/// matching `gpui-component`'s own established usage
+/// (`select.rs`'s dropdown: `List::new(&self.list)...max_h(rems(20.))`
+/// on the `List` directly, wrapped in a plain, sizing-unconstrained
+/// `v_flex()`). `List::render` explicitly pulls `max_size.height` out of
+/// its *own* style into `options.max_height`, which is what actually
+/// bounds the internal virtualized results view -- setting it on an
+/// ancestor div instead (the original bug here: UAT reported the palette
+/// opening but search always returning nothing, and typing feeling
+/// stuttery) leaves that bound unset, so the virtualized list has no
+/// definite height to lay out into at all.
 fn command_palette_overlay(
     state: &Entity<ListState<CommandPaletteDelegate>>,
     cx: &Context<Workspace>,
@@ -930,13 +942,11 @@ fn command_palette_overlay(
             gpui::div()
                 .id("command-palette-card")
                 .w(px(560.))
-                .max_h(px(420.))
                 .bg(tokens.color.panel_bg_active)
                 .border_1()
                 .border_color(tokens.color.border_focus)
                 .rounded_md()
-                .overflow_hidden()
-                .child(List::new(state)),
+                .child(List::new(state).max_h(px(420.))),
         )
 }
 
