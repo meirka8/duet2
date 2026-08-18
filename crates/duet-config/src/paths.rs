@@ -80,6 +80,11 @@ pub fn connections_path() -> Result<PathBuf> {
     Ok(duet_config_dir()?.join("connections.toml"))
 }
 
+/// `~/.config/duet/hotlist.toml` (T-4.3.5, FR-NAV-08).
+pub fn hotlist_path() -> Result<PathBuf> {
+    Ok(duet_config_dir()?.join("hotlist.toml"))
+}
+
 /// `~/.config/duet/themes/<name>.toml`.
 pub fn theme_path(name: &str) -> Result<PathBuf> {
     Ok(duet_config_dir()?
@@ -170,6 +175,22 @@ mod tests {
                 assert_eq!(
                     session_path().unwrap(),
                     PathBuf::from("/tmp/xdg-state-explicit/duet/session.json")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn hotlist_path_appends_duet_hotlist_toml() {
+        temp_env(
+            &[
+                ("XDG_CONFIG_HOME", Some("/tmp/xdg-explicit")),
+                ("HOME", None),
+            ],
+            || {
+                assert_eq!(
+                    hotlist_path().unwrap(),
+                    PathBuf::from("/tmp/xdg-explicit/duet/hotlist.toml")
                 );
             },
         );
