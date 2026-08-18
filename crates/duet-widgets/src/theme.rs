@@ -514,18 +514,23 @@ impl TokenPalette {
             theme.input = self.color.border_default;
             theme.caret = self.color.cursor_bg;
             // T-4.3.8 UAT: `Table`'s own row-hover style (`table_hover`)
-            // is otherwise whatever unrelated gray `gpui-component`'s
-            // built-in theme ships -- since `FileTableDelegate::render_tr`
-            // paints the keyboard cursor's own row with `cursor_bg`
-            // *before* `Table` chains its `.hover(...)` on top, hovering
-            // the mouse over the cursor row replaced that blue with the
-            // stock gray, reading as a jarring "inverted" flicker with
-            // poor contrast against `cursor_fg`'s dark text. `info` is
-            // the same Catppuccin "sky" family as `cursor_bg` -- a
-            // different hue, not just a lighter/darker copy of it, kept
-            // at the same lightness class -- so `cursor_fg`'s contrast
-            // holds up under it just as well as under `cursor_bg` itself.
-            theme.table_hover = self.color.info;
+            // replaces a row's background outright -- it doesn't touch
+            // text color, and it applies the same way to every row,
+            // cursor or not. That rules out a light/bright hover color
+            // (a first attempt using `info`, a light "sky" cyan, made
+            // hovering any *ordinary* row -- by far the common case --
+            // show `panel_fg_active`'s light text on a light background,
+            // "almost indistinguishable" per UAT) as well as a dark one
+            // close to the row's own base background (would fail the
+            // *cursor* row's dark `cursor_fg` text the same way the
+            // stock gray originally did). `tab_active_bg` is this
+            // palette's own "elevated/currently-relevant surface" role --
+            // a genuine middle tone in both built-in themes -- so it
+            // holds up reasonably against light default-row text (the
+            // common case) without being actively unreadable against the
+            // cursor row's dark text on the rare occasion the two
+            // coincide.
+            theme.table_hover = self.color.tab_active_bg;
         }
         cx.set_global(self);
     }
