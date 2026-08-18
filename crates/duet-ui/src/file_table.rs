@@ -2891,6 +2891,19 @@ fn spawn_directory_load(
                 delegate.select_row_by_name(name);
             }
             delegate.set_loading(false);
+            // UAT: navigating up (Backspace) correctly moved the cursor
+            // back onto the child directory just left (`select_name`),
+            // but never scrolled the viewport to follow -- if that entry
+            // sat below the fold in the parent's (often much longer)
+            // listing, the cursor looked like it vanished off the
+            // bottom, the exact same class of bug T-4.3.3's own
+            // quick-search jump had. Scrolling here unconditionally
+            // (not just when `select_name` found something) also covers
+            // an ordinary fresh load landing on row 0, which is a no-op
+            // if the view is already scrolled to the top.
+            if let Some(row) = delegate.display_row() {
+                state.scroll_to_row(row, cx);
+            }
             cx.notify();
             true
         });
