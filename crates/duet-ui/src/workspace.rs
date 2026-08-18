@@ -12,13 +12,13 @@ use std::time::Duration;
 use duet_commands::keymap::{self, tc_csv};
 use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
-use duet_config::SessionTab;
+use duet_config::{HotlistEntry, SessionTab};
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
     input::{Input, InputState},
     layout::{Root, WindowExt, h_flex, v_flex},
-    list::{List, ListState},
+    list::{IndexPath, List, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel},
     theme::{ActiveTheme as _, TokenPalette},
     toast::Notification,
@@ -37,6 +37,7 @@ use crate::file_table::{
     FileTable, FileTableSettings, MouseMode, QuickSearchMode, write_byte_count,
 };
 use crate::function_bar::{self, FKeySlot};
+use crate::hotlist::HotlistDelegate;
 use crate::panel::{Panel, bind_panel_keys};
 use crate::theme_controller::ThemeController;
 
@@ -76,6 +77,34 @@ actions!(
     ]
 );
 
+// T-4.3.5's directory hotlist (FR-NAV-08). `OpenHotlist` (`Ctrl+D`) is the
+// one binding `docs/keymap-tc.csv` actually documents (`hotlist.open`,
+// "known" confidence). `AddCurrentDirToHotlist` (`Ctrl+Shift+D`),
+// `HotlistRemoveEntry` (`Delete`), `HotlistMoveUp`/`HotlistMoveDown`
+// (`Ctrl+Up`/`Ctrl+Down`) are this codebase's own reasonable defaults --
+// `docs/commands.md`'s `hotlist.add`/`remove`/`reorder` rows exist but
+// carry no keybinding anywhere in the repo (confirmed: neither
+// `keymap-tc.csv` nor design.md's own keymap appendix names one). The
+// Ctrl+Shift+`<letter>` pairing mirrors this app's own established
+// convention (Ctrl+T new tab / Ctrl+Shift+T reopen closed tab): the
+// shift variant is the more consequential sibling of the same key.
+// Ctrl+Up/Ctrl+Down for reorder is deliberately *not* plain arrow keys --
+// confirmed by reading `gpui-component-0.5.1/src/list/list.rs`'s own
+// `list::init` that `List`'s internal `SelectUp`/`SelectDown` navigation
+// is bound to the bare, unmodified `"up"`/`"down"` keystrokes, so a
+// `Ctrl+Up`/`Ctrl+Down` binding is a genuinely different keystroke that
+// never competes with it.
+actions!(
+    duet_workspace,
+    [
+        OpenHotlist,
+        AddCurrentDirToHotlist,
+        HotlistRemoveEntry,
+        HotlistMoveUp,
+        HotlistMoveDown
+    ]
+);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -86,6 +115,14 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-right", ResizeSplitterRight, Some("Workspace")),
         KeyBinding::new("tab", FocusOtherPanel, Some("FileTable")),
         KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Workspace")),
+        KeyBinding::new("ctrl-d", OpenHotlist, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-d", AddCurrentDirToHotlist, Some("Workspace")),
+        // Scoped to "HotlistOverlay" (the overlay card's own key context,
+        // not "Workspace") -- these three should only ever fire while the
+        // overlay is actually open and its list has an entry to act on.
+        KeyBinding::new("delete", HotlistRemoveEntry, Some("HotlistOverlay")),
+        KeyBinding::new("ctrl-up", HotlistMoveUp, Some("HotlistOverlay")),
+        KeyBinding::new("ctrl-down", HotlistMoveDown, Some("HotlistOverlay")),
     ]);
 }
 
@@ -303,6 +340,32 @@ pub struct Workspace {
     /// was invoked while the command line had focus).
     palette_target_panel: PanelSide,
 
+    /// `~/.config/duet/hotlist.toml`, or `None` if `$HOME`/
+    /// `$XDG_CONFIG_HOME` can't be resolved -- hotlist persistence is then
+    /// skipped, not fatal, same tolerance every other config path in this
+    /// struct already has.
+    hotlist_path: Option<PathBuf>,
+    /// T-4.3.5's directory hotlist (FR-NAV-08): the canonical, in-memory,
+    /// persisted list of bookmarks. Loaded once at startup; every
+    /// add/remove/reorder updates this field *and* writes it back to
+    /// `hotlist_path` immediately (`persist_hotlist`) -- eager, matching
+    /// `session.json`'s own "don't lose more than the last action"
+    /// convention, not just-at-shutdown.
+    hotlist_entries: Vec<HotlistEntry>,
+    /// `Some` while the hotlist overlay is open -- constructed fresh on
+    /// every `open_hotlist` from the current `hotlist_entries`, dropped on
+    /// close. Mirrors `command_palette`'s own field exactly.
+    hotlist: Option<Entity<ListState<HotlistDelegate>>>,
+    /// Saved by `open_hotlist`, restored and cleared by `close_hotlist` --
+    /// same reasoning as `palette_previous_focus`.
+    hotlist_previous_focus: Option<FocusHandle>,
+    /// Which panel `hotlist.navigate`/`AddCurrentDirToHotlist` apply to --
+    /// same capture-at-open-time reasoning as `palette_target_panel`.
+    /// Reused for `AddCurrentDirToHotlist` too even though that action
+    /// doesn't open the overlay, since it needs the exact same "which
+    /// panel is the user actually working in" answer.
+    hotlist_target_panel: PanelSide,
+
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
     /// `ThemeController::install`'s doc comment). `Option` only to bridge
@@ -461,6 +524,16 @@ impl Workspace {
             Rc::new(PaletteIndex::build(&registry, &resolved))
         };
 
+        // T-4.3.5: loaded once, here, same "no live-reload path yet"
+        // story as `palette_index` -- every add/remove/reorder updates
+        // `hotlist_entries` and `hotlist_path` in lockstep from then on
+        // (see `Self::persist_hotlist`), so there's nothing to re-read.
+        let hotlist_path = duet_config::paths::hotlist_path().ok();
+        let hotlist_entries = hotlist_path
+            .as_deref()
+            .map(load_hotlist_entries)
+            .unwrap_or_default();
+
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
@@ -477,6 +550,11 @@ impl Workspace {
             command_palette: None,
             palette_previous_focus: None,
             palette_target_panel: PanelSide::Left,
+            hotlist_path,
+            hotlist_entries,
+            hotlist: None,
+            hotlist_previous_focus: None,
+            hotlist_target_panel: PanelSide::Left,
             theme: None,
         }
     }
@@ -683,6 +761,14 @@ impl Workspace {
                 self.focus_other_panel(window, cx);
                 true
             }
+            "hotlist.open" => {
+                self.open_hotlist_for_panel(self.palette_target_panel, window, cx);
+                true
+            }
+            "hotlist.add" => {
+                self.add_dir_to_hotlist_for_panel(self.palette_target_panel, window, cx);
+                true
+            }
             _ => false,
         };
         if !handled {
@@ -692,6 +778,235 @@ impl Workspace {
             );
         }
         self.close_command_palette(window, cx);
+    }
+
+    /// Which panel is currently focused -- the same capture-at-invocation
+    /// logic `open_command_palette` already established for
+    /// `palette_target_panel`, reused here for both `open_hotlist` and
+    /// `AddCurrentDirToHotlist` (which needs the same answer without
+    /// opening the overlay at all).
+    fn focused_panel_side(&self, window: &Window, cx: &App) -> PanelSide {
+        if self
+            .right_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window)
+        {
+            PanelSide::Right
+        } else {
+            PanelSide::Left
+        }
+    }
+
+    /// `Ctrl+D` (`OpenHotlist`, T-4.3.5, FR-NAV-08): opens the directory
+    /// hotlist overlay, targeting whichever panel currently has focus.
+    fn open_hotlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.focused_panel_side(window, cx);
+        self.open_hotlist_for_panel(target, window, cx);
+    }
+
+    /// The `hotlist.open` half of [`Self::dispatch_palette_command`] and
+    /// [`Self::open_hotlist`]'s shared implementation, taking `target`
+    /// explicitly rather than deriving it from window focus: when this
+    /// runs from the palette, focus is still on the palette's own list at
+    /// this point (the palette closes *after* dispatch returns), so
+    /// [`Self::focused_panel_side`] would see the palette itself, not the
+    /// panel the user actually meant -- `dispatch_palette_command` already
+    /// knows the right answer via `palette_target_panel` (captured back
+    /// when the palette *opened*, before it stole focus) and passes that
+    /// straight through instead.
+    ///
+    /// A no-op if the overlay is already open (same reasoning as
+    /// `open_command_palette`: reopening shouldn't stack a second one).
+    fn open_hotlist_for_panel(
+        &mut self,
+        target: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hotlist.is_some() {
+            return;
+        }
+
+        self.hotlist_target_panel = target;
+        self.hotlist_previous_focus = window.focused(cx);
+
+        let entries = self.hotlist_entries.clone();
+        let weak_workspace = cx.entity().downgrade();
+        let state =
+            cx.new(|cx| ListState::new(HotlistDelegate::new(entries, weak_workspace), window, cx));
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.hotlist = Some(state);
+        cx.notify();
+    }
+
+    /// Closes the hotlist overlay (Escape, a click outside it, or right
+    /// after Enter navigates) and restores keyboard focus to whatever had
+    /// it before it opened. Mirrors `close_command_palette` exactly.
+    pub(crate) fn close_hotlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hotlist = None;
+        if let Some(handle) = self.hotlist_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// `hotlist.navigate` (Enter, inside the overlay, via
+    /// `HotlistDelegate::confirm`): navigates the captured target panel's
+    /// active tab to `dir`, then closes the overlay. Goes through
+    /// `FileTable::navigate_to_path` (T-4.3.5's own new entry point --
+    /// `navigate_to` itself is private to `file_table`'s module).
+    pub(crate) fn navigate_to_hotlist_entry(
+        &mut self,
+        dir: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match self.hotlist_target_panel {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let table = panel.read(cx).active_table().clone();
+        table.update(cx, |table, cx| {
+            table.navigate_to_path(PathBuf::from(dir), window, cx);
+        });
+        self.close_hotlist(window, cx);
+    }
+
+    /// `Ctrl+Shift+D` (`AddCurrentDirToHotlist`, `hotlist.add`):
+    /// bookmarks whichever panel currently has focus's active tab's
+    /// current directory.
+    fn add_current_dir_to_hotlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.focused_panel_side(window, cx);
+        self.add_dir_to_hotlist_for_panel(target, window, cx);
+    }
+
+    /// The `hotlist.add` half of [`Self::dispatch_palette_command`] and
+    /// [`Self::add_current_dir_to_hotlist`]'s shared implementation -- see
+    /// [`Self::open_hotlist_for_panel`]'s doc comment for why `target` is
+    /// taken explicitly rather than re-derived from window focus here. A
+    /// no-op (with an explanatory toast, not silence) if `target`'s
+    /// directory is already bookmarked -- TC's own hotlist doesn't allow
+    /// duplicate entries either.
+    fn add_dir_to_hotlist_for_panel(
+        &mut self,
+        target: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match target {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let dir = panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .current_dir()
+            .to_string_lossy()
+            .into_owned();
+
+        if self.hotlist_entries.iter().any(|e| e.path == dir) {
+            window.push_notification(
+                Notification::info(format!("{dir} is already in the hotlist.")),
+                cx,
+            );
+            return;
+        }
+
+        self.hotlist_entries.push(HotlistEntry {
+            path: dir.clone(),
+            label: None,
+        });
+        self.persist_hotlist(cx);
+        window.push_notification(Notification::success(format!("Bookmarked {dir}")), cx);
+    }
+
+    /// `Delete` (`HotlistRemoveEntry`, `hotlist.remove`, inside the
+    /// overlay): removes the selected entry, moves the selection to
+    /// whatever now sits at (or nearest to) the same position, and
+    /// persists the change immediately. A no-op if nothing is selected
+    /// (an empty hotlist).
+    fn remove_selected_hotlist_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.hotlist.clone() else {
+            return;
+        };
+        let entries = state.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            let Some(selected) = delegate.selected else {
+                return delegate.entries.clone();
+            };
+            delegate.entries.remove(selected);
+            let new_selected = if delegate.entries.is_empty() {
+                None
+            } else {
+                Some(selected.min(delegate.entries.len() - 1))
+            };
+            let entries = delegate.entries.clone();
+            // `ListState::set_selected_index` (not writing
+            // `delegate.selected` by hand) is what actually moves the
+            // *rendered* highlight -- `ListState` tracks the real
+            // selected index itself and only notifies the delegate of
+            // changes via `ListDelegate::set_selected_index`, it doesn't
+            // read the delegate's own copy back.
+            state.set_selected_index(new_selected.map(IndexPath::new), window, cx);
+            entries
+        });
+        self.hotlist_entries = entries;
+        self.persist_hotlist(cx);
+    }
+
+    /// `Ctrl+Up`/`Ctrl+Down` (`HotlistMoveUp`/`HotlistMoveDown`,
+    /// `hotlist.reorder`, inside the overlay): swaps the selected entry
+    /// with its neighbor in `direction` (`-1` = up, `1` = down), a no-op
+    /// at either end of the list or if nothing is selected. Persists
+    /// immediately.
+    fn move_selected_hotlist_entry(
+        &mut self,
+        direction: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.hotlist.clone() else {
+            return;
+        };
+        let entries = state.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            let Some(selected) = delegate.selected else {
+                return delegate.entries.clone();
+            };
+            let target = selected as isize + direction;
+            if target < 0 || target as usize >= delegate.entries.len() {
+                return delegate.entries.clone();
+            }
+            let target = target as usize;
+            delegate.entries.swap(selected, target);
+            let entries = delegate.entries.clone();
+            state.set_selected_index(Some(IndexPath::new(target)), window, cx);
+            entries
+        });
+        self.hotlist_entries = entries;
+        self.persist_hotlist(cx);
+    }
+
+    /// Writes `self.hotlist_entries` to `hotlist_path` off the UI thread,
+    /// matching `persist_session`'s own "best-effort, log on failure,
+    /// never a crash" pattern. Called after every add/remove/reorder.
+    fn persist_hotlist(&self, cx: &mut Context<Self>) {
+        let Some(path) = self.hotlist_path.clone() else {
+            return;
+        };
+        let entries = self.hotlist_entries.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = save_hotlist_entries(&path, &entries) {
+                    tracing::warn!(
+                        target: "duet_ui::workspace",
+                        "failed to save hotlist.toml: {err}"
+                    );
+                }
+            })
+            .detach();
     }
 
     /// Gathers both panels' *live* tab lists (real current directories,
@@ -923,12 +1238,21 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenHotlist, window, cx| {
+                this.open_hotlist(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AddCurrentDirToHotlist, window, cx| {
+                this.add_current_dir_to_hotlist(window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
             .child(self.function_key_bar(cx))
             .when_some(self.command_palette.clone(), |this, state| {
                 this.child(command_palette_overlay(&state, cx))
+            })
+            .when_some(self.hotlist.clone(), |this, state| {
+                this.child(hotlist_overlay(&state, cx))
             })
     }
 }
@@ -993,6 +1317,52 @@ fn command_palette_overlay(
                 .child(List::new(state).max_h(px(420.)))
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_command_palette(window, cx);
+                })),
+        )
+}
+
+/// T-4.3.5's hotlist overlay -- same `.occlude()`-backdrop/card shape as
+/// `command_palette_overlay` (see that function's own doc comment for the
+/// full reasoning), plus a `"HotlistOverlay"` key context and three extra
+/// `.on_action` handlers the palette never needed: this overlay is
+/// editable (`Delete`/`Ctrl+Up`/`Ctrl+Down`), not read-only.
+fn hotlist_overlay(
+    state: &Entity<ListState<HotlistDelegate>>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("hotlist-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("hotlist-card")
+                .key_context("HotlistOverlay")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(List::new(state).max_h(px(360.)))
+                .on_action(cx.listener(|this, _: &HotlistRemoveEntry, window, cx| {
+                    this.remove_selected_hotlist_entry(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &HotlistMoveUp, window, cx| {
+                    this.move_selected_hotlist_entry(-1, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &HotlistMoveDown, window, cx| {
+                    this.move_selected_hotlist_entry(1, window, cx);
+                }))
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_hotlist(window, cx);
                 })),
         )
 }
@@ -1315,6 +1685,48 @@ fn load_quick_search_idle_timeout(path: &std::path::Path) -> Duration {
     Duration::from_millis(ms.clamp(200, 5000) as u64)
 }
 
+/// Reads `hotlist.toml`'s `entries` from `path` (T-4.3.5, FR-NAV-08).
+/// Same fallback tolerance as [`load_mouse_mode`] -- a missing file (no
+/// bookmarks saved yet, the ordinary case on first launch) or a malformed
+/// one both degrade to an empty hotlist rather than failing startup.
+fn load_hotlist_entries(path: &std::path::Path) -> Vec<HotlistEntry> {
+    duet_config::hotlist::load(path)
+        .and_then(|file| file.typed())
+        .map(|hotlist| hotlist.entries)
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using an empty hotlist (hotlist.toml not loaded yet: {err})"
+            );
+            Vec::new()
+        })
+}
+
+/// Writes `entries` to `hotlist.toml` at `path`, creating the file (with
+/// `schema_version` at the documented current version) if this is the
+/// first write. Round-trip preserving for every other key, per
+/// `duet-config`'s `ConfigFile::set` contract -- same pattern
+/// `save_splitter_ratio` already establishes for `settings.toml`.
+fn save_hotlist_entries(
+    path: &std::path::Path,
+    entries: &[HotlistEntry],
+) -> duet_config::Result<()> {
+    let mut file = match duet_config::hotlist::load(path) {
+        Ok(file) => file,
+        Err(_) => duet_config::HotlistFile::from_str(
+            path,
+            "schema_version = 1\nentries = []\n",
+            &duet_config::MigrationRegistry::generic_v0_to_v1(),
+            duet_config::hotlist::HOTLIST_SCHEMA_VERSION,
+        )?,
+    };
+    file.set(
+        &["entries"],
+        duet_config::Hotlist::entries_to_toml_array(entries),
+    );
+    file.save()
+}
+
 /// Writes `panels.splitter_ratio = ratio` to `settings.toml` at `path`,
 /// creating the file (with every other field at its documented default)
 /// if this is the first write. Round-trip preserving for every *other*
@@ -1625,6 +2037,137 @@ mod tests {
         });
     }
 
+    /// Regression test for a UAT-reported bug: `hotlist.open`/`hotlist.add`
+    /// were missing from `dispatch_palette_command`'s match entirely (so
+    /// selecting either from the palette just showed the "isn't wired up
+    /// yet" notice), and once wired naively (calling `open_hotlist`/
+    /// `add_current_dir_to_hotlist`, which both re-derive the target panel
+    /// from *live window focus*) they'd silently target the wrong panel:
+    /// at the moment `dispatch_palette_command` runs, focus is still on
+    /// the palette's own list (the palette only closes *after* dispatch
+    /// returns), so `focused_panel_side` sees neither panel focused and
+    /// falls back to `PanelSide::Left` regardless of which panel the user
+    /// actually meant. This drives the real `CommandPaletteDelegate::
+    /// confirm` path (not `dispatch_palette_command` called directly, so
+    /// focus is genuinely on the palette when it runs) with the *right*
+    /// panel focused beforehand, and confirms `hotlist.open` still targets
+    /// the right panel.
+    #[gpui::test]
+    fn dispatch_palette_command_for_hotlist_open_targets_the_captured_palette_panel(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let right_handle = workspace.read_with(vcx, |ws, cx| {
+                ws.right_panel.read(cx).active_focus_handle(cx)
+            });
+            vcx.update(|window, _cx| window.focus(&right_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.command_palette.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state
+                    .delegate_mut()
+                    .perform_search("hotlist.open", window, cx)
+                    .detach();
+            });
+            vcx.run_until_parked();
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_target_panel,
+                    PanelSide::Right,
+                    "hotlist.open dispatched from the palette must target the panel that \
+                     was focused when the palette *opened*, not whatever has focus at \
+                     dispatch time (the palette itself)"
+                );
+                assert!(ws.hotlist.is_some());
+                assert!(ws.command_palette.is_none());
+            });
+        });
+    }
+
+    /// Same regression as the test above, for `hotlist.add`: bookmarks
+    /// whichever panel was focused *before* the palette opened, not
+    /// wherever `focused_panel_side` lands when called from inside
+    /// dispatch (with focus still on the palette).
+    #[gpui::test]
+    fn dispatch_palette_command_for_hotlist_add_bookmarks_the_captured_palette_panel(
+        cx: &mut TestAppContext,
+    ) {
+        let right_dir = tempfile::tempdir().unwrap();
+        with_workspace(cx, |workspace, vcx| {
+            let left_dir = workspace.read_with(vcx, |ws, cx| {
+                ws.left_panel
+                    .read(cx)
+                    .active_table()
+                    .read(cx)
+                    .current_dir()
+                    .to_path_buf()
+            });
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            right_table.update_in(vcx, |table, window, cx| {
+                table.navigate_to_path(right_dir.path().to_path_buf(), window, cx);
+            });
+            vcx.run_until_parked();
+
+            let right_handle = workspace.read_with(vcx, |ws, cx| {
+                ws.right_panel.read(cx).active_focus_handle(cx)
+            });
+            vcx.update(|window, _cx| window.focus(&right_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.command_palette.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state
+                    .delegate_mut()
+                    .perform_search("hotlist.add", window, cx)
+                    .detach();
+            });
+            vcx.run_until_parked();
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_entries.len(),
+                    1,
+                    "hotlist.add dispatched from the palette must actually bookmark \
+                     something, not just show the \"isn't wired up yet\" notice"
+                );
+                assert_eq!(
+                    ws.hotlist_entries[0].path,
+                    right_dir.path().to_string_lossy(),
+                    "must bookmark the panel that was focused when the palette opened \
+                     ({:?}), not the left panel's directory ({left_dir:?})",
+                    right_dir.path()
+                );
+            });
+        });
+    }
+
     #[gpui::test]
     fn dispatch_palette_command_for_an_unwired_id_shows_a_notice_and_still_closes(
         cx: &mut TestAppContext,
@@ -1715,6 +2258,296 @@ mod tests {
                 );
                 assert!(ws.command_palette.is_none());
             });
+        });
+    }
+
+    // -- T-4.3.5 directory hotlist --------------------------------------
+
+    #[gpui::test]
+    fn add_current_dir_to_hotlist_bookmarks_the_focused_panels_directory(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            let dir = workspace.read_with(vcx, |ws, cx| {
+                ws.left_panel
+                    .read(cx)
+                    .active_table()
+                    .read(cx)
+                    .current_dir()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.add_current_dir_to_hotlist(window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(ws.hotlist_entries.len(), 1);
+                assert_eq!(ws.hotlist_entries[0].path, dir);
+                assert_eq!(ws.hotlist_entries[0].label, None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn add_current_dir_to_hotlist_is_a_noop_for_an_already_bookmarked_directory(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.add_current_dir_to_hotlist(window, cx);
+                ws.add_current_dir_to_hotlist(window, cx);
+            });
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_entries.len(),
+                    1,
+                    "adding the same directory twice must not create a duplicate entry"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn open_hotlist_captures_the_focused_panel_and_focuses_the_overlay(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_hotlist(window, cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(ws.hotlist_target_panel, PanelSide::Left);
+                assert!(ws.hotlist.is_some());
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    !left_handle.is_focused(window),
+                    "focus must move onto the hotlist overlay, not stay on the panel"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn close_hotlist_restores_previous_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_hotlist(window, cx));
+            workspace.update_in(vcx, |ws, window, cx| ws.close_hotlist(window, cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.hotlist.is_none()));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "closing the hotlist must restore focus to whatever had it before"
+                );
+            });
+        });
+    }
+
+    /// Exercises `HotlistDelegate::confirm` directly (same "drive the
+    /// same logic the trait methods call" approach the palette's own
+    /// `confirming_a_selected_row...` test uses) -- confirms Enter on a
+    /// bookmarked entry actually navigates the captured target panel, not
+    /// just that `navigate_to_hotlist_entry` works when called directly.
+    #[gpui::test]
+    fn confirming_a_hotlist_entry_navigates_the_target_panel_and_closes(cx: &mut TestAppContext) {
+        let target = tempfile::tempdir().unwrap();
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.hotlist_entries.push(HotlistEntry {
+                    path: target.path().to_string_lossy().into_owned(),
+                    label: None,
+                });
+                ws.hotlist_target_panel = PanelSide::Left;
+                ws.open_hotlist(window, cx);
+            });
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.hotlist.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+            vcx.run_until_parked();
+
+            workspace.read_with(vcx, |ws, cx| {
+                assert_eq!(
+                    ws.left_panel.read(cx).active_table().read(cx).current_dir(),
+                    target.path(),
+                    "confirming the entry must navigate the target panel there"
+                );
+                assert!(
+                    ws.hotlist.is_none(),
+                    "confirming must also close the overlay"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn remove_selected_hotlist_entry_removes_it_and_persists(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.hotlist_entries = vec![
+                    HotlistEntry {
+                        path: "/a".into(),
+                        label: None,
+                    },
+                    HotlistEntry {
+                        path: "/b".into(),
+                        label: None,
+                    },
+                ];
+                ws.open_hotlist(window, cx);
+            });
+
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.remove_selected_hotlist_entry(window, cx);
+            });
+            vcx.run_until_parked();
+
+            let (entries, path) = workspace.read_with(vcx, |ws, _| {
+                (ws.hotlist_entries.clone(), ws.hotlist_path.clone())
+            });
+            assert_eq!(
+                entries,
+                vec![HotlistEntry {
+                    path: "/b".into(),
+                    label: None
+                }]
+            );
+
+            let on_disk = duet_config::hotlist::load(&path.unwrap())
+                .unwrap()
+                .typed()
+                .unwrap()
+                .entries;
+            assert_eq!(
+                on_disk, entries,
+                "the removal must be persisted to hotlist.toml, not just in memory"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn move_selected_hotlist_entry_swaps_with_its_neighbor_and_persists(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.hotlist_entries = vec![
+                    HotlistEntry {
+                        path: "/a".into(),
+                        label: None,
+                    },
+                    HotlistEntry {
+                        path: "/b".into(),
+                        label: None,
+                    },
+                    HotlistEntry {
+                        path: "/c".into(),
+                        label: None,
+                    },
+                ];
+                ws.open_hotlist(window, cx);
+            });
+            // The overlay's `HotlistDelegate` starts selected on index 0
+            // ("/a") -- move it down once.
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.move_selected_hotlist_entry(1, window, cx);
+            });
+            vcx.run_until_parked();
+
+            let (entries, path) = workspace.read_with(vcx, |ws, _| {
+                (ws.hotlist_entries.clone(), ws.hotlist_path.clone())
+            });
+            assert_eq!(
+                entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+                vec!["/b", "/a", "/c"]
+            );
+
+            let on_disk = duet_config::hotlist::load(&path.unwrap())
+                .unwrap()
+                .typed()
+                .unwrap()
+                .entries;
+            assert_eq!(on_disk, entries, "reorder must persist to hotlist.toml too");
+        });
+    }
+
+    #[gpui::test]
+    fn move_selected_hotlist_entry_up_from_the_top_is_a_noop(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.hotlist_entries = vec![
+                    HotlistEntry {
+                        path: "/a".into(),
+                        label: None,
+                    },
+                    HotlistEntry {
+                        path: "/b".into(),
+                        label: None,
+                    },
+                ];
+                ws.open_hotlist(window, cx);
+            });
+            // Selected starts at index 0 -- moving *up* must be a no-op.
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.move_selected_hotlist_entry(-1, window, cx);
+            });
+            vcx.run_until_parked();
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.hotlist_entries
+                        .iter()
+                        .map(|e| e.path.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["/a", "/b"]
+                );
+            });
+        });
+    }
+
+    /// FR-NAV-08's "entries persist" AC, exercised end to end against a
+    /// real file: `add_current_dir_to_hotlist` writes to `hotlist.toml`
+    /// off the UI thread, and a fresh read of that same file sees exactly
+    /// what was added -- not just an in-memory assertion.
+    #[gpui::test]
+    fn hotlist_entries_persist_to_a_real_hotlist_toml_file(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.add_current_dir_to_hotlist(window, cx);
+            });
+            vcx.run_until_parked();
+
+            let (entries, path) = workspace.read_with(vcx, |ws, _| {
+                (ws.hotlist_entries.clone(), ws.hotlist_path.clone())
+            });
+            assert_eq!(entries.len(), 1);
+
+            let on_disk = duet_config::hotlist::load(&path.unwrap())
+                .unwrap()
+                .typed()
+                .unwrap()
+                .entries;
+            assert_eq!(on_disk, entries);
         });
     }
 

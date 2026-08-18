@@ -16,7 +16,7 @@ Per `design.md` §10:
     keymaps/tc.toml          # shipped bases (read-only, copied on customise)
     keymaps/mc.toml
     keymaps/modern.toml
-    hotlist.toml             # bookmarks (own schema, out of scope for this doc)
+    hotlist.toml             # bookmarks (§3a)
     connections.toml         # remote profiles (no secrets — keyring refs only)
     themes/*.toml
     plugins/<id>/            # installed plugin bundles + per-plugin config
@@ -368,6 +368,36 @@ additive and preserved by round-trip parsing even if an older Duet doesn't recog
 
 ---
 
+## 3a. `hotlist.toml`
+
+FR-NAV-08's directory hotlist (bookmarks), written by T-4.3.5. Its own dedicated file
+rather than a `settings.toml` section, matching the directory layout in §0. `entries` is a
+flat array in display/navigation order — what the `Ctrl+D` overlay lists top to bottom, and
+what its reorder command permutes; there is no nested-category/submenu support (the
+catalogue's `hotlist.add_submenu` command exists with no keybinding or notes anywhere,
+deliberately out of scope here).
+
+```toml
+schema_version = 1
+
+entries = [
+  { path = "/home/meir/projects" },
+  { path = "/home/meir/Downloads", label = "Downloads" },
+  { path = "/mnt/nas/backups" },
+]
+```
+
+### Key reference
+
+| Key | Type | Default | Range / values | Meaning |
+|---|---|---|---|---|
+| `schema_version` | int | `1` | ≥ 0 | Migration marker. |
+| `entries` | array of tables | `[]` | — | Bookmarked directories, in display order. |
+| `entries[].path` | string | — (required) | an absolute path | The bookmarked directory. Not validated to exist at load time — a bookmark to a since-removed directory is kept (and simply fails to navigate) rather than silently dropped, so a temporarily-unmounted volume doesn't lose its entry. |
+| `entries[].label` | string | none (omitted) | any | A user-chosen display name, distinct from `path`. `hotlist.rename_entry` (`docs/commands.md`) is the command that would set this; no UI writes it yet as of T-4.3.5 — every entry today has `label` absent, and displays by `path`. |
+
+---
+
 ## 4. Theme token list (`themes/*.toml`)
 
 FR-CFG-04's "documented token set". A theme file supplies one variant (`light` or `dark`);
@@ -480,8 +510,5 @@ selected.
 
 - Exact grammar/parser for `binding.context` predicates (boolean expression over context
   terms) is design.md §9.4's responsibility; this doc only fixes the TOML field shape.
-- `hotlist.toml` (bookmarks) is named in the directory layout but out of scope for T-1.6.1
-  per the task's explicit four-file list; it will need its own short schema note before
-  T-4.3.5.
 - The migration runner's exact backup naming/retention (this doc proposes
   `<file>.v<N>.bak-<unix_ts>`) should be confirmed against whatever T-3.3.1 implements.

@@ -2460,6 +2460,25 @@ impl FileTable {
     /// `FileTable` needs a live `Window`, same as this one's own
     /// constructor does) -- the ordinary in-place-navigation path below
     /// never touches it.
+    /// T-4.3.5: the directory hotlist's "navigate to the selected
+    /// bookmark" entry point -- `navigate_to` itself is private to this
+    /// module (every existing caller, `EnterDirectory`/`NavigateParent`/
+    /// etc., is `FileTable`'s own `on_action` wiring), but `workspace.rs`'s
+    /// hotlist overlay is a sibling module and needs to reach into
+    /// whichever panel currently has focus. Thin passthrough: same
+    /// `push_history: true`/no `select_name` a plain "go to this
+    /// directory" gesture already uses (matching `navigate_to_home`'s own
+    /// call), same locked-tab redirect and quick-search invalidation
+    /// `navigate_to` itself already handles for every other caller.
+    pub(crate) fn navigate_to_path(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_to(dir, true, None, window, cx);
+    }
+
     fn navigate_to(
         &mut self,
         dir: PathBuf,

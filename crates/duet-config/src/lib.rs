@@ -51,6 +51,8 @@
 pub mod connections;
 mod document;
 mod error;
+/// `hotlist.toml` loading: the directory hotlist (bookmarks), FR-NAV-08.
+pub mod hotlist;
 mod io;
 /// `keymap.toml` / `keymaps/*.toml` loading.
 pub mod keymap;
@@ -68,6 +70,7 @@ mod watch;
 
 pub use document::ConfigFile;
 pub use error::{ConfigError, Result};
+pub use hotlist::{Hotlist, HotlistEntry, HotlistFile};
 pub use migrate::{Migration, MigrationRegistry};
 pub use session::{Session, SessionPanel, SessionSortColumn, SessionTab};
 pub use settings::{Settings, SettingsFile};

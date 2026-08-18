@@ -20,6 +20,7 @@
 mod command_palette;
 pub mod file_table;
 mod function_bar;
+mod hotlist;
 pub mod panel;
 mod theme_controller;
 mod workspace;
