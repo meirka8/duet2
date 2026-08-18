@@ -1660,8 +1660,12 @@ name = "duet-ops"
 version = "0.1.0"
 dependencies = [
  "duet-types",
+ "duet-vfs",
+ "futures-util",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
