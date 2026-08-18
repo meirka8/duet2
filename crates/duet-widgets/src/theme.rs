@@ -513,6 +513,19 @@ impl TokenPalette {
             theme.progress_bar = self.color.progress_bar;
             theme.input = self.color.border_default;
             theme.caret = self.color.cursor_bg;
+            // T-4.3.8 UAT: `Table`'s own row-hover style (`table_hover`)
+            // is otherwise whatever unrelated gray `gpui-component`'s
+            // built-in theme ships -- since `FileTableDelegate::render_tr`
+            // paints the keyboard cursor's own row with `cursor_bg`
+            // *before* `Table` chains its `.hover(...)` on top, hovering
+            // the mouse over the cursor row replaced that blue with the
+            // stock gray, reading as a jarring "inverted" flicker with
+            // poor contrast against `cursor_fg`'s dark text. `info` is
+            // the same Catppuccin "sky" family as `cursor_bg` -- a
+            // different hue, not just a lighter/darker copy of it, kept
+            // at the same lightness class -- so `cursor_fg`'s contrast
+            // holds up under it just as well as under `cursor_bg` itself.
+            theme.table_hover = self.color.info;
         }
         cx.set_global(self);
     }
