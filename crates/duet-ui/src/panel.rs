@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::file_table::{
-    FileTable, FileTableEvent, LockedNavigationHandler, MouseMode, TabRestore,
+    FileTable, FileTableEvent, FileTableSettings, LockedNavigationHandler, TabRestore,
 };
 
 /// `duet_config::SessionSortColumn` -> `duet_index::SortColumn`, for
@@ -132,10 +132,10 @@ pub struct Panel {
     /// (`tab.reopen_closed`, Ctrl+Shift+T).
     closed_stack: Vec<ClosedTab>,
     tokio_handle: tokio::runtime::Handle,
-    /// FR-SEL-06, see `file_table::MouseMode`'s doc comment -- read once
-    /// by `workspace::load_mouse_mode` and passed down unchanged to every
-    /// tab this panel creates.
-    mouse_mode: MouseMode,
+    /// See `file_table::FileTableSettings`'s doc comment -- read once by
+    /// `Workspace::new` and passed down unchanged to every tab this panel
+    /// creates.
+    file_table_settings: FileTableSettings,
 }
 
 impl Panel {
@@ -156,7 +156,7 @@ impl Panel {
         tabs: Vec<SessionTab>,
         active: usize,
         tokio_handle: tokio::runtime::Handle,
-        mouse_mode: MouseMode,
+        file_table_settings: FileTableSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -166,7 +166,7 @@ impl Panel {
             active: 0,
             closed_stack: Vec::new(),
             tokio_handle,
-            mouse_mode,
+            file_table_settings,
         };
         for tab in tabs {
             let restore = TabRestore {
@@ -228,7 +228,7 @@ impl Panel {
                 self.tokio_handle.clone(),
                 width_seed,
                 restore,
-                self.mouse_mode,
+                self.file_table_settings,
                 window,
                 cx,
             )
@@ -680,6 +680,8 @@ impl Render for Panel {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use duet_types::EntryId;
     use duet_widgets::layout::Root;
     use duet_widgets::table::{TableDelegate, TableEvent};
@@ -687,7 +689,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::file_table::{EnterDirectory, NavigateRoot};
+    use crate::file_table::{CursorDown, EnterDirectory, MouseMode, NavigateRoot, QuickSearchMode};
 
     fn session_tab(dir: PathBuf, locked: bool, lock_dir_change: bool) -> SessionTab {
         SessionTab {
@@ -753,10 +755,23 @@ mod tests {
             bind_panel_keys(cx);
         });
 
+        let file_table_settings = FileTableSettings {
+            mouse_mode,
+            quick_search_default_mode: QuickSearchMode::default(),
+            quick_search_idle_timeout: Duration::from_millis(1200),
+        };
         let mut panel_cell: Option<Entity<Panel>> = None;
         let (_root, vcx) = cx.add_window_view(|window, cx| {
-            let panel =
-                cx.new(|cx| Panel::new(tabs, active, tokio_handle.clone(), mouse_mode, window, cx));
+            let panel = cx.new(|cx| {
+                Panel::new(
+                    tabs,
+                    active,
+                    tokio_handle.clone(),
+                    file_table_settings,
+                    window,
+                    cx,
+                )
+            });
             panel_cell = Some(panel.clone());
             Root::new(panel, window, cx)
         });
@@ -1738,4 +1753,317 @@ mod tests {
             },
         );
     }
+
+    // -- T-4.3.3 quick search / quick filter ----------------------------
+
+    /// Moves real keyboard focus onto `panel`'s active tab and forces a
+    /// render pass -- `dispatch_action`/`simulate_input`/`simulate_keystrokes`
+    /// all resolve against whatever the *last drawn frame's* dispatch
+    /// tree says has focus, so a bare `window.focus(&handle)` with no
+    /// follow-up `window.draw(cx)` isn't reliably picked up (same
+    /// pattern `sort_persists_across_navigation_within_a_tab` already
+    /// established for `dispatch_action(EnterDirectory)`).
+    fn focus_active_table(panel: &Entity<Panel>, vcx: &mut VisualTestContext) {
+        let handle = panel.read_with(vcx, |panel, cx| panel.active_focus_handle(cx));
+        vcx.update(|window, _cx| window.focus(&handle));
+        let _ = vcx.update(|window, cx| window.draw(cx));
+    }
+
+    /// Three real files, deliberately named so a fuzzy subsequence query
+    /// for "gam" only plausibly matches `gamma.txt`.
+    fn three_named_files_dir() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), "").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "").unwrap();
+        std::fs::write(dir.path().join("gamma.txt"), "").unwrap();
+        dir
+    }
+
+    #[gpui::test]
+    fn typing_in_jump_mode_moves_the_cursor_to_the_best_fuzzy_match(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("gam");
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("gamma.txt".to_string()));
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Jump)
+                    );
+                });
+            },
+        );
+    }
+
+    /// Unlike "gam" (only ever matches `gamma.txt`), "a" is a fuzzy
+    /// subsequence of all three fixture names -- exercising the actual
+    /// score comparison, not just "there was exactly one candidate".
+    /// `alpha.txt`'s leading "a" is expected to outscore `beta.txt`'s
+    /// (3rd character) and `gamma.txt`'s (2nd character) under nucleo's
+    /// own prefix-match bonus.
+    #[gpui::test]
+    fn typing_in_jump_mode_picks_the_highest_scoring_match_among_several(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("a");
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.cursor_entry_name(cx), Some("alpha.txt".to_string()));
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn escape_exits_the_quick_search_regime(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("gam");
+                table.read_with(vcx, |table, cx| {
+                    assert!(
+                        table
+                            .state()
+                            .read(cx)
+                            .delegate()
+                            .quick_search_mode()
+                            .is_some()
+                    );
+                });
+
+                vcx.simulate_keystrokes("escape");
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.state().read(cx).delegate().quick_search_mode(), None);
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn idle_timeout_exits_the_quick_search_regime(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                table.read_with(vcx, |table, cx| {
+                    assert!(
+                        table
+                            .state()
+                            .read(cx)
+                            .delegate()
+                            .quick_search_mode()
+                            .is_some()
+                    );
+                });
+
+                vcx.executor().advance_clock(Duration::from_millis(1300));
+                vcx.run_until_parked();
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        None,
+                        "1300ms with no further keystroke must exceed the 1200ms default idle timeout"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_keystroke_resets_the_idle_timer(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                vcx.executor().advance_clock(Duration::from_millis(1000)); // < 1200ms
+                vcx.run_until_parked();
+                vcx.simulate_input("a"); // resets the timer
+
+                vcx.executor().advance_clock(Duration::from_millis(1000)); // 2000ms since 1st keystroke
+                vcx.run_until_parked();
+                table.read_with(vcx, |table, cx| {
+                    assert!(
+                        table
+                            .state()
+                            .read(cx)
+                            .delegate()
+                            .quick_search_mode()
+                            .is_some(),
+                        "the 2nd keystroke's own timer (1000ms elapsed) must still be pending, \
+                         even though 2000ms have passed since the 1st keystroke's stale timer \
+                         would have fired"
+                    );
+                });
+
+                vcx.executor().advance_clock(Duration::from_millis(300)); // 1300ms since 2nd
+                vcx.run_until_parked();
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.state().read(cx).delegate().quick_search_mode(), None);
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn arrow_key_exits_jump_mode_but_not_filter_mode(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                vcx.dispatch_action(CursorDown);
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        None,
+                        "jump mode must exit on arrow-key movement (FR-NAV-13)"
+                    );
+                });
+
+                vcx.simulate_keystrokes("ctrl-p");
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter)
+                    );
+                });
+                vcx.dispatch_action(CursorDown);
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter),
+                        "filter mode must NOT exit on arrow-key movement -- own judgment call, \
+                         see QuickSearchMode's doc comment"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_p_starts_filter_mode_and_narrows_the_listing(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_keystrokes("ctrl-p");
+                vcx.simulate_input("ga");
+
+                table.read_with(vcx, |table, cx| {
+                    let delegate = table.state().read(cx).delegate();
+                    assert_eq!(
+                        delegate.model().order().len(),
+                        1,
+                        "only gamma.txt contains \"ga\""
+                    );
+                    assert_eq!(delegate.quick_search_mode(), Some(QuickSearchMode::Filter));
+                });
+
+                vcx.simulate_keystrokes("escape");
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().model().order().len(),
+                        3,
+                        "escape must restore the full, unfiltered listing"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn mouse_click_exits_the_quick_search_regime(cx: &mut TestAppContext) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                emit_table_event(&table, TableEvent::SelectRow(1), vcx);
+
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.state().read(cx).delegate().quick_search_mode(), None);
+                });
+            },
+        );
+    }
+
+    // `losing_focus_exits_the_quick_search_regime` (FR-NAV-13's "panel
+    // losing focus" exit condition) is intentionally not tested here --
+    // see `FileTable::new`'s `on_focus_out` wiring for why: `Window`'s
+    // real focus-change events only report a non-empty
+    // `previous_focus_path` while `window_active` (the OS window's own
+    // foreground state) is true, and the only way to simulate that in a
+    // test is `TestWindow::simulate_active_status_change`, which is
+    // `pub(crate)` *inside gpui itself* -- unreachable from `duet-ui`'s
+    // own tests (confirmed by reading `gpui-0.2.2/src/platform/test/
+    // window.rs` and `src/app/test_context.rs`; no public wrapper
+    // exists). Verified instead that `window.on_focus_out` is the
+    // documented, correct API for this exact purpose and that every
+    // *other* exit condition (Escape, idle timeout, jump-mode cursor
+    // movement, mouse click, Ctrl+P) is both implemented and tested
+    // above -- this one is flagged honestly for live UAT instead.
 }
