@@ -6,19 +6,25 @@
 //! command-line row, all themed by [`crate::theme_controller`].
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
+use duet_commands::keymap::{self, tc_csv};
+use duet_commands::palette::PaletteIndex;
+use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::SessionTab;
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
     input::{Input, InputState},
     layout::{Root, WindowExt, h_flex, v_flex},
+    list::{List, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel},
     theme::{ActiveTheme as _, TokenPalette},
     toast::Notification,
 };
 use futures_util::StreamExt;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Application, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
@@ -26,6 +32,7 @@ use gpui::{
     size,
 };
 
+use crate::command_palette::CommandPaletteDelegate;
 use crate::file_table::{FileTable, write_byte_count};
 use crate::function_bar::{self, FKeySlot};
 use crate::panel::{Panel, bind_panel_keys};
@@ -48,9 +55,23 @@ use crate::theme_controller::ThemeController;
 // `"Workspace"`/`"Panel"`: it only makes sense to fire while a panel's
 // table genuinely holds focus, the same reasoning `docs/keymap-tc.csv`
 // gives (`focus.other_panel`'s context column is `panel`).
+//
+// `OpenCommandPalette` (T-4.3.6, FR-TOOL-11): `Ctrl+Shift+P` is my own
+// reasonable-default choice, not a verified TC binding -- Total Commander
+// predates the "command palette" UX pattern entirely (this app's own
+// `docs/keymap-tc.csv` survey has no row for it, same situation
+// `NavigateHome`'s Alt+Home and `TabReopenClosed`'s Ctrl+Shift+T were
+// already in). Chosen for being the same chord VSCode/Sublime/most
+// Electron-era editors already use for this exact feature, and unclaimed
+// by anything else in this app's keymap.
 actions!(
     duet_workspace,
-    [ResizeSplitterLeft, ResizeSplitterRight, FocusOtherPanel]
+    [
+        ResizeSplitterLeft,
+        ResizeSplitterRight,
+        FocusOtherPanel,
+        OpenCommandPalette
+    ]
 );
 
 /// Registers the workspace's own keybindings. Called once from [`run`],
@@ -62,6 +83,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-left", ResizeSplitterLeft, Some("Workspace")),
         KeyBinding::new("ctrl-right", ResizeSplitterRight, Some("Workspace")),
         KeyBinding::new("tab", FocusOtherPanel, Some("FileTable")),
+        KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("Workspace")),
     ]);
 }
 
@@ -248,11 +270,50 @@ pub struct Workspace {
     /// same way the `theme` field below does for `ThemeController`.
     pending_notice: Option<String>,
 
+    /// T-4.3.6's command palette: the fuzzy-searchable index over every
+    /// registered command (`docs/commands.md`'s 302-entry catalogue) plus
+    /// its currently resolved keybinding(s). Built once, here, rather
+    /// than on every `Ctrl+Shift+P` -- parsing the catalogue and the TC
+    /// keymap CSV isn't free, and "opening is instant with 200+ commands"
+    /// is this task's own AC; commands/bindings never change at runtime
+    /// in this app yet, so there's nothing that would ever need this
+    /// rebuilt later. `Rc`, not a bare value, so each palette-open can
+    /// hand a cheap clone to a fresh `CommandPaletteDelegate` without
+    /// `Workspace` giving up ownership.
+    palette_index: Rc<PaletteIndex>,
+    /// `Some` while the palette overlay is open -- constructed fresh on
+    /// every `open_command_palette` (so a reopened palette always starts
+    /// with an empty query, matching every other command palette's
+    /// convention) and dropped on close. The `Entity` itself owns the
+    /// live search state (query text, current matches, selection).
+    command_palette: Option<Entity<ListState<CommandPaletteDelegate>>>,
+    /// Saved by `open_command_palette`, restored and cleared by
+    /// `close_command_palette` -- so closing the palette (Escape, or
+    /// after invoking a command) gives keyboard focus back to whichever
+    /// panel had it before, rather than leaving focus stranded on an
+    /// overlay that no longer exists.
+    palette_previous_focus: Option<FocusHandle>,
+    /// Which panel a palette-invoked tab command applies to -- captured
+    /// once, at `open_command_palette` time (before focus moves onto the
+    /// palette's own query input, at which point neither panel would
+    /// read as focused any more). Defaults to the left panel if,
+    /// somehow, neither panel had focus when the palette opened (e.g. it
+    /// was invoked while the command line had focus).
+    palette_target_panel: PanelSide,
+
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
     /// `ThemeController::install`'s doc comment). `Option` only to bridge
     /// that one-frame gap; every render after startup sees `Some`.
     theme: Option<ThemeController>,
+}
+
+/// Which of the two panels a palette-dispatched tab command should apply
+/// to -- see the `palette_target_panel` field's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelSide {
+    Left,
+    Right,
 }
 
 /// Progress of the background Tokio task that lists the current
@@ -352,6 +413,22 @@ impl Workspace {
         })
         .detach();
 
+        // T-4.3.6: see the `palette_index` field's doc comment for why
+        // this is built once, here, rather than per-open. Same
+        // catalogue-plus-TC-keymap-CSV pattern `function_bar.rs`'s
+        // `build_function_bar` already establishes.
+        let palette_index = {
+            let mut registry = CommandRegistry::new();
+            register_builtin_commands(&mut registry).expect(
+                "docs/commands.md's catalogue is embedded at compile time and covered by \
+                 duet-commands' own parse tests -- registration failing here would mean the \
+                 checked-in document itself is malformed",
+            );
+            let loaded = tc_csv::load();
+            let resolved = keymap::resolve_with_locations([loaded.layer]);
+            Rc::new(PaletteIndex::build(&registry, &resolved))
+        };
+
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
@@ -364,6 +441,10 @@ impl Workspace {
             settings_path,
             session_path,
             pending_notice,
+            palette_index,
+            command_palette: None,
+            palette_previous_focus: None,
+            palette_target_panel: PanelSide::Left,
             theme: None,
         }
     }
@@ -451,6 +532,134 @@ impl Workspace {
         };
         let handle = target.read(cx).active_focus_handle(cx);
         window.focus(&handle);
+    }
+
+    /// `Ctrl+Shift+P` (`OpenCommandPalette`, T-4.3.6): opens the command
+    /// palette overlay. A no-op if it's already open (`Ctrl+Shift+P`
+    /// twice shouldn't stack a second one, or discard whatever query the
+    /// user already typed by rebuilding from scratch). Captures which
+    /// panel currently has focus (before this moves focus onto the
+    /// palette's own query input, at which point neither panel would read
+    /// as focused any more -- see `palette_target_panel`'s doc comment)
+    /// and the focus to restore on close.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.is_some() {
+            return;
+        }
+
+        self.palette_target_panel = if self
+            .right_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window)
+        {
+            PanelSide::Right
+        } else {
+            PanelSide::Left
+        };
+        self.palette_previous_focus = window.focused(cx);
+
+        let index = self.palette_index.clone();
+        let weak_workspace = cx.entity().downgrade();
+        let state = cx.new(|cx| {
+            ListState::new(
+                CommandPaletteDelegate::new(index, weak_workspace),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        state.update(cx, |state, cx| state.focus(window, cx));
+        self.command_palette = Some(state);
+        cx.notify();
+    }
+
+    /// Closes the command palette overlay (Escape, a click outside it, or
+    /// right after a command is dispatched) and restores keyboard focus
+    /// to whatever had it before the palette opened.
+    pub(crate) fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        if let Some(handle) = self.palette_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Runs the confirmed palette entry, then closes the palette -- see
+    /// `command_palette.rs`'s module doc comment for why this is a small,
+    /// explicit `match` rather than going through `Command::handler`
+    /// (every built-in handler is an intentional stub). Anything not
+    /// covered here is a real registered command with no implementation
+    /// yet, reported via a toast rather than silently doing nothing.
+    pub(crate) fn dispatch_palette_command(
+        &mut self,
+        id: &CommandId,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match self.palette_target_panel {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let handled = match id.as_str() {
+            "tab.new" => {
+                panel.update(cx, |panel, cx| panel.new_tab(window, cx));
+                true
+            }
+            "tab.close" => {
+                panel.update(cx, |panel, cx| panel.close_active(window, cx));
+                true
+            }
+            "tab.next" => {
+                panel.update(cx, |panel, cx| panel.next_tab(window, cx));
+                true
+            }
+            "tab.prev" => {
+                panel.update(cx, |panel, cx| panel.prev_tab(window, cx));
+                true
+            }
+            "tab.duplicate" => {
+                panel.update(cx, |panel, cx| panel.duplicate_active(window, cx));
+                true
+            }
+            "tab.close_others" => {
+                panel.update(cx, |panel, cx| panel.close_others(window, cx));
+                true
+            }
+            "tab.reopen_closed" => {
+                panel.update(cx, |panel, cx| panel.reopen_closed(window, cx));
+                true
+            }
+            "tab.lock" => {
+                panel.update(cx, |panel, cx| panel.toggle_lock(cx));
+                true
+            }
+            "tab.lock_dir_change" => {
+                panel.update(cx, |panel, cx| panel.toggle_lock_dir_change(cx));
+                true
+            }
+            "tab.move_left" => {
+                panel.update(cx, |panel, cx| panel.move_active_left(cx));
+                true
+            }
+            "tab.move_right" => {
+                panel.update(cx, |panel, cx| panel.move_active_right(cx));
+                true
+            }
+            "focus.other_panel" => {
+                self.focus_other_panel(window, cx);
+                true
+            }
+            _ => false,
+        };
+        if !handled {
+            window.push_notification(
+                Notification::info(format!("\u{201c}{title}\u{201d} isn't wired up yet.")),
+                cx,
+            );
+        }
+        self.close_command_palette(window, cx);
     }
 
     /// Gathers both panels' *live* tab lists (real current directories,
@@ -666,6 +875,7 @@ impl Render for Workspace {
             .id("workspace-root")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
             .bg(bg)
             .text_color(fg)
@@ -678,11 +888,81 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusOtherPanel, window, cx| {
                 this.focus_other_panel(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                this.open_command_palette(window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
             .child(self.function_key_bar(cx))
+            .when_some(self.command_palette.clone(), |this, state| {
+                this.child(command_palette_overlay(&state, cx))
+            })
     }
+}
+
+/// T-4.3.6: the palette's overlay chrome -- a full-window backdrop behind
+/// a centered card wrapping the real `duet_widgets::list::List` widget,
+/// which already owns the query input, the virtualised results list, and
+/// all of Up/Down/Enter/Escape's keyboard handling (`CommandPaletteDelegate`
+/// supplies the data and the `confirm`/`cancel` callbacks). `.absolute()`
+/// positions this against the nearest positioned ancestor, which is why
+/// `Workspace::render`'s root carries `.relative()`.
+///
+/// `max_h` goes on `List::new(state)` itself, not the wrapping card --
+/// matching `gpui-component`'s own established usage
+/// (`select.rs`'s dropdown: `List::new(&self.list)...max_h(rems(20.))`
+/// on the `List` directly, wrapped in a plain, sizing-unconstrained
+/// `v_flex()`). `List::render` explicitly pulls `max_size.height` out of
+/// its *own* style into `options.max_height`, which is what actually
+/// bounds the internal virtualized results view -- setting it on an
+/// ancestor div instead (an earlier bug here: UAT reported the palette
+/// opening but search always returning nothing, and typing feeling
+/// stuttery) leaves that bound unset, so the virtualized list has no
+/// definite height to lay out into at all.
+///
+/// `.occlude()` on both the backdrop and the card, plus `.on_mouse_down_out`
+/// on the card, mirror `select.rs`'s own popup exactly -- without the
+/// backdrop's `.occlude()`, a click anywhere on it falls straight through
+/// to whatever panel is underneath (UAT: "click on a panel while the
+/// palette is open activates that panel, the palette doesn't close, and
+/// controls freeze" -- clicking moved real GPUI focus onto the panel
+/// while `command_palette` stayed `Some`, leaving the still-rendered
+/// overlay visually on top but no longer the thing anything was actually
+/// talking to). `on_mouse_down_out` listens window-wide regardless of the
+/// card's own size (it's a capture-phase, `window.mouse_position()`-based
+/// check, not scoped to the backdrop's bounds), so a click on the
+/// backdrop -- now that it can't reach the panel underneath either --
+/// closes the palette the same way Escape does.
+fn command_palette_overlay(
+    state: &Entity<ListState<CommandPaletteDelegate>>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("command-palette-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("command-palette-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(List::new(state).max_h(px(420.)))
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_command_palette(window, cx);
+                })),
+        )
 }
 
 /// T-4.2.7's per-panel footer text: `FR-SEL-05`'s "n of m files selected,
@@ -1047,7 +1327,295 @@ async fn count_current_dir_entries() -> Result<(String, usize), String> {
 
 #[cfg(test)]
 mod tests {
+    use duet_commands::CommandId;
+    use duet_widgets::layout::Root;
+    use duet_widgets::list::ListDelegate as _;
+    use gpui::{TestAppContext, VisualTestContext};
+
     use super::*;
+
+    /// Serializes every test that touches `$XDG_CONFIG_HOME`/
+    /// `$XDG_STATE_HOME` (env vars are process-global state, and `cargo
+    /// test` runs tests concurrently across threads by default) --
+    /// mirrors `duet-config`'s own `paths::tests::temp_env` helper, which
+    /// this crate doesn't have direct access to (different crate).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Builds a real `Workspace` (both panels, the palette index, the
+    /// works) inside a real test window, with `$XDG_CONFIG_HOME`/
+    /// `$XDG_STATE_HOME` pointed at a fresh tempdir for the duration of
+    /// `f` -- without this, `Workspace::new`'s `settings_path()`/
+    /// `session_path()` calls would read whatever the *real* machine
+    /// running the test happens to have at `~/.config/duet`/
+    /// `~/.local/state/duet`, making the test's behavior depend on the
+    /// environment it happens to run in. Same real-multi-thread-Tokio-
+    /// runtime rationale as `panel.rs`'s `with_panel`: both panels'
+    /// `FileTable`s spawn real background listing loads.
+    fn with_workspace(
+        cx: &mut TestAppContext,
+        f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext),
+    ) {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: serialized by ENV_LOCK above; no other thread in this
+        // test binary reads these specific vars concurrently.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+            std::env::set_var("XDG_STATE_HOME", state_dir.path());
+        }
+
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("failed to start a test Tokio runtime");
+        let tokio_handle = tokio_rt.handle().clone();
+
+        cx.update(|cx| {
+            duet_widgets::init(cx);
+            duet_widgets::theme::TokenPalette::built_in(duet_widgets::theme::ThemeMode::Dark)
+                .install(cx);
+            bind_workspace_keys(cx);
+            crate::file_table::bind_file_table_keys(cx);
+            bind_panel_keys(cx);
+        });
+
+        let mut workspace_cell: Option<Entity<Workspace>> = None;
+        let (_root, vcx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, tokio_handle.clone()));
+            workspace_cell = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = workspace_cell.expect("the window-build closure always constructs one");
+
+        f(workspace, vcx);
+
+        // SAFETY: still serialized by ENV_LOCK.
+        unsafe {
+            match prev_config {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn open_command_palette_captures_the_focused_panel_and_focuses_the_palette(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(ws.palette_target_panel, PanelSide::Left);
+                assert!(ws.command_palette.is_some());
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    !left_handle.is_focused(window),
+                    "focus must move onto the palette's own query input, not stay on the panel"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn close_command_palette_restores_previous_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            workspace.update_in(vcx, |ws, window, cx| ws.close_command_palette(window, cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.command_palette.is_none()));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "closing the palette must restore focus to whatever had it before"
+                );
+            });
+        });
+    }
+
+    /// UAT regression: a real mouse click on the backdrop (well outside
+    /// the centered card -- the palette's own top padding is 96px, so a
+    /// click near the window's top-left corner is always on the backdrop
+    /// regardless of window size) must close the palette, not fall
+    /// through and activate whatever panel is underneath. Drives this
+    /// through a real simulated click (`VisualTestContext::simulate_click`),
+    /// not a direct method call -- this is specifically what the
+    /// `.occlude()`/`on_mouse_down_out` wiring exists to guarantee.
+    #[gpui::test]
+    fn clicking_the_backdrop_closes_the_palette_instead_of_reaching_the_panel_underneath(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.simulate_click(gpui::point(px(5.), px(5.)), gpui::Modifiers::default());
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.command_palette.is_none(),
+                    "a click on the backdrop must close the palette"
+                );
+            });
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "the click must not have reached the panel underneath -- closing the \
+                     palette should simply restore focus to what had it before, not leave \
+                     the panel independently focused via a click that fell through"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dispatch_palette_command_for_a_wired_id_runs_the_real_panel_method(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let tabs_before =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).snapshot(cx).tabs.len());
+
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.palette_target_panel = PanelSide::Left;
+                ws.dispatch_palette_command(
+                    &CommandId::new("tab.new").unwrap(),
+                    "Open a new tab",
+                    window,
+                    cx,
+                );
+            });
+
+            workspace.read_with(vcx, |ws, cx| {
+                assert_eq!(
+                    ws.left_panel.read(cx).snapshot(cx).tabs.len(),
+                    tabs_before + 1,
+                    "tab.new must actually open a new tab on the target panel"
+                );
+                assert!(
+                    ws.command_palette.is_none(),
+                    "dispatching a command must close the palette"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dispatch_palette_command_for_an_unwired_id_shows_a_notice_and_still_closes(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.update_in(vcx, |ws, window, cx| ws.open_command_palette(window, cx));
+
+            let notifications_before = vcx.update(|window, cx| window.notifications(cx).len());
+
+            workspace.update_in(vcx, |ws, window, cx| {
+                // `ops.copy` is a real, registered catalogue command with
+                // no real implementation to dispatch to yet.
+                ws.dispatch_palette_command(
+                    &CommandId::new("ops.copy").unwrap(),
+                    "Copy selection to the target panel",
+                    window,
+                    cx,
+                );
+            });
+
+            let notifications_after = vcx.update(|window, cx| window.notifications(cx).len());
+            assert!(
+                notifications_after > notifications_before,
+                "an unwired command must surface a notice, not silently no-op"
+            );
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.command_palette.is_none(),
+                    "the palette still closes even for an unwired command"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn palette_index_covers_the_full_catalogue(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let len = workspace.read_with(vcx, |ws, _| ws.palette_index.len());
+            assert!(
+                len >= 200,
+                "T-4.3.6's AC names \"200+ commands\" explicitly; got {len}"
+            );
+        });
+    }
+
+    /// Exercises the palette's `ListDelegate` impl directly (bypassing
+    /// real keystroke simulation, the same "drive the same logic the
+    /// trait methods call" approach `file_table.rs`'s own delegate tests
+    /// already use) -- confirms `perform_search`, `confirm`, and `cancel`
+    /// all reach `Workspace` correctly through the whole real wiring, not
+    /// just `dispatch_palette_command` called directly as the tests
+    /// above do.
+    #[gpui::test]
+    fn confirming_a_selected_row_through_the_list_delegate_dispatches_it(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let tabs_before =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).snapshot(cx).tabs.len());
+
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.palette_target_panel = PanelSide::Left;
+                ws.open_command_palette(window, cx);
+            });
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.command_palette.clone())
+                .expect("just opened");
+
+            state.update_in(vcx, |state, window, cx| {
+                state
+                    .delegate_mut()
+                    .perform_search("tab.new", window, cx)
+                    .detach();
+            });
+            vcx.run_until_parked();
+            state.update_in(vcx, |state, window, cx| {
+                state.delegate_mut().set_selected_index(
+                    Some(duet_widgets::list::IndexPath::new(0)),
+                    window,
+                    cx,
+                );
+                state.delegate_mut().confirm(false, window, cx);
+            });
+
+            workspace.read_with(vcx, |ws, cx| {
+                assert_eq!(
+                    ws.left_panel.read(cx).snapshot(cx).tabs.len(),
+                    tabs_before + 1,
+                    "confirming the top \"tab.new\" search result must dispatch it for real"
+                );
+                assert!(ws.command_palette.is_none());
+            });
+        });
+    }
 
     /// FR-NAV-01's "ratio persists per session", exercised end to end
     /// against real files: no `settings.toml` exists yet (fresh install,
