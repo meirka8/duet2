@@ -13,7 +13,16 @@ workspace = true
 
 [dependencies]
 duet-types = { path = "../duet-types" }
+# T-5.1.1: the planner walks a source tree through the `FileSystem` trait
+# (design.md §9.1's abstraction every backend implements), not `std::fs`
+# directly -- so a plan built for a local copy today keeps working once
+# archive/remote backends exist (Phase 6/7). The obviously-intended edge:
+# `duet-ops` sits right after `duet-vfs` in design.md §7.5/§8.1's crate list
+# precisely because the operation engine consumes the VFS layer.
+duet-vfs = { path = "../duet-vfs" }
 serde.workspace = true
+# `FileSystem::read_dir`'s `BoxStream` needs `StreamExt::next()` to consume.
+futures-util.workspace = true
 
 [dev-dependencies]
 # Only `duet-ops`'s own tests need a concrete wire format to round-trip
@@ -22,3 +31,10 @@ serde.workspace = true
 # spikes/s5-copy-ladder. Not promoted to [workspace.dependencies] since no
 # other crate needs it yet.
 serde_json = "1"
+# `rt-multi-thread` (not just `rt`): the cancellation test genuinely races
+# a `plan_copy` task against a concurrent `cancel()` call from the test's
+# own task -- a single-threaded runtime would just interleave cooperatively
+# at `.await` points, which doesn't exercise the same "stop a walk actually
+# in progress on another worker" scenario a real UI/executor split does.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3.12"
