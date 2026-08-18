@@ -616,10 +616,14 @@ impl FileTableDelegate {
     /// cursor actually happens; `FileTable::push_quick_search_char`/
     /// `toggle_quick_filter` both call this after touching
     /// `self.quick_search` itself.
-    fn apply_quick_search(&mut self) {
-        let Some(session) = self.quick_search.as_ref() else {
-            return;
-        };
+    /// Returns the display row the caller should scroll into view, if
+    /// any -- `apply_quick_search_jump`/`_filter` both move the cursor
+    /// (directly, or via `sync_cursor_row_from_model`) but neither has
+    /// access to the `TableState` that `scroll_to_row` lives on, only
+    /// `FileTable::apply_quick_search` (this delegate method's one
+    /// caller) does.
+    fn apply_quick_search(&mut self) -> Option<usize> {
+        let session = self.quick_search.as_ref()?;
         let mode = session.mode;
         // Cloning just the query string (not the whole session) sidesteps
         // needing `self.quick_search` borrowed immutably (to read it) and
@@ -646,8 +650,11 @@ impl FileTableDelegate {
     /// this reading: the winner is always the best match, but it isn't
     /// always the first one you'd encounter scrolling down from the
     /// top.) A query matching nothing clears `jump_match` and leaves the
-    /// cursor where it was.
-    fn apply_quick_search_jump(&mut self, query: &str) {
+    /// cursor where it was. Returns the winner's display row (UAT: the
+    /// cursor was jumping to matches outside the visible scroll range
+    /// with nothing bringing the viewport along -- `FileTable::
+    /// apply_quick_search` scrolls to whatever this returns).
+    fn apply_quick_search_jump(&mut self, query: &str) -> Option<usize> {
         let anchor_row = self.cursor_row.unwrap_or(0);
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
         let mut matcher = Matcher::new(Config::DEFAULT);
@@ -700,9 +707,11 @@ impl FileTableDelegate {
         if let Some(session) = self.quick_search.as_mut() {
             session.jump_match = winner.as_ref().map(|(_, m)| m.clone());
         }
-        if let Some((winner_row, _)) = winner {
-            self.move_cursor_to(winner_row + self.parent_offset());
-        }
+        winner.map(|(winner_row, _)| {
+            let display_row = winner_row + self.parent_offset();
+            self.move_cursor_to(display_row);
+            display_row
+        })
     }
 
     /// `Filter` mode's per-keystroke work (FR-NAV-07): narrows
@@ -715,7 +724,20 @@ impl FileTableDelegate {
     /// `full_order()` always, until this method's first call),
     /// `FilterSpec::default()`'s `show_hidden: false` would hide
     /// dotfiles as an unintended side effect of adding quick-filter.
-    fn apply_quick_search_filter(&mut self, query: &str) {
+    ///
+    /// UAT: narrowing the listing routinely filters out whatever entry
+    /// the cursor was previously on -- `sync_cursor_row_from_model`
+    /// alone then leaves `cursor_row` at `None` (its own, correct
+    /// behavior: the entry it was tracking is no longer visible), which
+    /// left the filtered view with *no* cursor highlighted at all and
+    /// nothing for Enter/arrow keys to act on, even though the match
+    /// count shown was already correct. Falls back to row 0 -- the
+    /// first (and typically only, or close to it) remaining visible
+    /// entry -- whenever that happens, so a narrowed listing always has
+    /// an actionable cursor. Returns the (possibly just-reset) cursor's
+    /// display row so `FileTable::apply_quick_search` can scroll it into
+    /// view, same as `apply_quick_search_jump`.
+    fn apply_quick_search_filter(&mut self, query: &str) -> Option<usize> {
         self.model.set_filter(Some(FilterSpec {
             show_hidden: true,
             quick_filter: Some(query.into()),
@@ -723,10 +745,15 @@ impl FileTableDelegate {
         }));
         self.rebuild_row_text();
         self.sync_cursor_row_from_model();
+        if self.cursor_row.is_none() && !self.model.order().is_empty() {
+            self.cursor_on_parent = false;
+            self.set_cursor_row(Some(0));
+        }
         let count = self.model.order().len();
         if let Some(session) = self.quick_search.as_mut() {
             session.filter_match_count = Some(count);
         }
+        self.display_row()
     }
 
     /// The row-preparation half of [`Self::context_menu`] (`TableDelegate`
@@ -2358,7 +2385,15 @@ impl FileTable {
     /// actual scoring/filtering work.
     fn apply_quick_search(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
-            state.delegate_mut().apply_quick_search();
+            // UAT: the cursor was jumping to the best match even when it
+            // fell outside the currently visible scroll range, with
+            // nothing bringing the viewport along -- always scroll to
+            // wherever the cursor actually ends up after each keystroke,
+            // same as every other cursor-moving command in this file
+            // already does.
+            if let Some(row) = state.delegate_mut().apply_quick_search() {
+                state.scroll_to_row(row, cx);
+            }
             cx.notify();
         });
     }
@@ -3492,6 +3527,64 @@ mod tests {
             delegate.quick_search_indicator_text(),
             Some("filter: f (3 matches)".to_string())
         );
+    }
+
+    /// UAT regression: `apply_quick_search_jump` moved the cursor but
+    /// nothing brought the viewport along, leaving the cursor jumping to
+    /// matches outside the visible scroll range. `FileTable::
+    /// apply_quick_search` fixes this by scrolling to whatever row this
+    /// method returns -- this test is the delegate-level half of that
+    /// fix: the row it returns must actually be the winner's *display*
+    /// row (accounting for the synthetic ".." row), not its model row.
+    #[test]
+    fn apply_quick_search_jump_returns_the_winners_display_row() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.set_has_parent_row(true);
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Jump,
+            query: "f3".to_string(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: None,
+        });
+
+        let row = delegate.apply_quick_search_jump("f3");
+
+        // "f3" is model row 3; with the ".." row ahead of it, that's
+        // display row 4 -- the exact translation `select_row_by_name`'s
+        // own regression test (T-4.3.7) already established elsewhere in
+        // this file.
+        assert_eq!(row, Some(4));
+        assert_eq!(delegate.cursor_row(), Some(3));
+    }
+
+    /// UAT regression: narrowing the listing routinely filters out
+    /// whatever entry the cursor was previously on, which used to leave
+    /// `cursor_row` at `None` entirely -- no cursor highlighted, nothing
+    /// for Enter/arrow keys to act on, even though the match count shown
+    /// was already correct.
+    #[test]
+    fn apply_quick_search_filter_resets_cursor_to_row_zero_when_previous_entry_is_filtered_out() {
+        let mut delegate = FileTableDelegate::new(five_file_model());
+        delegate.move_cursor_to(2); // land on "f2"
+        delegate.quick_search = Some(QuickSearchState {
+            mode: QuickSearchMode::Filter,
+            query: String::new(),
+            generation: 1,
+            jump_match: None,
+            filter_match_count: None,
+        });
+
+        // Only "f4" matches -- "f2" (the cursor's entry) is filtered out.
+        let row = delegate.apply_quick_search_filter("f4");
+
+        assert_eq!(
+            row,
+            Some(0),
+            "cursor must reset to the first remaining visible row"
+        );
+        assert_eq!(delegate.cursor_row(), Some(0));
+        assert_eq!(delegate.model().order().len(), 1);
     }
 
     #[test]
