@@ -29,12 +29,23 @@ futures-util.workspace = true
 # `Journal::append`/`JournalReader::scan` actually read and write real
 # journal files, it's a real production dependency, not a dev-only one.
 serde_json = "1"
+# T-5.1.3: the executor is the first `duet-ops` *production* code to need a
+# real Tokio runtime, not just an `async fn` driven by whatever runtime the
+# caller happens to run -- it spawns a bounded worker pool
+# (`tokio::spawn`/`tokio::sync::Semaphore`) and a 100ms progress-sampling
+# timer (`tokio::time::interval`) itself. `rt-multi-thread` (not just
+# `rt`): per-device concurrency is only real concurrency, not cooperative
+# interleaving, on a multi-threaded runtime -- a single-threaded one would
+# make "concurrency respects rotational detection" untestable in the way
+# T-5.1.1's own cancellation test already established the precedent for.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
-# `rt-multi-thread` (not just `rt`): the cancellation test genuinely races
-# a `plan_copy` task against a concurrent `cancel()` call from the test's
-# own task -- a single-threaded runtime would just interleave cooperatively
-# at `.await` points, which doesn't exercise the same "stop a walk actually
-# in progress on another worker" scenario a real UI/executor split does.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3.12"
+# T-5.1.3's executor tests need a `FileSystem` test double (wrapping
+# `LocalFs`, overriding `server_side_copy` to force the naive fallback
+# path or add an artificial delay) to deterministically exercise the
+# pause-mid-copy and bounded-concurrency behaviours -- see
+# `executor.rs`'s `TestFs`. Same reasoning `duet-vfs` itself already gives
+# for depending on `async-trait`: real async-fn-in-trait isn't object-safe.
+async-trait.workspace = true
