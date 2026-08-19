@@ -90,8 +90,9 @@
 //! rotational-aware default calls `suggested_concurrency` itself and
 //! passes the resulting number in.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use duet_types::{ErrorKind, MetaPatch, Result, Timestamp, VPath, VfsError};
@@ -103,7 +104,7 @@ use crate::event::{JobEvent, ProgressSnapshot};
 use crate::job::{JobId, JobOutcome, JobReport, StepFailure};
 use crate::journal::{Journal, JournalRecord, StepOutcome};
 use crate::plan::Plan;
-use crate::step::{RemoveMode, Step, StepKind};
+use crate::step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
 
 /// A cheaply cloneable, three-state cooperative control flag for a single
 /// running job: `Running`, `Paused`, or `Cancelled`. A single `AtomicU8`
@@ -211,6 +212,15 @@ struct ExecutorContext {
     control: ExecutionControl,
     counters: Arc<ProgressCounters>,
     events: mpsc::UnboundedSender<JobEvent>,
+    /// Every step's outcome recorded so far this run, keyed by
+    /// `step_index` -- what [`Step::Remove`]/[`Step::Verify`]'s own
+    /// `depends_on` field is checked against (T-5.1.5's dependency-gating
+    /// mechanism; see [`dependency_block_reason`]). A plain `Mutex`, not
+    /// an atomic/lock-free structure: writes happen once per step
+    /// (occasionally contended across a concurrent copy-class batch, but
+    /// briefly), and every read is a single-key lookup -- nothing here is
+    /// hot-path enough to justify more machinery.
+    outcomes: Arc<Mutex<HashMap<u32, StepOutcome>>>,
 }
 
 /// The raw, non-atomic-across-fields counters a job's [`ProgressSnapshot`]
@@ -299,6 +309,7 @@ pub async fn execute(
         control,
         counters: Arc::new(ProgressCounters::default()),
         events: events.clone(),
+        outcomes: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let sampler = spawn_progress_sampler(job_id, Arc::clone(&ctx.counters), events.clone());
@@ -504,17 +515,28 @@ async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step
             kind: step.kind(),
         });
 
-        let attempt = dispatch(ctx, step, partial_name.as_deref()).await;
-        let outcome = match attempt {
-            Ok(StepAttempt::Done(outcome)) => outcome,
-            Ok(StepAttempt::Interrupted) => continue, // pause/cancel mid-copy -- retry
-            Err(e) => StepOutcome::Failed(StepFailure {
-                step_index,
-                path: step_primary_path(step),
-                kind: e.kind(),
-                message: e.to_string(),
-            }),
+        let outcome = if let Some(reason) = dependency_block_reason(ctx, step) {
+            // Short-circuit before ever calling `dispatch` -- a
+            // dependency-blocked step performs no side effect at all, so
+            // there's nothing to attempt.
+            StepOutcome::Skipped { reason }
+        } else {
+            let attempt = dispatch(ctx, step, partial_name.as_deref()).await;
+            match attempt {
+                Ok(StepAttempt::Done(outcome)) => outcome,
+                Ok(StepAttempt::Interrupted) => continue, // pause/cancel mid-copy -- retry
+                Err(e) => StepOutcome::Failed(StepFailure {
+                    step_index,
+                    path: step_primary_path(step),
+                    kind: e.kind(),
+                    message: e.to_string(),
+                }),
+            }
         };
+        ctx.outcomes
+            .lock()
+            .unwrap()
+            .insert(step_index, outcome.clone());
 
         if let Err(e) = ctx
             .journal
@@ -580,8 +602,7 @@ fn apply_outcome(report: &mut JobReport, step_index: u32, step: &Step, outcome: 
 
 /// The path a [`StepFailure`]/[`crate::job::SkipEntry`] should attribute a
 /// step to -- its destination for anything that writes one, its target for
-/// removal/metadata, `None` for the read-only `Verify` (not dispatched
-/// today, but kept exhaustive).
+/// removal/metadata, `dest` for the read-only `Verify`.
 fn step_primary_path(step: &Step) -> Option<VPath> {
     match step {
         Step::CreateDir { dest, .. }
@@ -591,6 +612,53 @@ fn step_primary_path(step: &Step) -> Option<VPath> {
         | Step::Link { dest, .. } => Some(dest.clone()),
         Step::SetMeta { target, .. } | Step::Remove { target, .. } => Some(target.clone()),
         Step::Verify { dest, .. } => Some(dest.clone()),
+    }
+}
+
+/// The `step_index` a step's own execution is contingent on, if any -- see
+/// [`Step::Remove`]/[`Step::Verify`]'s own doc comments for what this
+/// field exists to prevent (T-5.1.5: a cross-device move's terminal
+/// `Remove` running even though the copy it was supposed to follow failed
+/// or was never reached).
+fn step_depends_on(step: &Step) -> Option<u32> {
+    match step {
+        Step::Remove { depends_on, .. } | Step::Verify { depends_on, .. } => *depends_on,
+        _ => None,
+    }
+}
+
+/// `Some(reason)` if `step` has an unmet [`step_depends_on`] dependency and
+/// must be skipped without ever being dispatched; `None` if it's clear to
+/// proceed (no dependency at all, or the dependency's own outcome wasn't
+/// `Failed`).
+///
+/// Deliberately gates on "not `Failed`", not on "`Succeeded`": a fresh
+/// `execute()` call resuming a previously-interrupted job re-walks
+/// `plan.steps` from the top and re-attempts everything, including steps
+/// that already durably succeeded before the interruption -- per this
+/// module's own "resume restarts the step" scope note, a `CopyFile` step
+/// whose destination was already fully written last time re-runs into
+/// `ErrorKind::Conflict` and is (correctly, safely) recorded `Skipped`,
+/// not `Succeeded`, on the second run. Gating a dependent `Remove` on
+/// strict `Succeeded` would treat that perfectly-fine resumed copy as
+/// unmet and strand the move forever, unable to ever remove a source
+/// whose destination has been correct since the *first* run. `Skipped`
+/// carries no information about *why* -- design.md's conflict-resolution
+/// story (T-5.1.9, not built yet) is what would eventually distinguish
+/// "already correctly there" from "a totally unrelated file happens to
+/// occupy this path" -- but refusing to proceed only on a definite,
+/// unambiguous `Failed` is the safe, conservative choice available today:
+/// it never blocks a legitimate resume, and it never lets a `Remove`
+/// through when its prerequisite is *known* to have gone wrong.
+fn dependency_block_reason(ctx: &ExecutorContext, step: &Step) -> Option<String> {
+    let dep = step_depends_on(step)?;
+    let outcomes = ctx.outcomes.lock().unwrap();
+    match outcomes.get(&dep) {
+        Some(StepOutcome::Failed(failure)) => Some(format!(
+            "prerequisite step {dep} failed ({}), refusing to proceed",
+            failure.message
+        )),
+        _ => None,
     }
 }
 
@@ -652,7 +720,7 @@ async fn dispatch(
         } => copy_file_step(ctx, source, dest, *size, partial_name).await,
         Step::Rename { source, dest, .. } => rename_step(&*ctx.fs, source, dest).await,
         Step::SetMeta { target, patch } => set_meta_step(&*ctx.fs, target, patch).await,
-        Step::Remove { target, mode } => remove_step(&*ctx.fs, target, *mode).await,
+        Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
         Step::Link { .. } => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
             step_index: 0, // overwritten by the caller
             path: step_primary_path(step),
@@ -661,14 +729,12 @@ async fn dispatch(
                        preservation, the only planner that will ever emit this step kind)"
                 .to_string(),
         }))),
-        Step::Verify { .. } => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
-            step_index: 0,
-            path: step_primary_path(step),
-            kind: ErrorKind::Fatal,
-            message: "Step::Verify execution is not implemented yet (T-5.1.12 owns post-copy \
-                       BLAKE3 verification)"
-                .to_string(),
-        }))),
+        Step::Verify {
+            source,
+            dest,
+            algorithm,
+            ..
+        } => verify_step(&*ctx.fs, source, dest, *algorithm).await,
     }
 }
 
@@ -707,8 +773,70 @@ async fn remove_step(fs: &dyn FileSystem, target: &VPath, mode: RemoveMode) -> R
         RemoveMode::EmptyDir => RemoveKind::EmptyDir,
         RemoveMode::Recursive => RemoveKind::Recursive,
     };
-    fs.remove(target, kind).await?;
-    Ok(StepAttempt::Done(StepOutcome::Succeeded))
+    match fs.remove(target, kind).await {
+        Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        // `EmptyDir` on a directory that isn't empty yet (a file inside it
+        // hasn't been removed -- its own copy failed, say) surfaces as
+        // `ErrorKind::Conflict` (`ENOTEMPTY`) per `RemoveKind::EmptyDir`'s
+        // own doc comment. This is T-5.1.5's self-gating mechanism for
+        // directory cleanup at the end of a cross-device move: no
+        // `depends_on` bookkeeping needed for these steps at all, since a
+        // non-empty directory simply and correctly refuses to go away on
+        // its own, exactly like any other conflict skip.
+        Err(e) if mode == RemoveMode::EmptyDir && e.kind() == ErrorKind::Conflict => {
+            Ok(StepAttempt::Done(StepOutcome::Skipped {
+                reason: format!(
+                    "{target} is not empty yet -- a step that writes into it \
+                                  must have failed or been skipped"
+                ),
+            }))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Compares `source` and `dest` per `algorithm` -- `SizeOnly` (a `stat` on
+/// each side, no content read) is fully implemented; `Blake3` is
+/// deliberately left unimplemented (T-5.1.12's own scope, per its task.md
+/// entry: "Post-copy verification (BLAKE3) as a job flag") rather than
+/// pulled in here just for this task's own cross-device-move AC, which
+/// design.md itself only requires "verify (if enabled)" for -- `SizeOnly`
+/// is a real, useful verification level on its own (catches a truncated
+/// or otherwise short/long copy), not a stub standing in for the real
+/// thing.
+async fn verify_step(
+    fs: &dyn FileSystem,
+    source: &VPath,
+    dest: &VPath,
+    algorithm: VerifyAlgorithm,
+) -> Result<StepAttempt> {
+    match algorithm {
+        VerifyAlgorithm::SizeOnly => {
+            let source_meta = fs.stat(source, false).await?;
+            let dest_meta = fs.stat(dest, false).await?;
+            if source_meta.size == dest_meta.size {
+                Ok(StepAttempt::Done(StepOutcome::Succeeded))
+            } else {
+                Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+                    step_index: 0, // overwritten by the caller
+                    path: Some(dest.clone()),
+                    kind: ErrorKind::Fatal,
+                    message: format!(
+                        "size mismatch: {source} is {} bytes, {dest} is {} bytes",
+                        source_meta.size, dest_meta.size
+                    ),
+                })))
+            }
+        }
+        VerifyAlgorithm::Blake3 => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+            step_index: 0,
+            path: Some(dest.clone()),
+            kind: ErrorKind::Fatal,
+            message: "VerifyAlgorithm::Blake3 execution is not implemented yet (T-5.1.12 owns \
+                       post-copy BLAKE3 verification); use VerifyAlgorithm::SizeOnly instead"
+                .to_string(),
+        }))),
+    }
 }
 
 fn skipped_conflict(dest: &VPath) -> StepOutcome {
@@ -1534,5 +1662,135 @@ mod tests {
             "observed only {observed_max} concurrent copy at once -- the batch \
              either isn't running in parallel at all, or the test's delay is too short"
         );
+    }
+
+    /// The core safety property T-5.1.5's `depends_on` field exists for,
+    /// exercised directly against a hand-built plan rather than through
+    /// `plan_move` -- a `Remove` step must never run if the step it
+    /// depends on failed, or a move could delete the only copy of a file
+    /// whose destination write never actually succeeded.
+    #[tokio::test]
+    async fn remove_step_with_a_failed_dependency_is_skipped_not_executed() {
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let survivor = dst.path().join("must_survive.txt");
+        std::fs::write(&survivor, b"do not delete me").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        // Step 0: a CopyFile that is certain to fail (source doesn't
+        // exist) -- standing in for "the move's copy failed."
+        // Step 1: a Remove of an unrelated, real file, wired to depend on
+        // step 0 -- if the gating mechanism didn't exist, this would run
+        // unconditionally and delete `survivor`.
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&dst.path().join("does-not-exist.txt")),
+                    dest: vpath_for(&dst.path().join("dest-that-never-happens.txt")),
+                    size: 5,
+                    conflict: None,
+                },
+                Step::Remove {
+                    target: vpath_for(&survivor),
+                    mode: RemoveMode::File,
+                    depends_on: Some(0),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "the CopyFile step must genuinely fail"
+        );
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the Remove step must be skipped, not attempted"
+        );
+        assert!(
+            survivor.exists(),
+            "the dependency-gated Remove must never have run -- the file must still exist"
+        );
+    }
+
+    /// The companion case: a `Remove` whose dependency step genuinely
+    /// succeeded must proceed normally.
+    #[tokio::test]
+    async fn remove_step_with_a_succeeded_dependency_proceeds() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        let source_path = src.path().join("a.txt");
+        let dest_path = dst.path().join("a.txt");
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&source_path),
+                    dest: vpath_for(&dest_path),
+                    size: 5,
+                    conflict: None,
+                },
+                Step::Remove {
+                    target: vpath_for(&source_path),
+                    mode: RemoveMode::File,
+                    depends_on: Some(0),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.skipped.is_empty());
+        assert!(
+            !source_path.exists(),
+            "the source must be removed after a successful copy"
+        );
+        assert!(dest_path.exists());
+    }
+
+    #[tokio::test]
+    async fn verify_size_only_succeeds_when_sizes_match_and_fails_when_they_dont() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"12345").unwrap();
+        std::fs::write(dir.path().join("b_same.txt"), b"67890").unwrap();
+        std::fs::write(dir.path().join("c_different.txt"), b"1").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![
+                Step::Verify {
+                    source: vpath_for(&dir.path().join("a.txt")),
+                    dest: vpath_for(&dir.path().join("b_same.txt")),
+                    algorithm: VerifyAlgorithm::SizeOnly,
+                    depends_on: None,
+                },
+                Step::Verify {
+                    source: vpath_for(&dir.path().join("a.txt")),
+                    dest: vpath_for(&dir.path().join("c_different.txt")),
+                    algorithm: VerifyAlgorithm::SizeOnly,
+                    depends_on: None,
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "only the size-mismatched pair should fail"
+        );
+        assert!(report.errors[0].message.contains("size mismatch"));
     }
 }

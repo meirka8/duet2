@@ -91,15 +91,40 @@ pub enum Step {
     /// operations"), which is exactly what an `Intent` journal record
     /// already guarantees for every step kind — nothing `Remove`-specific
     /// is needed beyond picking [`RemoveMode`] correctly.
-    Remove { target: VPath, mode: RemoveMode },
+    ///
+    /// `depends_on`: for the terminal `Remove` of a cross-device move (the
+    /// source, once its copy is durable), the `step_index` of the
+    /// `CopyFile`/`Reflink`/`Verify` step this removal is contingent on —
+    /// `None` for a plain delete with no such prerequisite. See the
+    /// executor's own dependency-gating doc comment (T-5.1.5) for exactly
+    /// what "contingent on" means operationally: this is what keeps a
+    /// cross-device move from ever unlinking a source whose destination
+    /// copy failed, which nothing enforced before this field existed (the
+    /// step loop previously advanced through `Failed`/`Skipped` outcomes
+    /// unconditionally).
+    Remove {
+        target: VPath,
+        mode: RemoveMode,
+        depends_on: Option<u32>,
+    },
     /// Verify `dest` against `source` (or against a recorded expected hash)
     /// by content hash — FR-OPS-08's optional post-copy verification, or
-    /// the mandatory verify step of a cross-device move before the source
+    /// the optional (`PlanOptions::verify`-gated — design.md §9.3: "verify
+    /// (if enabled)") verify step of a cross-device move before the source
     /// is unlinked. Read-only: never mutates either path.
+    ///
+    /// `depends_on`: the `step_index` of the `CopyFile`/`Reflink` step
+    /// that produced `dest`, so a copy that failed or was skipped never
+    /// gets "verified" against stale/nonexistent content — same
+    /// dependency-gating mechanism `Remove`'s own field documents.
+    /// `None` for a verify with no such prerequisite (not currently
+    /// emitted by any planner, but the field stays generally useful, not
+    /// move-specific).
     Verify {
         source: VPath,
         dest: VPath,
         algorithm: VerifyAlgorithm,
+        depends_on: Option<u32>,
     },
 }
 

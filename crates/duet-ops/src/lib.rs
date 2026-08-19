@@ -19,6 +19,10 @@
 //!   that make FR-OPS-03 progress reporting possible from the start.
 //! - [`planner`] — T-5.1.1: walks a source set through `duet_vfs`'s
 //!   `FileSystem` trait and materialises the `Plan` above, cancellably.
+//! - [`mover`] — T-5.1.5: same idea, for moves — a same-device entry
+//!   becomes one zero-cost `Rename`; cross-device becomes a `CopyFile` +
+//!   (optional `Verify`) + `Remove` sequence, dependency-gated so the
+//!   source is never removed unless its copy is known to have succeeded.
 //! - [`executor`] — T-5.1.3: runs a `Plan`'s steps against a `FileSystem`,
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
@@ -42,6 +46,7 @@ mod event;
 mod executor;
 mod job;
 mod journal;
+mod mover;
 mod plan;
 mod planner;
 mod step;
@@ -51,6 +56,7 @@ pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
 pub use job::{Job, JobId, JobKind, JobOutcome, JobReport, JobState, SkipEntry, StepFailure};
 pub use journal::{Journal, JournalReader, JournalRecord, RecoveryReport, StepOutcome};
+pub use mover::plan_move;
 pub use plan::{Plan, PlanOptions, PlanTotals};
 pub use planner::{CancelToken, PlannerError, plan_copy};
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
