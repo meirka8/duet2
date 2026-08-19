@@ -774,7 +774,12 @@ async fn copy_file_step(
     // hook into (`server_side_copy` is one opaque backend call), so it
     // still accounts for its whole file in one jump at completion.
     let mut used_naive = false;
-    match ctx.fs.server_side_copy(source, &partial).await {
+    let should_cancel = || ctx.control.state() != ControlState::Running;
+    match ctx
+        .fs
+        .server_side_copy(source, &partial, &should_cancel)
+        .await
+    {
         Ok(duet_vfs::CopyOutcome::Copied { .. }) => {}
         Ok(duet_vfs::CopyOutcome::Unsupported) => {
             // Best-effort cleanup of any zero-byte artifact the failed
@@ -785,6 +790,14 @@ async fn copy_file_step(
                 StepAttempt::Done(StepOutcome::Succeeded) => {}
                 other => return Ok(other),
             }
+        }
+        Ok(duet_vfs::CopyOutcome::Interrupted) => {
+            // Pause/cancel landed mid-`server_side_copy` (rung 2 or 3 of
+            // T-5.1.4's ladder) -- the backend already cleaned up its own
+            // partial per `CopyOutcome::Interrupted`'s own doc comment.
+            // Same handling as `naive_copy`'s own interruption: the
+            // caller's retry loop restarts this whole step from scratch.
+            return Ok(StepAttempt::Interrupted);
         }
         Err(e) if e.kind() == ErrorKind::Conflict => {
             return Ok(StepAttempt::Done(skipped_conflict(dest)));
@@ -1064,6 +1077,7 @@ mod tests {
             &self,
             from: &VPath,
             to: &VPath,
+            should_cancel: &(dyn Fn() -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(n, Ordering::SeqCst);
@@ -1073,7 +1087,7 @@ mod tests {
             let result = if self.force_unsupported {
                 Ok(duet_vfs::CopyOutcome::Unsupported)
             } else {
-                self.inner.server_side_copy(from, to).await
+                self.inner.server_side_copy(from, to, should_cancel).await
             };
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             result
@@ -1199,6 +1213,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
+            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             Ok(duet_vfs::CopyOutcome::Unsupported)
         }

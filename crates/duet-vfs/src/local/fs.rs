@@ -158,8 +158,13 @@ impl FileSystem for LocalFs {
         ))
     }
 
-    async fn server_side_copy(&self, from: &VPath, to: &VPath) -> Result<CopyOutcome> {
-        super::probe::accelerated_copy(from, to)
+    async fn server_side_copy(
+        &self,
+        from: &VPath,
+        to: &VPath,
+        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CopyOutcome> {
+        super::probe::accelerated_copy(from, to, should_cancel)
     }
 }
 
@@ -267,7 +272,7 @@ mod tests {
         std::fs::write(dir.path().join("src.txt"), b"copy me").unwrap();
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
         let outcome = fs
-            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"))
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|| false)
             .await
             .unwrap();
         match outcome {
@@ -278,7 +283,7 @@ mod tests {
                 // have gone through the copy_file_range fallback.
                 assert!(!reflinked);
             }
-            CopyOutcome::Unsupported => panic!("expected an accelerated copy on tmpfs"),
+            other => panic!("expected an accelerated copy on tmpfs, got {other:?}"),
         }
         assert_eq!(
             std::fs::read(dir.path().join("dst.txt")).unwrap(),
@@ -293,7 +298,7 @@ mod tests {
         std::fs::write(dir.path().join("dst.txt"), b"already here").unwrap();
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
         let err = fs
-            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"))
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|| false)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Conflict);

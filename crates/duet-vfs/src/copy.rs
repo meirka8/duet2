@@ -29,4 +29,16 @@ pub enum CopyOutcome {
     /// mounts) cannot accelerate the copy. The caller must fall back to
     /// `open_read` + `open_write` + the copy-strategy ladder.
     Unsupported,
+    /// `should_cancel` returned `true` before the copy finished. The
+    /// destination is left exactly as a `SIGKILL` at that same point would
+    /// have (per `docs/crash-safety.md`'s `CopyFile`/`Reflink` invariants,
+    /// which this outcome deliberately mirrors rather than sidesteps): if
+    /// `to` was ever created, it exists but holds fewer bytes than
+    /// planned, or none — never the pre-existing content of a path that
+    /// happened to already be there (`server_side_copy` never targets an
+    /// already-existing `to` in the first place; see `Conflict` above).
+    /// The caller (T-5.1.3's executor) treats this exactly like the
+    /// pause/cancel interruption its own buffered fallback loop already
+    /// produces: discard and retry the whole step from scratch.
+    Interrupted,
 }
