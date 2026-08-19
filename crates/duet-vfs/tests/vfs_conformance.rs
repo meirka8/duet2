@@ -809,7 +809,7 @@ async fn caps_reflink_absent_or_server_side_copy_is_honest() {
     let f = Fixture::local();
     f.write_std("src.txt", b"data");
     let outcome =
-        f.fs.server_side_copy(&f.path("src.txt"), &f.path("dst.txt"))
+        f.fs.server_side_copy(&f.path("src.txt"), &f.path("dst.txt"), &|| false)
             .await
             .unwrap();
     if f.fs.caps().contains(Caps::REFLINK) {

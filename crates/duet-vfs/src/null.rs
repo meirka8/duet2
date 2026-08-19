@@ -87,7 +87,12 @@ impl FileSystem for NullFs {
         ))
     }
 
-    async fn server_side_copy(&self, _from: &VPath, _to: &VPath) -> Result<CopyOutcome> {
+    async fn server_side_copy(
+        &self,
+        _from: &VPath,
+        _to: &VPath,
+        _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CopyOutcome> {
         Ok(CopyOutcome::Unsupported)
     }
 }
@@ -156,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn server_side_copy_reports_unsupported_not_an_error() {
         let fs: Arc<dyn FileSystem> = Arc::new(NullFs);
-        let outcome = fs.server_side_copy(&p(), &p()).await.unwrap();
+        let outcome = fs.server_side_copy(&p(), &p(), &|| false).await.unwrap();
         assert_eq!(outcome, CopyOutcome::Unsupported);
     }
 

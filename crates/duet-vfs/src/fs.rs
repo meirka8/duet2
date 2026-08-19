@@ -229,6 +229,17 @@ pub trait FileSystem: Send + Sync {
     /// — not an error — when this backend/path pair can't accelerate the
     /// copy; see [`CopyOutcome`]'s doc comment.
     ///
+    /// `should_cancel` is polled periodically for backends whose
+    /// acceleration isn't a single atomic syscall (T-5.1.4's copy-strategy
+    /// ladder: `LocalFs` chains `FICLONE` → `copy_file_range` → a
+    /// sparse-aware buffered copy, and the last two rungs can each run for
+    /// a genuinely long time on a large file). Returning `true` from it may
+    /// produce `Ok(CopyOutcome::Interrupted)` instead of completing — see
+    /// that variant's own doc comment for what state the destination is
+    /// left in. A backend whose acceleration really is one atomic syscall
+    /// (or that has no acceleration to offer at all) is free to never call
+    /// `should_cancel`.
+    ///
     /// # Errors
     /// Only for genuine failures, never for "can't accelerate":
     /// - `NotFound` — `from` does not exist.
@@ -240,5 +251,10 @@ pub trait FileSystem: Send + Sync {
     ///   (except a true reflink, which the backend should attempt first
     ///   internally when available) and can hit `ENOSPC`/`EDQUOT`.
     /// - `Retryable` / `Fatal` — as for any I/O.
-    async fn server_side_copy(&self, from: &VPath, to: &VPath) -> Result<CopyOutcome>;
+    async fn server_side_copy(
+        &self,
+        from: &VPath,
+        to: &VPath,
+        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CopyOutcome>;
 }
