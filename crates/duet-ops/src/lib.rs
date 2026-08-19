@@ -5,10 +5,12 @@
 //! `Plan`, `Step`, `Job`, `JobEvent`, `ConflictPolicy`, `Journal` — as real,
 //! compiling, serializable types. This is a Phase 2 interface-design task:
 //! field and variant *shapes* are complete per the design doc, but most
-//! runtime behaviour (the executor's step loop, real journal file I/O) is
+//! runtime behaviour (the executor's step loop, real queue management) is
 //! out of scope and left `todo!()`, to be filled in by their own dedicated
-//! Phase 5 tasks (T-5.1.2…T-5.1.13). T-5.1.1 is the first of those to
-//! land: [`planner::plan_copy`], the actual async/cancellable source walk.
+//! Phase 5 tasks (T-5.1.3…T-5.1.13). T-5.1.1 and T-5.1.2 are the first two
+//! of those to land: [`planner::plan_copy`] (the async/cancellable source
+//! walk) and [`journal::Journal`]/[`journal::JournalReader`] (the real
+//! append-fsync-replay file I/O).
 //!
 //! Structure mirrors design.md §9.3's own framing, "plan -> execute ->
 //! journal":
@@ -20,11 +22,13 @@
 //!   data the UI needs.
 //! - [`job`] / [`event`] — the queued unit and the event stream a UI (or
 //!   test harness) subscribes to instead of polling (design.md §8.2).
-//! - [`journal`] — the FR-OPS-07 crash-safety backbone: append-only,
-//!   fsync'd intent/completion records a recovery reader can replay after a
-//!   SIGKILL. See `docs/crash-safety.md` (T-2.3.2) for the interruption-
-//!   point-by-interruption-point proof sketch this record format exists to
-//!   support.
+//! - [`journal`] — T-5.1.2, the FR-OPS-07 crash-safety backbone:
+//!   append-only, fsync'd intent/completion records a recovery reader
+//!   ([`journal::JournalReader::scan`]) can replay after a SIGKILL. See
+//!   `docs/crash-safety.md` (T-2.3.2) for the interruption-point-by
+//!   -interruption-point proof sketch this record format exists to
+//!   support, and `journal`'s own module doc comment for exactly how much
+//!   of that proof this task covers versus leaves to T-10.2.1.
 
 mod conflict;
 mod event;

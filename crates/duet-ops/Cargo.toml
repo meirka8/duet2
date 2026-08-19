@@ -23,14 +23,14 @@ duet-vfs = { path = "../duet-vfs" }
 serde.workspace = true
 # `FileSystem::read_dir`'s `BoxStream` needs `StreamExt::next()` to consume.
 futures-util.workspace = true
+# T-5.1.2: the journal's on-disk wire format (newline-delimited JSON, one
+# `JournalRecord` per line -- see `journal.rs`'s module doc comment). T-2.3.1
+# only ever needed this as a *test* round-trip format for `Plan`; now that
+# `Journal::append`/`JournalReader::scan` actually read and write real
+# journal files, it's a real production dependency, not a dev-only one.
+serde_json = "1"
 
 [dev-dependencies]
-# Only `duet-ops`'s own tests need a concrete wire format to round-trip
-# through (T-2.3.1's AC: "a hand-written plan ... serialises and
-# deserialises"); JSON is the obvious choice and is already precedented by
-# spikes/s5-copy-ladder. Not promoted to [workspace.dependencies] since no
-# other crate needs it yet.
-serde_json = "1"
 # `rt-multi-thread` (not just `rt`): the cancellation test genuinely races
 # a `plan_copy` task against a concurrent `cancel()` call from the test's
 # own task -- a single-threaded runtime would just interleave cooperatively
