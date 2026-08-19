@@ -19,17 +19,6 @@
 //!   silently mishandled. `Link` belongs to T-5.1.7 (the hardlink-graph
 //!   task, the only one that will ever produce a `Link` step); `Verify`
 //!   belongs to T-5.1.12 (post-copy BLAKE3 verification).
-//! - **Conflict resolution is a placeholder, not the real seven-policy
-//!   engine.** `Step`'s own doc comment requires the executor to
-//!   "re-check immediately before acting" whether a destination now
-//!   exists — this module does that (every mutating call already returns
-//!   `ErrorKind::Conflict` on an unexpected pre-existing destination) but
-//!   treats *any* such conflict uniformly as [`StepOutcome::Skipped`],
-//!   ignoring `PlanOptions::default_conflict`/`Step`'s own `conflict`
-//!   field entirely. Implementing the real "job-level default →
-//!   per-conflict answer → apply-to-all" resolution (all seven TC
-//!   policies) is T-5.1.9's whole purpose — a task that doesn't exist yet
-//!   would be pre-empted, not helped, by half-implementing it here.
 //! - **No retry-with-backoff for `Retryable` failures, no `ENOSPC`
 //!   queue-wide pause, no `EACCES` elevation offer.** A `Retryable`/
 //!   `Space`/`Permission` failure is classified and recorded as a
@@ -89,6 +78,40 @@
 //! crate is built on. A caller that has a concrete `LocalFs` and wants the
 //! rotational-aware default calls `suggested_concurrency` itself and
 //! passes the resulting number in.
+//!
+//! # Conflict resolution (T-5.1.9)
+//!
+//! `CreateDir`, `CopyFile`/`Reflink`, and `Rename` are the three step kinds
+//! that ever produce or replace a destination path — the only ones a real
+//! conflict (`ErrorKind::Conflict` from the relevant mutating call) can
+//! happen to. [`resolve_conflict`] implements design.md §9.3's tiering,
+//! highest precedence first: a `Step`'s own pre-resolved `conflict` field →
+//! an already-established per-job "apply to all" answer
+//! (`ExecutorContext::sticky_conflict`, constructed fresh inside every
+//! `execute()` call, so one job's answer can never leak into another's) →
+//! a live [`crate::conflict::ConflictResolver`], if `execute()` was given
+//! one → `PlanOptions::default_conflict`. All seven [`ConflictPolicy`]
+//! values are real:
+//! - `Skip`/`Overwrite` are unconditional.
+//! - `OverwriteIfOlder`/`OverwriteIfDifferentSize` re-`stat` both sides and
+//!   overwrite only if the comparison favours it, else behave like `Skip`.
+//! - `RenameTarget` requires the resolution to carry an explicit
+//!   `alternate` destination (nothing in this crate can invent a name a
+//!   human is supposed to choose); `AutoRename` computes one itself
+//!   ([`auto_rename_target`]: `name (2).ext`, `name (3).ext`, ...).
+//! - `Abort` calls `ExecutionControl::cancel()` — the same mechanism a
+//!   user-initiated cancel uses — which is why `JobOutcome::Cancelled`'s
+//!   own doc comment already lists "the user (or an Abort conflict answer)"
+//!   together; no separate terminal state was needed.
+//!
+//! One real, pre-existing bug fixed as part of building this: `CreateDir`
+//! on a destination that already exists *as a directory* now succeeds
+//! silently instead of going through conflict resolution at all — merging
+//! into an already-existing directory tree (copying the same source twice,
+//! resuming a job, ...) is completely ordinary behaviour, not a competing
+//! claim on the same path the way an existing *file* at a `CopyFile`'s
+//! destination is. Only a non-directory occupying a `CreateDir`'s `dest`
+//! goes through the real seven-policy engine.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -100,6 +123,9 @@ use duet_vfs::{FileSystem, Mode, RemoveKind, RenameFlags, WriteOpts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::conflict::{
+    ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
+};
 use crate::event::{JobEvent, ProgressSnapshot};
 use crate::job::{JobId, JobOutcome, JobReport, StepFailure};
 use crate::journal::{Journal, JournalRecord, StepOutcome};
@@ -221,6 +247,20 @@ struct ExecutorContext {
     /// briefly), and every read is a single-key lookup -- nothing here is
     /// hot-path enough to justify more machinery.
     outcomes: Arc<Mutex<HashMap<u32, StepOutcome>>>,
+    /// `PlanOptions::default_conflict`, copied out for convenient access —
+    /// the lowest-precedence tier [`resolve_conflict`] falls back to.
+    default_conflict: ConflictPolicy,
+    /// A live conflict decision-maker, if the caller supplied one. `None`
+    /// means every conflict resolves via `default_conflict` alone, with no
+    /// live consultation.
+    resolver: Option<Arc<dyn ConflictResolver>>,
+    /// This job's "apply to all" answer, once a live resolver has given
+    /// one — `None` until then. Constructed fresh inside every `execute()`
+    /// call (see [`execute`]'s own body), never passed in from outside, so
+    /// one job's sticky answer can never leak into a different job's
+    /// `execute()` call even if the same `resolver` `Arc` is reused across
+    /// both (T-5.1.9's AC: "no policy leaks between jobs").
+    sticky_conflict: Arc<Mutex<Option<ConflictResolution>>>,
 }
 
 /// The raw, non-atomic-across-fields counters a job's [`ProgressSnapshot`]
@@ -261,6 +301,13 @@ struct ProgressCounters {
 /// (`tokio::runtime::Builder::new_multi_thread()`, sized off
 /// `available_parallelism()`) already satisfies this; a caller building
 /// its own runtime just to drive `execute` needs to do the same.
+///
+/// `resolver` is consulted for a conflict no pre-resolved `Step::conflict`
+/// field and no already-established per-job "apply to all" answer already
+/// covers — see the module doc comment's "Conflict resolution" section.
+/// `None` means every such conflict falls back to
+/// `plan.options.default_conflict` with no live consultation at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     fs: Arc<dyn FileSystem>,
     job_id: JobId,
@@ -269,6 +316,7 @@ pub async fn execute(
     concurrency: usize,
     events: mpsc::UnboundedSender<JobEvent>,
     control: ExecutionControl,
+    resolver: Option<Arc<dyn ConflictResolver>>,
 ) -> JobReport {
     let started_at = Timestamp::from(SystemTime::now());
     let journal = JournalHandle::spawn(journal);
@@ -302,6 +350,7 @@ pub async fn execute(
         };
     }
 
+    let default_conflict = plan.options.default_conflict;
     let ctx = ExecutorContext {
         fs,
         job_id,
@@ -310,6 +359,9 @@ pub async fn execute(
         counters: Arc::new(ProgressCounters::default()),
         events: events.clone(),
         outcomes: Arc::new(Mutex::new(HashMap::new())),
+        default_conflict,
+        resolver,
+        sticky_conflict: Arc::new(Mutex::new(None)),
     };
 
     let sampler = spawn_progress_sampler(job_id, Arc::clone(&ctx.counters), events.clone());
@@ -521,8 +573,19 @@ async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step
             // there's nothing to attempt.
             StepOutcome::Skipped { reason }
         } else {
-            let attempt = dispatch(ctx, step, partial_name.as_deref()).await;
+            let attempt = dispatch(ctx, step_index, step, partial_name.as_deref()).await;
             match attempt {
+                // Several `StepFailure`s built deep inside `dispatch` (e.g.
+                // a `RenameTarget` conflict with no alternate name, or a
+                // `naive_copy` I/O error) don't know their own step index
+                // at construction time and are built with a placeholder
+                // `step_index: 0` -- fixed up here, once, in the one place
+                // that actually knows it, rather than threading the real
+                // index through every failure-construction site.
+                Ok(StepAttempt::Done(StepOutcome::Failed(mut failure))) => {
+                    failure.step_index = step_index;
+                    StepOutcome::Failed(failure)
+                }
                 Ok(StepAttempt::Done(outcome)) => outcome,
                 Ok(StepAttempt::Interrupted) => continue, // pause/cancel mid-copy -- retry
                 Err(e) => StepOutcome::Failed(StepFailure {
@@ -707,18 +770,40 @@ enum StepAttempt {
 
 async fn dispatch(
     ctx: &ExecutorContext,
+    step_index: u32,
     step: &Step,
     partial_name: Option<&str>,
 ) -> Result<StepAttempt> {
     match step {
-        Step::CreateDir { dest, mode } => create_dir_step(&*ctx.fs, dest, *mode).await,
+        Step::CreateDir { dest, mode } => create_dir_step(ctx, step_index, dest, *mode).await,
         Step::CopyFile {
-            source, dest, size, ..
+            source,
+            dest,
+            size,
+            conflict,
         }
         | Step::Reflink {
-            source, dest, size, ..
-        } => copy_file_step(ctx, source, dest, *size, partial_name).await,
-        Step::Rename { source, dest, .. } => rename_step(&*ctx.fs, source, dest).await,
+            source,
+            dest,
+            size,
+            conflict,
+        } => {
+            copy_file_step(
+                ctx,
+                step_index,
+                *conflict,
+                source,
+                dest,
+                *size,
+                partial_name,
+            )
+            .await
+        }
+        Step::Rename {
+            source,
+            dest,
+            conflict,
+        } => rename_step(ctx, step_index, *conflict, source, dest).await,
         Step::SetMeta { target, patch } => set_meta_step(&*ctx.fs, target, patch).await,
         Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
         Step::Link { .. } => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
@@ -738,24 +823,309 @@ async fn dispatch(
     }
 }
 
+/// `CreateDir`'s own conflict handling: unlike `CopyFile`/`Reflink`/
+/// `Rename`, an existing directory at `dest` isn't a real conflict at all
+/// (see the module doc comment's "Conflict resolution" section) — only a
+/// non-directory occupying `dest` goes through [`resolve_conflict`] and the
+/// real seven-policy engine.
 async fn create_dir_step(
-    fs: &dyn FileSystem,
+    ctx: &ExecutorContext,
+    step_index: u32,
     dest: &VPath,
     mode: Option<u32>,
 ) -> Result<StepAttempt> {
-    match fs.create_dir(dest, mode.map(Mode::new)).await {
+    match ctx.fs.create_dir(dest, mode.map(Mode::new)).await {
         Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
-        Err(e) if e.kind() == ErrorKind::Conflict => Ok(StepAttempt::Done(skipped_conflict(dest))),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            let existing = ctx.fs.stat(dest, false).await?;
+            if existing.is_dir() {
+                return Ok(StepAttempt::Done(StepOutcome::Succeeded));
+            }
+            // A non-directory occupies `dest` -- a genuine conflict.
+            // `Step::CreateDir` carries no source path (see `mover.rs`'s
+            // own doc comment on that gap), so `dest` stands in for both
+            // sides of the prompt; a live resolver still gets a real
+            // `dest_meta`, just an uninformative `source_meta`.
+            let resolution = resolve_conflict(ctx, step_index, None, dest, dest).await?;
+            apply_create_dir_conflict_resolution(ctx, resolution, dest, mode).await
+        }
         Err(e) => Err(e),
     }
 }
 
-async fn rename_step(fs: &dyn FileSystem, source: &VPath, dest: &VPath) -> Result<StepAttempt> {
-    match fs.rename(source, dest, RenameFlags::NO_REPLACE).await {
+async fn apply_create_dir_conflict_resolution(
+    ctx: &ExecutorContext,
+    resolution: ConflictResolution,
+    dest: &VPath,
+    mode: Option<u32>,
+) -> Result<StepAttempt> {
+    match resolution.policy {
+        ConflictPolicy::Skip => Ok(skip_attempt(dest, "skip")),
+        ConflictPolicy::Abort => {
+            ctx.control.cancel();
+            Ok(skip_attempt(
+                dest,
+                "abort -- user chose to stop the job at this conflict",
+            ))
+        }
+        // `Step::CreateDir` carries no source path to compare `dest`
+        // against, so "overwrite if older/different size" has nothing to
+        // measure -- conservatively degrade to `Skip` (this crate's
+        // "never clobber silently" default philosophy) rather than guess.
+        // A file occupying the path a directory is meant to go is a rare,
+        // essentially adversarial case; `Overwrite` itself still works
+        // unconditionally, since it needs no comparison.
+        ConflictPolicy::OverwriteIfOlder | ConflictPolicy::OverwriteIfDifferentSize => {
+            Ok(skip_attempt(
+                dest,
+                "no source to compare mtime/size against for a directory",
+            ))
+        }
+        ConflictPolicy::Overwrite => {
+            ctx.fs.remove(dest, RemoveKind::File).await?;
+            ctx.fs.create_dir(dest, mode.map(Mode::new)).await?;
+            Ok(StepAttempt::Done(StepOutcome::Succeeded))
+        }
+        ConflictPolicy::RenameTarget => match resolution.alternate {
+            Some(alt) => {
+                ctx.fs.create_dir(&alt, mode.map(Mode::new)).await?;
+                Ok(StepAttempt::Done(StepOutcome::Succeeded))
+            }
+            None => Ok(rename_target_needs_a_name(dest)),
+        },
+        ConflictPolicy::AutoRename => {
+            let alt = auto_rename_target(ctx, dest).await?;
+            ctx.fs.create_dir(&alt, mode.map(Mode::new)).await?;
+            Ok(StepAttempt::Done(StepOutcome::Succeeded))
+        }
+    }
+}
+
+/// Attempts `fs.rename(from, dest, NO_REPLACE)`; on a real conflict,
+/// resolves it and applies whichever of the seven policies won. Shared by
+/// [`rename_step`] and [`copy_file_step`]'s publish step -- `source` (used
+/// only for the conflict prompt and `OverwriteIfOlder`/
+/// `OverwriteIfDifferentSize`'s comparisons) and `from` (the actual rename
+/// operand) coincide for a same-device `Rename` step but differ for a
+/// `CopyFile`/`Reflink` publish, where `from` is the staged partial, not
+/// the original source.
+async fn rename_with_conflict_resolution(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    pre_resolved: Option<ConflictPolicy>,
+    source: &VPath,
+    from: &VPath,
+    dest: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.rename(from, dest, RenameFlags::NO_REPLACE).await {
+        Ok(()) => return Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        Err(e) if e.kind() != ErrorKind::Conflict => return Err(e),
+        Err(_) => {}
+    }
+    let resolution = resolve_conflict(ctx, step_index, pre_resolved, source, dest).await?;
+    apply_rename_conflict_resolution(ctx, resolution, source, from, dest).await
+}
+
+async fn apply_rename_conflict_resolution(
+    ctx: &ExecutorContext,
+    resolution: ConflictResolution,
+    source: &VPath,
+    from: &VPath,
+    dest: &VPath,
+) -> Result<StepAttempt> {
+    match resolution.policy {
+        ConflictPolicy::Skip => Ok(skip_attempt(dest, "skip")),
+        ConflictPolicy::Abort => {
+            ctx.control.cancel();
+            Ok(skip_attempt(
+                dest,
+                "abort -- user chose to stop the job at this conflict",
+            ))
+        }
+        ConflictPolicy::Overwrite => replace_rename(ctx, from, dest).await,
+        ConflictPolicy::OverwriteIfOlder => {
+            let source_meta = ctx.fs.stat(source, false).await?;
+            let dest_meta = ctx.fs.stat(dest, false).await?;
+            match (dest_meta.modified, source_meta.modified) {
+                (Some(d), Some(s)) if d < s => replace_rename(ctx, from, dest).await,
+                _ => Ok(skip_attempt(
+                    dest,
+                    "destination is not older than the source",
+                )),
+            }
+        }
+        ConflictPolicy::OverwriteIfDifferentSize => {
+            let source_meta = ctx.fs.stat(source, false).await?;
+            let dest_meta = ctx.fs.stat(dest, false).await?;
+            if dest_meta.size != source_meta.size {
+                replace_rename(ctx, from, dest).await
+            } else {
+                Ok(skip_attempt(
+                    dest,
+                    "destination is the same size as the source",
+                ))
+            }
+        }
+        ConflictPolicy::RenameTarget => match resolution.alternate {
+            Some(alt) => rename_to_alternate(ctx, from, &alt).await,
+            None => Ok(rename_target_needs_a_name(dest)),
+        },
+        ConflictPolicy::AutoRename => {
+            let alt = auto_rename_target(ctx, dest).await?;
+            rename_to_alternate(ctx, from, &alt).await
+        }
+    }
+}
+
+/// Forces the destination to be replaced -- used once the resolved policy
+/// has already decided to overwrite unconditionally (`Overwrite`, or
+/// `OverwriteIfOlder`/`OverwriteIfDifferentSize` once their own comparison
+/// favoured it).
+async fn replace_rename(ctx: &ExecutorContext, from: &VPath, dest: &VPath) -> Result<StepAttempt> {
+    ctx.fs.rename(from, dest, RenameFlags::empty()).await?;
+    Ok(StepAttempt::Done(StepOutcome::Succeeded))
+}
+
+/// Renames `from` onto `alt` (an alternate, expected-to-be-free
+/// destination chosen by `RenameTarget`'s resolver answer or
+/// [`auto_rename_target`]) with `NO_REPLACE` -- a second conflict here
+/// (the alternate name itself collided, an extremely unlikely race) is
+/// reported as a failure rather than looped on indefinitely.
+async fn rename_to_alternate(
+    ctx: &ExecutorContext,
+    from: &VPath,
+    alt: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.rename(from, alt, RenameFlags::NO_REPLACE).await {
         Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
-        Err(e) if e.kind() == ErrorKind::Conflict => Ok(StepAttempt::Done(skipped_conflict(dest))),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+                step_index: 0, // overwritten by the caller
+                path: Some(alt.clone()),
+                kind: ErrorKind::Conflict,
+                message: format!("{alt} also already exists; refusing to guess another name"),
+            })))
+        }
         Err(e) => Err(e),
     }
+}
+
+fn skip_attempt(dest: &VPath, reason: &str) -> StepAttempt {
+    StepAttempt::Done(StepOutcome::Skipped {
+        reason: format!("{dest} already exists ({reason})"),
+    })
+}
+
+fn rename_target_needs_a_name(dest: &VPath) -> StepAttempt {
+    StepAttempt::Done(StepOutcome::Failed(StepFailure {
+        step_index: 0, // overwritten by the caller
+        path: Some(dest.clone()),
+        kind: ErrorKind::Fatal,
+        message: format!(
+            "{dest}: RenameTarget requires an alternate destination, but the conflict \
+             resolver didn't supply one (ConflictResolution::alternate was None) -- use \
+             AutoRename for an engine-chosen name, or have the resolver provide one"
+        ),
+    }))
+}
+
+/// The number of `name (N).ext` candidates [`auto_rename_target`] will try
+/// before giving up -- generous enough that hitting it means something is
+/// genuinely wrong (a directory pre-populated with hundreds of
+/// consecutively-numbered collisions), not a real "ran out of names" case.
+const AUTO_RENAME_MAX_ATTEMPTS: u32 = 1000;
+
+/// Finds the first non-colliding `name (2).ext`, `name (3).ext`, ... sibling
+/// of `dest` by probing `fs.stat` -- the engine-chosen name
+/// `ConflictPolicy::AutoRename` promises, with no prompt involved.
+async fn auto_rename_target(ctx: &ExecutorContext, dest: &VPath) -> Result<VPath> {
+    let fatal = |msg: String| -> Box<VfsError> {
+        Box::new(VfsError::new(ErrorKind::Fatal, msg).with_path(dest.clone()))
+    };
+    let parent = dest
+        .parent()
+        .ok_or_else(|| fatal("no parent to auto-rename within".to_string()))?;
+    let name = dest.inner().file_name().unwrap_or("").to_string();
+    let std_name = std::path::Path::new(&name);
+    let stem = std_name
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&name)
+        .to_string();
+    let ext = std_name
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
+
+    for n in 2..=AUTO_RENAME_MAX_ATTEMPTS {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent
+            .join(&candidate_name)
+            .map_err(|e| fatal(e.to_string()))?;
+        match ctx.fs.stat(&candidate, false).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(fatal(format!(
+        "could not find a free auto-rename name near {dest} after {AUTO_RENAME_MAX_ATTEMPTS} attempts"
+    )))
+}
+
+/// Resolves what to do about a real conflict at `dest`, honoring design.md
+/// §9.3's tiering -- see the module doc comment's "Conflict resolution"
+/// section for the full precedence order and rationale. `source` is used
+/// only to build a [`ConflictPrompt`] if a live resolver actually needs to
+/// be consulted (the pre-resolved and sticky tiers need no metadata at
+/// all).
+async fn resolve_conflict(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    pre_resolved: Option<ConflictPolicy>,
+    source: &VPath,
+    dest: &VPath,
+) -> Result<ConflictResolution> {
+    if let Some(policy) = pre_resolved {
+        return Ok(ConflictResolution::once(policy));
+    }
+    if let Some(sticky) = ctx.sticky_conflict.lock().unwrap().clone() {
+        return Ok(sticky);
+    }
+    let Some(resolver) = ctx.resolver.clone() else {
+        return Ok(ConflictResolution::once(ctx.default_conflict));
+    };
+    let source_meta = ctx.fs.stat(source, false).await?;
+    let dest_meta = ctx.fs.stat(dest, false).await?;
+    let prompt = ConflictPrompt {
+        step_index,
+        source: source.clone(),
+        dest: dest.clone(),
+        source_meta,
+        dest_meta,
+    };
+    let resolution = resolver.resolve(&prompt);
+    if resolution.scope == ConflictScope::AllRemaining {
+        *ctx.sticky_conflict.lock().unwrap() = Some(resolution.clone());
+    }
+    let _ = ctx.events.send(JobEvent::ConflictDetected {
+        job_id: ctx.job_id,
+        prompt: Box::new(prompt),
+    });
+    Ok(resolution)
+}
+
+async fn rename_step(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    conflict: Option<ConflictPolicy>,
+    source: &VPath,
+    dest: &VPath,
+) -> Result<StepAttempt> {
+    rename_with_conflict_resolution(ctx, step_index, conflict, source, source, dest).await
 }
 
 async fn set_meta_step(
@@ -839,12 +1209,15 @@ async fn verify_step(
     }
 }
 
-fn skipped_conflict(dest: &VPath) -> StepOutcome {
+/// The scratch partial path itself unexpectedly already existing --
+/// essentially never a real "the destination already exists" conflict
+/// (`partial`'s name is randomly generated per-attempt), so it doesn't go
+/// through the seven-policy engine at all; treated as a simple skip rather
+/// than a hard error, on the theory that whatever's occupying our scratch
+/// name will be gone by the next attempt.
+fn partial_collision(partial: &VPath) -> StepOutcome {
     StepOutcome::Skipped {
-        reason: format!(
-            "{dest} already exists (real conflict-policy resolution is T-5.1.9's job; \
-             the executor's placeholder behavior is to skip)"
-        ),
+        reason: format!("scratch path {partial} unexpectedly already exists"),
     }
 }
 
@@ -853,9 +1226,11 @@ fn skipped_conflict(dest: &VPath) -> StepOutcome {
 /// the backend can accelerate it), falling back to a naive buffered
 /// `open_read`/`open_write` loop -- pause/cancel-checked every
 /// [`COPY_BUFFER_BYTES`] -- when the backend reports `Unsupported`. Either
-/// way, publishes by renaming the partial onto `dest` as an explicit,
-/// separate step, so `Intent.partial_name` (recorded before this function
-/// is even called) always names the file recovery would actually find.
+/// way, publishes by renaming the partial onto `dest` (through
+/// [`rename_with_conflict_resolution`], the same seven-policy engine a
+/// `Rename` step uses) as an explicit, separate step, so
+/// `Intent.partial_name` (recorded before this function is even called)
+/// always names the file recovery would actually find.
 ///
 /// `server_side_copy` itself writes directly to whatever path it's given
 /// with no staging of its own (confirmed by reading `local::probe::
@@ -867,6 +1242,8 @@ fn skipped_conflict(dest: &VPath) -> StepOutcome {
 /// that gap.
 async fn copy_file_step(
     ctx: &ExecutorContext,
+    step_index: u32,
+    conflict: Option<ConflictPolicy>,
     source: &VPath,
     dest: &VPath,
     expected_size: u64,
@@ -928,27 +1305,31 @@ async fn copy_file_step(
             return Ok(StepAttempt::Interrupted);
         }
         Err(e) if e.kind() == ErrorKind::Conflict => {
-            return Ok(StepAttempt::Done(skipped_conflict(dest)));
+            return Ok(StepAttempt::Done(partial_collision(&partial)));
         }
         Err(e) => return Err(e),
     }
 
-    match ctx.fs.rename(&partial, dest, RenameFlags::NO_REPLACE).await {
-        Ok(()) => {
+    let attempt =
+        rename_with_conflict_resolution(ctx, step_index, conflict, source, &partial, dest).await?;
+    match &attempt {
+        StepAttempt::Done(StepOutcome::Succeeded) => {
             ctx.counters.files_done.fetch_add(1, Ordering::Relaxed);
             if !used_naive {
                 ctx.counters
                     .bytes_done
                     .fetch_add(expected_size, Ordering::Relaxed);
             }
-            Ok(StepAttempt::Done(StepOutcome::Succeeded))
         }
-        Err(e) if e.kind() == ErrorKind::Conflict => {
+        StepAttempt::Done(StepOutcome::Skipped { .. }) => {
+            // Not published anywhere -- clean up the staged copy so a
+            // skipped step doesn't leave an orphaned `.duet-partial-*`
+            // file behind.
             let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
-            Ok(StepAttempt::Done(skipped_conflict(dest)))
         }
-        Err(e) => Err(e),
+        _ => {}
     }
+    Ok(attempt)
 }
 
 /// The naive fallback copy loop: plain buffered `open_read`/`open_write`,
@@ -1092,11 +1473,13 @@ fn spawn_progress_sampler(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use duet_types::UnixPathBuf;
     use duet_vfs::LocalFs;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::*;
@@ -1113,10 +1496,30 @@ mod tests {
         state_dir: &Path,
         concurrency: usize,
     ) -> (JobReport, Vec<JobEvent>) {
+        run_with_resolver(fs, plan, state_dir, concurrency, None).await
+    }
+
+    async fn run_with_resolver(
+        fs: Arc<dyn FileSystem>,
+        plan: Plan,
+        state_dir: &Path,
+        concurrency: usize,
+        resolver: Option<Arc<dyn ConflictResolver>>,
+    ) -> (JobReport, Vec<JobEvent>) {
         let journal = Journal::open(JobIdT(1), state_dir).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        let report = execute(fs, JobIdT(1), plan, journal, concurrency, tx, control).await;
+        let report = execute(
+            fs,
+            JobIdT(1),
+            plan,
+            journal,
+            concurrency,
+            tx,
+            control,
+            resolver,
+        )
+        .await;
         drop(report.clone());
         let mut events = Vec::new();
         while let Ok(e) = rx.try_recv() {
@@ -1445,8 +1848,10 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(
             report.skipped.len(),
-            2,
-            "both CreateDir (dir already exists) and CopyFile (file already exists) must skip"
+            1,
+            "CreateDir must succeed silently (merging into an already-existing directory is \
+             normal, not a conflict -- T-5.1.9's own fix); only CopyFile (file already exists) \
+             should skip"
         );
         assert_eq!(
             std::fs::read_to_string(dst.path().join(src_name).join("a.txt")).unwrap(),
@@ -1490,6 +1895,7 @@ mod tests {
             1, // force sequential so cancellation is guaranteed mid-batch
             tx,
             control_for_task,
+            None,
         ));
 
         control.cancel();
@@ -1553,6 +1959,7 @@ mod tests {
             1,
             tx,
             control_for_task,
+            None,
         ));
 
         // Let real, observable progress happen first -- otherwise a
@@ -1792,5 +2199,608 @@ mod tests {
             "only the size-mismatched pair should fail"
         );
         assert!(report.errors[0].message.contains("size mismatch"));
+    }
+
+    // ---- T-5.1.9: conflict-resolution engine ----------------------------
+
+    /// A scripted [`ConflictResolver`] test double: returns pre-programmed
+    /// answers in order, falling back to a fixed `Skip` once exhausted, and
+    /// counts how many times it was actually consulted -- what the
+    /// sticky-state tests below check to prove the resolver stops being
+    /// called once an `AllRemaining` answer has been established.
+    struct ScriptedResolver {
+        answers: Mutex<VecDeque<ConflictResolution>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedResolver {
+        fn new(answers: Vec<ConflictResolution>) -> Self {
+            ScriptedResolver {
+                answers: Mutex::new(answers.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ConflictResolver for ScriptedResolver {
+        fn resolve(&self, _prompt: &ConflictPrompt) -> ConflictResolution {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ConflictResolution::once(ConflictPolicy::Skip))
+        }
+    }
+
+    fn set_mtime_secs_ago(path: &Path, secs_ago: u64) {
+        let mtime = SystemTime::now() - Duration::from_secs(secs_ago);
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_overwrite_replaces_the_destination() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&source, b"new content").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&source),
+                dest: vpath_for(&dest),
+                size: 11,
+                conflict: Some(ConflictPolicy::Overwrite),
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.files_completed, 1);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_overwrite_if_older_replaces_only_when_dest_is_older() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        // Case 1: destination is older than the source -- overwritten.
+        let source1 = dir.path().join("s1.txt");
+        let dest1 = dir.path().join("d1.txt");
+        std::fs::write(&source1, b"new").unwrap();
+        std::fs::write(&dest1, b"old").unwrap();
+        set_mtime_secs_ago(&dest1, 3600);
+
+        // Case 2: destination is newer than the source -- left alone.
+        let source2 = dir.path().join("s2.txt");
+        let dest2 = dir.path().join("d2.txt");
+        std::fs::write(&source2, b"new").unwrap();
+        set_mtime_secs_ago(&source2, 3600);
+        std::fs::write(&dest2, b"old").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&source1),
+                    dest: vpath_for(&dest1),
+                    size: 3,
+                    conflict: Some(ConflictPolicy::OverwriteIfOlder),
+                },
+                Step::CopyFile {
+                    source: vpath_for(&source2),
+                    dest: vpath_for(&dest2),
+                    size: 3,
+                    conflict: Some(ConflictPolicy::OverwriteIfOlder),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.files_completed, 1,
+            "only the older destination should be overwritten"
+        );
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(std::fs::read(&dest1).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(&dest2).unwrap(),
+            b"old",
+            "a destination newer than the source must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_overwrite_if_different_size_replaces_only_when_sizes_differ() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let source1 = dir.path().join("s1.txt");
+        let dest1 = dir.path().join("d1.txt");
+        std::fs::write(&source1, b"12345").unwrap();
+        std::fs::write(&dest1, b"1").unwrap(); // different size
+
+        let source2 = dir.path().join("s2.txt");
+        let dest2 = dir.path().join("d2.txt");
+        std::fs::write(&source2, b"12345").unwrap();
+        std::fs::write(&dest2, b"67890").unwrap(); // same size
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&source1),
+                    dest: vpath_for(&dest1),
+                    size: 5,
+                    conflict: Some(ConflictPolicy::OverwriteIfDifferentSize),
+                },
+                Step::CopyFile {
+                    source: vpath_for(&source2),
+                    dest: vpath_for(&dest2),
+                    size: 5,
+                    conflict: Some(ConflictPolicy::OverwriteIfDifferentSize),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files_completed, 1);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(std::fs::read(&dest1).unwrap(), b"12345");
+        assert_eq!(
+            std::fs::read(&dest2).unwrap(),
+            b"67890",
+            "a same-size destination must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_rename_target_uses_the_resolvers_alternate_destination() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        let alternate = dir.path().join("dest (renamed).txt");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&source),
+                dest: vpath_for(&dest),
+                size: 7,
+                conflict: None,
+            }],
+            PlanOptions::default(),
+        );
+        let resolver: Arc<dyn ConflictResolver> =
+            Arc::new(ScriptedResolver::new(vec![ConflictResolution::rename_to(
+                vpath_for(&alternate),
+            )]));
+
+        let (report, _events) = run_with_resolver(fs, plan, state.path(), 1, Some(resolver)).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"old",
+            "the original, conflicting destination must be untouched"
+        );
+        assert_eq!(std::fs::read(&alternate).unwrap(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_rename_target_without_an_alternate_fails_clearly() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&source),
+                dest: vpath_for(&dest),
+                size: 7,
+                conflict: Some(ConflictPolicy::RenameTarget),
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("RenameTarget"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_auto_rename_picks_the_first_free_numbered_name() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        // Pre-occupy "dest (2).txt" too, so the engine has to skip past it.
+        std::fs::write(dir.path().join("dest (2).txt"), b"taken").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&source),
+                dest: vpath_for(&dest),
+                size: 7,
+                conflict: Some(ConflictPolicy::AutoRename),
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            std::fs::read(dir.path().join("dest (3).txt")).unwrap(),
+            b"payload",
+            "the first two candidate names were taken; must land on the third"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn conflict_policy_abort_stops_the_job_as_cancelled_not_failed() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source1 = dir.path().join("s1.txt");
+        let dest1 = dir.path().join("d1.txt");
+        std::fs::write(&source1, b"x").unwrap();
+        std::fs::write(&dest1, b"old").unwrap();
+        let source2 = dir.path().join("s2.txt");
+        let dest2 = dir.path().join("d2.txt"); // no conflict -- must never even run
+        std::fs::write(&source2, b"y").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&source1),
+                    dest: vpath_for(&dest1),
+                    size: 1,
+                    conflict: Some(ConflictPolicy::Abort),
+                },
+                Step::CopyFile {
+                    source: vpath_for(&source2),
+                    dest: vpath_for(&dest2),
+                    size: 1,
+                    conflict: None,
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        // concurrency = 1 so the semaphore fully serialises the batch --
+        // the second step cannot even start until the abort step (which
+        // calls `ExecutionControl::cancel()` before returning) has
+        // released its permit.
+        let report = execute(fs, JobIdT(1), plan, journal, 1, tx, control, None).await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            std::fs::read(&dest1).unwrap(),
+            b"old",
+            "abort itself must not overwrite the conflicting destination"
+        );
+        assert!(
+            !dest2.exists(),
+            "the job must stop at the abort -- the second, non-conflicting CopyFile must never run"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            JobEvent::Finished {
+                outcome: JobOutcome::Cancelled,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn create_dir_merges_silently_into_an_already_existing_directory() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let dest = dir.path().join("existing");
+        std::fs::create_dir(&dest).unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CreateDir {
+                dest: vpath_for(&dest),
+                mode: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report.skipped.is_empty(),
+            "an already-existing directory is not a conflict"
+        );
+        assert!(dest.is_dir());
+    }
+
+    #[tokio::test]
+    async fn create_dir_with_a_file_occupying_the_path_is_a_real_conflict() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let dest = dir.path().join("occupied");
+        std::fs::write(&dest, b"a file, not a directory").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CreateDir {
+                dest: vpath_for(&dest),
+                mode: None,
+            }],
+            PlanOptions::default(), // default_conflict: Skip
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.skipped.len(), 1);
+        assert!(
+            dest.is_file(),
+            "the default (skip) must not clobber the existing file"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_overwrite_replaces_a_file_occupying_the_path() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let dest = dir.path().join("occupied");
+        std::fs::write(&dest, b"a file, not a directory").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::CreateDir {
+                dest: vpath_for(&dest),
+                mode: None,
+            }],
+            PlanOptions {
+                default_conflict: ConflictPolicy::Overwrite,
+                verify: false,
+            },
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.skipped.is_empty());
+        assert!(
+            dest.is_dir(),
+            "Overwrite must replace the file with a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_step_overwrite_replaces_the_destination() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&source, b"new content").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::Rename {
+                source: vpath_for(&source),
+                dest: vpath_for(&dest),
+                conflict: Some(ConflictPolicy::Overwrite),
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.skipped.is_empty());
+        assert!(
+            !source.exists(),
+            "a Rename step consumes its source regardless of policy"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+    }
+
+    /// For each of `n` files under `base` named `{prefix}_s{i}.txt` /
+    /// `{prefix}_d{i}.txt`, writes a `"new"` source and a pre-existing
+    /// `"old"` destination -- a batch of `n` guaranteed `CopyFile`
+    /// conflicts, used by the property test below.
+    fn make_conflicting_files(base: &Path, prefix: &str, n: usize) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut sources = Vec::new();
+        let mut dests = Vec::new();
+        for i in 0..n {
+            let s = base.join(format!("{prefix}_s{i}.txt"));
+            let d = base.join(format!("{prefix}_d{i}.txt"));
+            std::fs::write(&s, b"new").unwrap();
+            std::fs::write(&d, b"old").unwrap();
+            sources.push(s);
+            dests.push(d);
+        }
+        (sources, dests)
+    }
+
+    fn copy_steps(sources: &[PathBuf], dests: &[PathBuf]) -> Vec<Step> {
+        sources
+            .iter()
+            .zip(dests)
+            .map(|(s, d)| Step::CopyFile {
+                source: vpath_for(s),
+                dest: vpath_for(d),
+                size: 3,
+                conflict: None,
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// T-5.1.9's AC: "property test over random conflict sequences
+        /// shows no policy leaks between jobs." Runs two *separate*
+        /// `execute()` calls (two "jobs"), each with its own random-length
+        /// run of `CopyFile` conflicts and its own random position where
+        /// the resolver hands out an "apply to all" answer -- reusing the
+        /// exact same `ScriptedResolver` `Arc` for both. If a job's sticky
+        /// state ever leaked into the other's `ExecutorContext`, job 2
+        /// would either skip consulting the resolver for its own
+        /// conflicts entirely, or apply job 1's leftover policy instead of
+        /// its own -- both of which the assertions below would catch.
+        #[test]
+        fn sticky_apply_to_all_never_leaks_between_two_separate_jobs(
+            n1 in 1usize..5,
+            raw_trigger1 in 1usize..5,
+            n2 in 1usize..5,
+            raw_trigger2 in 1usize..5,
+        ) {
+            let trigger1 = raw_trigger1.min(n1);
+            let trigger2 = raw_trigger2.min(n2);
+
+            // `current_thread`, matching `#[tokio::test]`'s own default
+            // flavor elsewhere in this file -- `Runtime::new()` builds a
+            // genuinely multi-threaded runtime, under which the three
+            // spawned copy-class tasks could race to acquire the
+            // concurrency=1 semaphore in any order, breaking this test's
+            // assumption that step order matches resolver-consultation
+            // order. Safe here the same way every other plain
+            // `#[tokio::test]` in this file already relies on: the files
+            // are tiny, so `LocalFs`'s inline blocking syscalls never
+            // starve anything long enough to matter.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let dir = TempDir::new().unwrap();
+                let state1 = TempDir::new().unwrap();
+                let state2 = TempDir::new().unwrap();
+
+                // Job 1's script: one-off `Overwrite` for every conflict
+                // before `trigger1`, then an `AllRemaining` `Skip` right at
+                // `trigger1` -- nothing scripted after that, since the
+                // sticky answer must cover the rest without consulting
+                // the resolver again.
+                let mut answers = Vec::new();
+                for i in 1..=trigger1 {
+                    if i < trigger1 {
+                        answers.push(ConflictResolution::once(ConflictPolicy::Overwrite));
+                    } else {
+                        answers.push(ConflictResolution::apply_to_all(ConflictPolicy::Skip));
+                    }
+                }
+                // Job 2's own script, appended after job 1's -- if job 1's
+                // sticky state leaked into job 2, these would never be
+                // consumed at all.
+                for i in 1..=trigger2 {
+                    if i < trigger2 {
+                        answers.push(ConflictResolution::once(ConflictPolicy::Skip));
+                    } else {
+                        answers.push(ConflictResolution::apply_to_all(ConflictPolicy::Overwrite));
+                    }
+                }
+                let resolver = Arc::new(ScriptedResolver::new(answers));
+                let resolver_dyn: Arc<dyn ConflictResolver> = resolver.clone();
+
+                let (job1_sources, job1_dests) = make_conflicting_files(dir.path(), "job1", n1);
+                let plan1 = Plan::new(copy_steps(&job1_sources, &job1_dests), PlanOptions::default());
+                let (report1, _events1) = run_with_resolver(
+                    Arc::new(LocalFs),
+                    plan1,
+                    state1.path(),
+                    1,
+                    Some(Arc::clone(&resolver_dyn)),
+                )
+                .await;
+
+                prop_assert!(report1.errors.is_empty(), "{:?}", report1.errors);
+                prop_assert_eq!(
+                    resolver.call_count(),
+                    trigger1,
+                    "job 1 must stop consulting the resolver right after its own apply-to-all answer"
+                );
+                for (i, d) in job1_dests.iter().enumerate() {
+                    let n = i + 1;
+                    let content = std::fs::read(d).unwrap();
+                    if n < trigger1 {
+                        prop_assert_eq!(content, b"new".to_vec());
+                    } else {
+                        prop_assert_eq!(content, b"old".to_vec());
+                    }
+                }
+
+                let (job2_sources, job2_dests) = make_conflicting_files(dir.path(), "job2", n2);
+                let plan2 = Plan::new(copy_steps(&job2_sources, &job2_dests), PlanOptions::default());
+                let (report2, _events2) = run_with_resolver(
+                    Arc::new(LocalFs),
+                    plan2,
+                    state2.path(),
+                    1,
+                    Some(Arc::clone(&resolver_dyn)),
+                )
+                .await;
+
+                prop_assert!(report2.errors.is_empty(), "{:?}", report2.errors);
+                prop_assert_eq!(
+                    resolver.call_count(),
+                    trigger1 + trigger2,
+                    "job 2 must independently consult the resolver for its own conflicts -- \
+                     if job 1's sticky answer had leaked, job 2 would never call the resolver \
+                     at all"
+                );
+                for (i, d) in job2_dests.iter().enumerate() {
+                    let n = i + 1;
+                    let content = std::fs::read(d).unwrap();
+                    if n < trigger2 {
+                        prop_assert_eq!(content, b"old".to_vec());
+                    } else {
+                        prop_assert_eq!(content, b"new".to_vec());
+                    }
+                }
+
+                Ok(())
+            })?;
+        }
     }
 }

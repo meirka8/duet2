@@ -27,10 +27,17 @@
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
 //!   See its own module doc comment for the (deliberately disclosed)
-//!   scope cuts — conflict resolution, retry/backoff, ETA, and multi-job
-//!   queueing are each a separate, later task.
-//! - [`conflict`] — the FR-OPS-04 policy set and the per-conflict prompt
-//!   data the UI needs.
+//!   scope cuts — retry/backoff, ETA, and multi-job queueing are each a
+//!   separate, later task.
+//! - [`conflict`] — T-5.1.9: the FR-OPS-04 policy set, the per-conflict
+//!   prompt data the UI needs, and [`conflict::ConflictResolver`], the seam
+//!   a live UI (or a test) plugs into. All seven TC policies are real,
+//!   resolved by the executor in design.md §9.3's own tiering, highest
+//!   precedence first: a `Step`'s own pre-resolved `conflict` field (set
+//!   once, at plan time) → an already-established per-job "apply to all"
+//!   answer → a live `ConflictResolver`, if `execute()` was given one →
+//!   `PlanOptions::default_conflict` (the job-level default, and the only
+//!   tier available with no live resolver at all).
 //! - [`job`] / [`event`] — the queued unit and the event stream a UI (or
 //!   test harness) subscribes to instead of polling (design.md §8.2).
 //! - [`journal`] — T-5.1.2, the FR-OPS-07 crash-safety backbone:
@@ -51,7 +58,9 @@ mod plan;
 mod planner;
 mod step;
 
-pub use conflict::{ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope};
+pub use conflict::{
+    ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
+};
 pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
 pub use job::{Job, JobId, JobKind, JobOutcome, JobReport, JobState, SkipEntry, StepFailure};

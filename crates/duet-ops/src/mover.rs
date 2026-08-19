@@ -326,7 +326,7 @@ mod tests {
         let journal = Journal::open(JobId(job_id), state_dir).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        execute(fs, JobId(job_id), plan, journal, 2, tx, control).await
+        execute(fs, JobId(job_id), plan, journal, 2, tx, control, None).await
     }
 
     /// A `FileSystem` test double wrapping a real [`LocalFs`], whose `stat`
@@ -659,15 +659,16 @@ mod tests {
         assert!(dst.path().join(src_name).join("a.txt").exists());
 
         // Run 2: the full plan, re-attempting everything from scratch --
-        // both the CreateDir and CopyFile steps now hit Conflict (already
-        // exist) and are Skipped, not Succeeded.
+        // the CreateDir merges silently into the already-existing
+        // directory (T-5.1.9's own fix: that's normal, not a conflict),
+        // while the CopyFile step hits a real Conflict (already exists)
+        // and is Skipped, not Succeeded.
         let second = run(Arc::clone(&fs), 6, plan, state.path()).await;
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert_eq!(
             second.skipped.len(),
-            2,
-            "the re-attempted CreateDir and CopyFile must both be Skipped (Conflict), \
-             not Succeeded"
+            1,
+            "the re-attempted CopyFile must be Skipped (Conflict), not Succeeded"
         );
         assert!(
             !src.path().join("a.txt").exists(),

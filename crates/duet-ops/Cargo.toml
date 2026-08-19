@@ -49,3 +49,9 @@ tempfile = "3.12"
 # `executor.rs`'s `TestFs`. Same reasoning `duet-vfs` itself already gives
 # for depending on `async-trait`: real async-fn-in-trait isn't object-safe.
 async-trait.workspace = true
+# T-5.1.9's AC calls for "a property test over random conflict sequences" --
+# already a workspace dependency (`duet-types`/`duet-index` use it for path
+# round-tripping and mask matching per design.md §14.1), used here to hammer
+# the sticky "apply to all" state machine across random-length conflict
+# sequences and random trigger positions.
+proptest.workspace = true
