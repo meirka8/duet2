@@ -1659,6 +1659,7 @@ version = "0.1.0"
 name = "duet-ops"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "duet-types",
  "duet-vfs",
  "futures-util",
