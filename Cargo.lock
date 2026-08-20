@@ -1729,6 +1729,7 @@ dependencies = [
  "duet-commands",
  "duet-config",
  "duet-index",
+ "duet-ops",
  "duet-types",
  "duet-vfs",
  "duet-widgets",

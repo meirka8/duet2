@@ -106,6 +106,35 @@ pub struct TokenPalette {
 
 impl Global for TokenPalette {}
 
+/// Transient interaction state layered on top of whichever theme is
+/// currently installed -- distinct from [`TokenPalette`] itself, which
+/// represents the *configured* theme (swapped wholesale on a theme
+/// change, T-4.1.5's hot reload). See [`suppress_row_hover`]'s own doc
+/// comment for what this exists to fix.
+struct HoverSuppression {
+    /// The real, configured `table_hover` color -- captured whenever
+    /// [`TokenPalette::install`] computes it, so [`unsuppress_row_hover`]
+    /// has something to restore regardless of which theme was active
+    /// when suppression started.
+    real_table_hover: Hsla,
+    suppressed: bool,
+}
+
+impl Global for HoverSuppression {}
+
+/// Fully transparent -- what [`suppress_row_hover`] swaps `table_hover`
+/// to. Alpha `0.0` paints nothing no matter what `h`/`s`/`l` are, which is
+/// what makes this work as a *global* override: a single flat color can't
+/// otherwise be "invisible" against every row's own different background
+/// (cursor/selected/stripe/plain all differ), but full transparency is
+/// invisible against all of them at once.
+const HOVER_SUPPRESSED_COLOR: Hsla = Hsla {
+    h: 0.,
+    s: 0.,
+    l: 0.,
+    a: 0.,
+};
+
 /// `#rrggbb`/`#rrggbbaa` -> [`Hsla`]. Returns `None` (rather than a hard
 /// error) on a malformed hex string so one bad token in a hand-edited
 /// theme file degrades to the built-in default for that token instead of
@@ -532,6 +561,27 @@ impl TokenPalette {
             // coincide.
             theme.table_hover = self.color.tab_active_bg;
         }
+        // T-5.2.1 (post-UAT, hover suppression): the real, configured
+        // hover color to restore whenever `unsuppress_row_hover` is next
+        // called -- tracked separately from `Theme::table_hover` itself,
+        // which `suppress_row_hover` may currently be overriding with
+        // `HOVER_SUPPRESSED_COLOR`. Re-applies the override immediately
+        // if suppression was already active, so a theme hot-reload
+        // (T-4.1.5) mid-suppression doesn't make hover flash visible
+        // again for one frame.
+        let real_table_hover = self.color.tab_active_bg;
+        if cx.has_global::<HoverSuppression>() {
+            let suppressed = cx.global::<HoverSuppression>().suppressed;
+            cx.global_mut::<HoverSuppression>().real_table_hover = real_table_hover;
+            if suppressed && cx.has_global::<Theme>() {
+                Theme::global_mut(cx).table_hover = HOVER_SUPPRESSED_COLOR;
+            }
+        } else {
+            cx.set_global(HoverSuppression {
+                real_table_hover,
+                suppressed: false,
+            });
+        }
         cx.set_global(self);
     }
 
@@ -543,6 +593,62 @@ impl TokenPalette {
     pub fn current(cx: &App) -> &TokenPalette {
         cx.global::<TokenPalette>()
     }
+}
+
+/// Suppresses every file table's row-hover highlight (`gpui_component`'s
+/// own `Table` row renderer, `table_hover` -- see [`TokenPalette::install`]'s
+/// own doc comment) until the next [`unsuppress_row_hover`] call.
+///
+/// T-5.2.1 UAT: a row the mouse happened to be resting on -- typically
+/// because it was the row most recently clicked -- kept showing the gray
+/// hover background indefinitely, confusingly independent of wherever the
+/// keyboard cursor had since moved to, since GPUI's hover pseudo-state is
+/// purely real-mouse-position-driven and gets re-evaluated every frame
+/// regardless of keyboard state. `gpui_component`'s own `Table` widget
+/// applies its hover style from inside its own row-rendering code (not
+/// something `duet-ui`'s delegate can intercept per-row -- confirmed by
+/// reading `gpui-component-0.5.1/src/table/state.rs`), so the only lever
+/// available is this crate's own facade over the *global* `table_hover`
+/// color: swapping it to fully transparent makes hover paint nothing at
+/// all, everywhere, until it's restored.
+///
+/// Callers: `duet-ui`'s file table calls this on every keyboard-driven
+/// row action (a `capture_key_down` listener on its own render root, so
+/// it sees every keystroke unconditionally, not just the ones it happens
+/// to also bind an action to) and calls `unsuppress_row_hover` back on
+/// the next real mouse-move over the table -- hover feedback returns the
+/// instant the mouse is genuinely back in use.
+pub fn suppress_row_hover(cx: &mut App) {
+    if !cx.has_global::<HoverSuppression>() || cx.global::<HoverSuppression>().suppressed {
+        return;
+    }
+    cx.global_mut::<HoverSuppression>().suppressed = true;
+    if cx.has_global::<Theme>() {
+        Theme::global_mut(cx).table_hover = HOVER_SUPPRESSED_COLOR;
+    }
+}
+
+/// Restores the real, configured row-hover color -- see
+/// [`suppress_row_hover`]'s own doc comment.
+pub fn unsuppress_row_hover(cx: &mut App) {
+    if !cx.has_global::<HoverSuppression>() || !cx.global::<HoverSuppression>().suppressed {
+        return;
+    }
+    let real = cx.global::<HoverSuppression>().real_table_hover;
+    cx.global_mut::<HoverSuppression>().suppressed = false;
+    if cx.has_global::<Theme>() {
+        Theme::global_mut(cx).table_hover = real;
+    }
+}
+
+/// `true` while row hover is suppressed -- introspection for tests
+/// (asserting the effect of [`suppress_row_hover`]/[`unsuppress_row_hover`]
+/// without needing a real rendered table/mouse hitbox), and a reasonable
+/// thing for a caller to check regardless. `false` before
+/// [`TokenPalette::install`] has ever run (nothing to suppress yet).
+pub fn row_hover_suppressed(cx: &App) -> bool {
+    cx.try_global::<HoverSuppression>()
+        .is_some_and(|s| s.suppressed)
 }
 
 #[cfg(test)]
@@ -598,5 +704,92 @@ mod tests {
         let light = TokenPalette::built_in(ThemeMode::Light);
         assert_ne!(dark.color.panel_bg_active, light.color.panel_bg_active);
         assert_ne!(dark.color.panel_fg_active, light.color.panel_fg_active);
+    }
+
+    // -- T-5.2.1 (post-UAT): row-hover suppression -------------------------
+
+    #[gpui::test]
+    fn suppress_row_hover_makes_table_hover_fully_transparent(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            TokenPalette::built_in(ThemeMode::Dark).install(cx);
+            let before = Theme::global(cx).table_hover;
+            assert_ne!(
+                before.a, 0.,
+                "the built-in theme's own configured hover color must not already be transparent"
+            );
+
+            suppress_row_hover(cx);
+            assert!(row_hover_suppressed(cx));
+            assert_eq!(Theme::global(cx).table_hover.a, 0.);
+        });
+    }
+
+    #[gpui::test]
+    fn unsuppress_row_hover_restores_the_real_configured_color(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            TokenPalette::built_in(ThemeMode::Dark).install(cx);
+            let real = Theme::global(cx).table_hover;
+
+            suppress_row_hover(cx);
+            unsuppress_row_hover(cx);
+
+            assert!(!row_hover_suppressed(cx));
+            assert_eq!(Theme::global(cx).table_hover, real);
+        });
+    }
+
+    #[gpui::test]
+    fn suppress_and_unsuppress_are_idempotent(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            TokenPalette::built_in(ThemeMode::Dark).install(cx);
+
+            // Calling either twice in a row must not panic or corrupt the
+            // "real" color it would eventually restore.
+            suppress_row_hover(cx);
+            suppress_row_hover(cx);
+            assert_eq!(Theme::global(cx).table_hover.a, 0.);
+
+            unsuppress_row_hover(cx);
+            unsuppress_row_hover(cx);
+            assert!(!row_hover_suppressed(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn reinstalling_the_theme_while_suppressed_keeps_it_suppressed_with_the_new_color(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::init(cx);
+            TokenPalette::built_in(ThemeMode::Dark).install(cx);
+            suppress_row_hover(cx);
+            assert_eq!(Theme::global(cx).table_hover.a, 0.);
+
+            // T-4.1.5's hot reload: a different theme installs while
+            // suppression is still active.
+            let light = TokenPalette::built_in(ThemeMode::Light);
+            let light_hover = light.color.tab_active_bg;
+            light.install(cx);
+
+            assert!(
+                row_hover_suppressed(cx),
+                "a theme swap must not silently clear suppression"
+            );
+            assert_eq!(
+                Theme::global(cx).table_hover.a,
+                0.,
+                "hover must stay invisible through the swap, not flash the new theme's color"
+            );
+
+            unsuppress_row_hover(cx);
+            assert_eq!(
+                Theme::global(cx).table_hover,
+                light_hover,
+                "unsuppressing after a swap must restore the *new* theme's color, not the stale one"
+            );
+        });
     }
 }

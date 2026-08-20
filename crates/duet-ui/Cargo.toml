@@ -43,6 +43,11 @@ duet-commands = { path = "../duet-commands" }
 # existing round-trip/versioning/watch layer rather than duet-ui inventing
 # its own file I/O.
 duet-config = { path = "../duet-config" }
+# T-5.2.1: the F5/F6 copy/move dialog (`src/copy_move_dialog.rs`) is the
+# first thing in `duet-ui` to drive the operation engine -- `duet-ops`'s
+# planner/executor/queue (T-5.1.1..T-5.1.13) are all already real and
+# tested; this is only the UI wiring on top.
+duet-ops = { path = "../duet-ops" }
 # The executor-wiring demo (AC: "the core's async tasks drive UI updates
 # through the foreground executor") needs a real multi-threaded Tokio
 # runtime distinct from GPUI's own executor -- "rt-multi-thread" to build

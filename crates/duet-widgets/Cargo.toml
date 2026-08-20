@@ -32,3 +32,12 @@ workspace = true
 # call site.
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+
+[dev-dependencies]
+# T-5.2.1 (post-UAT): the hover-suppression global (`theme.rs`'s
+# `HoverSuppression`) can only be exercised against a real `App`/`cx` --
+# `#[gpui::test]`'s `TestAppContext` is GPUI's own answer to that (a fake
+# platform, real enough to touch real globals, no actual display
+# connection needed), same reasoning `duet-ui`'s own `[dev-dependencies]`
+# gpui override already documents.
+gpui = { version = "0.2.2", features = ["test-support"] }

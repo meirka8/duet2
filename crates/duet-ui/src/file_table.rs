@@ -52,7 +52,7 @@ use duet_widgets::menu::{PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
 };
-use duet_widgets::theme::TokenPalette;
+use duet_widgets::theme::{TokenPalette, suppress_row_hover, unsuppress_row_hover};
 use futures_util::StreamExt;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -856,8 +856,13 @@ impl FileTableDelegate {
     /// Moves the cursor directly to `row` (display-row terms, like
     /// `move_cursor_by`), clamped into range (so `usize::MAX` is a
     /// convenient "last row" for End/Ctrl+End). Ends any in-progress
-    /// range-select session, same as `move_cursor_by`.
-    fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
+    /// range-select session, same as `move_cursor_by`. `pub(crate)` (not
+    /// just used within this module any more) -- `copy_move_dialog.rs`'s
+    /// own tests (T-5.2.1) need it to park the cursor on the synthetic
+    /// ".." row and confirm `resolve_source_names` correctly treats that
+    /// as "nothing usable," same reasoning as `local_vpath`'s own
+    /// visibility bump.
+    pub(crate) fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
         let len = self.display_rows_count();
         if len == 0 {
             return None;
@@ -2479,6 +2484,44 @@ impl FileTable {
         self.navigate_to(dir, true, None, window, cx);
     }
 
+    /// Re-lists this table's own `current_dir` in place -- no history
+    /// entry (this isn't a navigation, `current_dir` doesn't change), and
+    /// deliberately bypasses `navigate_to`'s locked-tab redirect: a
+    /// locked tab still needs to reflect what `current_dir` actually
+    /// contains right now, since locking only guards against navigating
+    /// *elsewhere*, not against seeing real, current content in place.
+    /// T-5.2.1: called on both panels once a background copy/move job
+    /// finishes (`Workspace::render`'s `pending_panel_refresh` drain), so
+    /// a panel showing a directory that job touched picks up what's
+    /// really on disk instead of showing stale rows (moved-away sources,
+    /// missing new destinations) until the user manually re-navigates.
+    /// Shares `navigate_to`'s reload steps (quick-search invalidation,
+    /// generation bump, `spawn_directory_load`/`spawn_volume_stats_load`)
+    /// but not its `window`/lock-redirect handling -- nothing here needs
+    /// a live `Window`.
+    pub(crate) fn reread_current_dir(&mut self, cx: &mut Context<Self>) {
+        let dir = self.current_dir.clone();
+        self.exit_quick_search(cx);
+        cx.emit(FileTableEvent::DirectoryChanged);
+        let (generation, sort_options) = self.state.update(cx, |state, cx| {
+            let generation = state.delegate_mut().bump_nav_generation();
+            let sort_options = state.delegate().model().sort_options();
+            state.delegate_mut().set_loading(true);
+            cx.notify();
+            (generation, sort_options)
+        });
+        spawn_directory_load(
+            dir.clone(),
+            self.tokio_handle.clone(),
+            self.state.clone(),
+            None,
+            (sort_options.column, sort_options.ascending),
+            generation,
+            cx,
+        );
+        spawn_volume_stats_load(dir, self.tokio_handle.clone(), generation, cx);
+    }
+
     fn navigate_to(
         &mut self,
         dir: PathBuf,
@@ -2647,6 +2690,24 @@ impl Render for FileTable {
             // ever run (confirmed by reading `gpui-0.2.2/src/window.rs`)
             // -- so this listener only ever sees keystrokes nothing else
             // already claimed.
+            // T-5.2.1 (post-UAT, hover suppression): a capture-phase
+            // listener sees *every* keydown reaching this table,
+            // unconditionally -- unlike the bubble-phase `on_key_down`
+            // just below, which (per its own doc comment) only ever
+            // fires for a keystroke nothing else already claimed. Bound
+            // actions (`CursorUp`/`CursorDown`/etc.) stop bubble-phase
+            // propagation before that listener would ever see them, but
+            // the capture phase runs *first*, before any of that -- the
+            // one real choke point that covers every keyboard-driven row
+            // action without needing a call sprinkled into each of the
+            // dozen or so `on_action` handlers below individually. See
+            // `duet_widgets::theme::suppress_row_hover`'s own doc
+            // comment for what this fixes and why the counterpart
+            // (`unsuppress_row_hover`, on real mouse movement) is on this
+            // same root div rather than per-row.
+            .capture_key_down(|_event, _window, cx| {
+                suppress_row_hover(cx);
+            })
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     let modifiers = &event.keystroke.modifiers;
@@ -2676,6 +2737,15 @@ impl Render for FileTable {
                     window.focus(&this.focus_handle);
                 }),
             )
+            // The other half of the hover-suppression fix above: any real
+            // mouse movement anywhere within this table (not just over a
+            // specific row -- `Div::on_mouse_move` fires whenever the
+            // pointer is within *this* element's own hitbox, which
+            // encloses every row) means the mouse is genuinely back in
+            // use, so hover feedback should resume immediately.
+            .on_mouse_move(|_event, _window, cx| {
+                unsuppress_row_hover(cx);
+            })
             .on_action(cx.listener(|this, _: &CursorUp, _window, cx| {
                 this.exit_quick_search_if_jump(cx);
                 this.move_cursor(-1, cx);
@@ -2947,8 +3017,11 @@ fn spawn_directory_load(
 }
 
 /// Converts `dir` into a local `VPath` -- the shared first step every
-/// `LocalFs` call this module makes off the UI thread needs.
-fn local_vpath(dir: &std::path::Path) -> Result<VPath, String> {
+/// `LocalFs` call this module makes off the UI thread needs. `pub(crate)`
+/// (not just used within this module any more) -- `copy_move_dialog.rs`
+/// (T-5.2.1) needs the exact same conversion for its `sources`/`dest_dir`
+/// `VPath`s and there's no reason to duplicate this one-liner.
+pub(crate) fn local_vpath(dir: &std::path::Path) -> Result<VPath, String> {
     let path_str = dir
         .to_str()
         .ok_or_else(|| "directory path is not valid UTF-8".to_string())?;
