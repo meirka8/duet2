@@ -29,7 +29,7 @@ pub enum CopyOutcome {
     /// mounts) cannot accelerate the copy. The caller must fall back to
     /// `open_read` + `open_write` + the copy-strategy ladder.
     Unsupported,
-    /// `should_cancel` returned `true` before the copy finished. The
+    /// `on_progress` returned `true` before the copy finished. The
     /// destination is left exactly as a `SIGKILL` at that same point would
     /// have (per `docs/crash-safety.md`'s `CopyFile`/`Reflink` invariants,
     /// which this outcome deliberately mirrors rather than sidesteps): if

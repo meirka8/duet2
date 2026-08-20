@@ -258,16 +258,32 @@ pub trait FileSystem: Send + Sync {
     /// — not an error — when this backend/path pair can't accelerate the
     /// copy; see [`CopyOutcome`]'s doc comment.
     ///
-    /// `should_cancel` is polled periodically for backends whose
-    /// acceleration isn't a single atomic syscall (T-5.1.4's copy-strategy
-    /// ladder: `LocalFs` chains `FICLONE` → `copy_file_range` → a
-    /// sparse-aware buffered copy, and the last two rungs can each run for
-    /// a genuinely long time on a large file). Returning `true` from it may
-    /// produce `Ok(CopyOutcome::Interrupted)` instead of completing — see
-    /// that variant's own doc comment for what state the destination is
-    /// left in. A backend whose acceleration really is one atomic syscall
-    /// (or that has no acceleration to offer at all) is free to never call
-    /// `should_cancel`.
+    /// `on_progress` serves two purposes at once, not two separate
+    /// callbacks, because every call site that needs one also needs the
+    /// other at exactly the same cadence: it is both this copy's *only*
+    /// incremental progress signal (the caller has no other way to learn
+    /// how many bytes of an in-flight accelerated copy have actually
+    /// landed — this is one opaque call from the caller's point of view)
+    /// and its cancellation check. `bytes` is the number of real bytes
+    /// transferred since the *previous* call to `on_progress` (not a
+    /// running total) — `0` is a valid, meaningful call too ("still here,
+    /// nothing new to report since last time, but still checking whether
+    /// to cancel"), not an error or a no-op to be skipped. Return `true` to
+    /// cancel.
+    ///
+    /// Called periodically for backends whose acceleration isn't a single
+    /// atomic syscall (T-5.1.4's copy-strategy ladder: `LocalFs` chains
+    /// `FICLONE` → `copy_file_range` → a sparse-aware buffered copy, and
+    /// the last two rungs can each run for a genuinely long time on a large
+    /// file, and can each report real incremental byte counts as they go).
+    /// Returning `true` may produce `Ok(CopyOutcome::Interrupted)` instead
+    /// of completing — see that variant's own doc comment for what state
+    /// the destination is left in. A backend whose acceleration really is
+    /// one atomic syscall (or that has no acceleration to offer at all) is
+    /// free to never call `on_progress`, or to call it once with the whole
+    /// size and ignore its return value (there is nothing left to
+    /// interrupt by the time an atomic syscall has already completed) —
+    /// see `LocalFs`'s `FICLONE` rung for exactly that case.
     ///
     /// # Errors
     /// Only for genuine failures, never for "can't accelerate":
@@ -284,6 +300,6 @@ pub trait FileSystem: Send + Sync {
         &self,
         from: &VPath,
         to: &VPath,
-        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+        on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
     ) -> Result<CopyOutcome>;
 }

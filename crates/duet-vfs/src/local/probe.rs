@@ -250,11 +250,16 @@ pub fn same_mount(a: &VPath, b: &VPath) -> Result<bool> {
 /// `copy_file_range` is kernel-side (no userspace buffer bounce), so this
 /// isn't about I/O throughput the way a buffered read/write chunk size is
 /// -- it exists purely to bound how long a single call can run before
-/// `accelerated_copy`'s loop gets a chance to check `should_cancel` again.
+/// `accelerated_copy`'s loop gets a chance to check `on_progress` again.
 /// 64 MiB: comfortably large enough that syscall-dispatch overhead stays
 /// negligible relative to the copy itself, comfortably small enough that
 /// even a slow destination can't turn one call into a multi-second gap in
-/// cancellation responsiveness.
+/// cancellation responsiveness. This is now also the progress-reporting
+/// granularity (`on_progress` is called once per completed chunk, with
+/// that chunk's real byte count) -- the same bound that was already chosen
+/// for cancellation latency turns out to be exactly the right size for
+/// "how chunky is too chunky" on the progress-reporting side too, so no
+/// separate constant was introduced for it.
 const COPY_FILE_RANGE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// `FileSystem::server_side_copy`'s implementation, and the natural first
@@ -268,7 +273,7 @@ const COPY_FILE_RANGE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 pub fn accelerated_copy(
     from: &VPath,
     to: &VPath,
-    should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
 ) -> Result<crate::CopyOutcome> {
     guard::assert_not_ui_thread();
     let from_path = real_path(from);
@@ -314,6 +319,16 @@ pub fn accelerated_copy(
         .flatten()
         .unwrap_or(false);
     if same_device && fs::ioctl_ficlone(&dst_fd, &src_fd).is_ok() {
+        // A FICLONE reflink is one atomic syscall -- by the time it has
+        // returned success, the whole file is already cloned, so there is
+        // nothing left in flight to interrupt. Still report the full size
+        // (the caller has no other way to learn how many bytes this
+        // "copy" represents), but deliberately ignore the return value:
+        // honoring a cancellation request here would mean unwinding a
+        // reflink that has already atomically succeeded, which isn't
+        // "interrupting a copy," it's "discarding a completed one" -- a
+        // different, and here unwanted, operation.
+        let _ = on_progress(size);
         return Ok(crate::CopyOutcome::Copied {
             bytes: size,
             reflinked: true,
@@ -323,10 +338,6 @@ pub fn accelerated_copy(
     let mut remaining = size;
     let mut total = 0u64;
     while remaining > 0 {
-        if should_cancel() {
-            let _ = fs::unlinkat(CWD, &to_path, fs::AtFlags::empty());
-            return Ok(crate::CopyOutcome::Interrupted);
-        }
         let chunk = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(COPY_FILE_RANGE_CHUNK_BYTES);
@@ -335,6 +346,16 @@ pub fn accelerated_copy(
             Ok(n) => {
                 total += n as u64;
                 remaining -= n as u64;
+                // Check for cancellation *after* a chunk lands, using the
+                // real byte count just transferred, rather than before --
+                // this is the same real-world cancellation granularity as
+                // a pre-check (still at most one `COPY_FILE_RANGE_CHUNK_
+                // BYTES`-sized chunk of latency), but it also means there
+                // is always genuine new progress to report on every call.
+                if on_progress(n as u64) {
+                    let _ = fs::unlinkat(CWD, &to_path, fs::AtFlags::empty());
+                    return Ok(crate::CopyOutcome::Interrupted);
+                }
             }
             Err(Errno::XDEV | Errno::NOSYS | Errno::OPNOTSUPP) if total == 0 => {
                 // Nothing written yet via copy_file_range -- try the
@@ -348,7 +369,7 @@ pub fn accelerated_copy(
                     from,
                     to,
                     &to_path,
-                    should_cancel,
+                    on_progress,
                 );
             }
             Err(e) => {
@@ -403,6 +424,24 @@ const FADVISE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 /// everything else). Best-effort throughout: a failed `fadvise` call never
 /// fails the copy, it just means this particular chunk didn't get the
 /// cache-pressure hint.
+///
+/// # Progress accounting for sparse sources: a known, disclosed gap
+///
+/// `on_progress` is called with real bytes transferred as each chunk is
+/// written (mid-extent), plus a `0`-byte heartbeat call between extents
+/// (no bytes moved since the last check, but still a chance to observe
+/// cancellation at the same cadence as before). Holes are, by design,
+/// never read or written at all -- so for a genuinely sparse source, the
+/// sum of every `on_progress` call this function makes can legitimately
+/// fall *short* of `size` (a hole contributes nothing to that sum, but
+/// still counts toward the file's logical length). This function does not
+/// try to paper over that with a "phantom" report for bytes it never
+/// touched; the caller (`copy_file_step` in `duet-ops`) is expected to
+/// credit the difference itself as a final top-up once this returns
+/// `Copied`, exactly the way it already has to reconcile `Copied::bytes`
+/// (which *is* the accurate total, holes included via the final
+/// `ftruncate` below) against whatever was reported incrementally along
+/// the way.
 #[allow(clippy::too_many_arguments)]
 fn sparse_buffered_copy(
     src_fd: &OwnedFd,
@@ -411,7 +450,7 @@ fn sparse_buffered_copy(
     from: &VPath,
     to: &VPath,
     to_path: &Path,
-    should_cancel: &(dyn Fn() -> bool + Send + Sync),
+    on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
 ) -> Result<crate::CopyOutcome> {
     let fail = |op: &'static str, path: &VPath, e: Errno| -> Box<duet_types::VfsError> {
         let _ = fs::unlinkat(CWD, to_path, fs::AtFlags::empty());
@@ -428,7 +467,12 @@ fn sparse_buffered_copy(
     let mut fadvise_applied_up_to = 0u64;
 
     loop {
-        if should_cancel() {
+        // Between extents: no bytes have moved since the last check within
+        // this same extent-to-extent gap, so this is a `0`-byte heartbeat
+        // -- still real and meaningful (it's what gives the caller a
+        // chance to signal cancellation at this same cadence), just with
+        // nothing new to report.
+        if on_progress(0) {
             return interrupted();
         }
 
@@ -455,9 +499,6 @@ fn sparse_buffered_copy(
 
         let mut cursor = data_start;
         while cursor < data_end {
-            if should_cancel() {
-                return interrupted();
-            }
             let want = usize::try_from(data_end - cursor)
                 .unwrap_or(usize::MAX)
                 .min(SPARSE_COPY_BUFFER_BYTES);
@@ -486,6 +527,15 @@ fn sparse_buffered_copy(
                 let len = NonZeroU64::new(total - fadvise_applied_up_to);
                 let _ = fs::fadvise(src_fd, fadvise_applied_up_to, len, fs::Advice::DontNeed);
                 fadvise_applied_up_to = total;
+            }
+
+            // Checked *after* the chunk is written, using the real byte
+            // count just copied, rather than before -- same reasoning as
+            // `accelerated_copy`'s `copy_file_range` loop: identical
+            // real-world cancellation latency, but every call now also
+            // carries genuine new progress.
+            if on_progress(n as u64) {
+                return interrupted();
             }
         }
         pos = data_end;
@@ -719,7 +769,8 @@ mod tests {
         let from = vp(&dir).join("sparse.src").unwrap();
         let to = vp(&dir).join("sparse.src.dst").unwrap();
         let outcome =
-            sparse_buffered_copy(&src_fd, &dst_fd, size, &from, &to, &dst_path, &|| false).unwrap();
+            sparse_buffered_copy(&src_fd, &dst_fd, size, &from, &to, &dst_path, &|_| false)
+                .unwrap();
         // `SEEK_HOLE`/`SEEK_DATA` round to filesystem block granularity
         // (4096 bytes on this machine's tmpfs, confirmed via `getconf
         // PAGESIZE` -- true of every real sparse-file implementation, not
@@ -771,18 +822,12 @@ mod tests {
         let to = vp(&dir).join("big.src.dst").unwrap();
 
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let should_cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let on_progress =
+            |_bytes: u64| calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
 
-        let outcome = sparse_buffered_copy(
-            &src_fd,
-            &dst_fd,
-            size,
-            &from,
-            &to,
-            &dst_path,
-            &should_cancel,
-        )
-        .unwrap();
+        let outcome =
+            sparse_buffered_copy(&src_fd, &dst_fd, size, &from, &to, &dst_path, &on_progress)
+                .unwrap();
         assert_eq!(outcome, crate::CopyOutcome::Interrupted);
         assert!(
             !dst_path.exists(),
@@ -791,7 +836,7 @@ mod tests {
         );
     }
 
-    /// The `copy_file_range` loop's own `should_cancel` check (rung 2 of
+    /// The `copy_file_range` loop's own `on_progress` cancellation check (rung 2 of
     /// T-5.1.4's ladder) -- distinct from `sparse_buffered_copy`'s own
     /// check above (rung 3). tmpfs has no `FICLONE` support (confirmed by
     /// `probes_tmpfs_correctly` below) but happily services
@@ -808,9 +853,10 @@ mod tests {
         let from = vp(&dir).join("big.src").unwrap();
         let to = vp(&dir).join("big.dst").unwrap();
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let should_cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        let on_progress =
+            |_bytes: u64| calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
 
-        let outcome = accelerated_copy(&from, &to, &should_cancel).unwrap();
+        let outcome = accelerated_copy(&from, &to, &on_progress).unwrap();
         assert_eq!(outcome, crate::CopyOutcome::Interrupted);
         assert!(
             !dir.path().join("big.dst").exists(),
@@ -835,7 +881,7 @@ mod tests {
         let from = vp(&dir).join("large.src").unwrap();
         let to = vp(&dir).join("large.src.dst").unwrap();
         let outcome =
-            sparse_buffered_copy(&src_fd, &dst_fd, len as u64, &from, &to, &dst_path, &|| {
+            sparse_buffered_copy(&src_fd, &dst_fd, len as u64, &from, &to, &dst_path, &|_| {
                 false
             })
             .unwrap();
@@ -924,7 +970,7 @@ mod tests {
 
         let from = VPath::local(UnixPathBuf::new(src_path.to_str().unwrap()).unwrap());
         let to = VPath::local(UnixPathBuf::new(dst_path.to_str().unwrap()).unwrap());
-        let outcome = accelerated_copy(&from, &to, &|| false).unwrap();
+        let outcome = accelerated_copy(&from, &to, &|_| false).unwrap();
         assert_eq!(
             outcome,
             crate::CopyOutcome::Copied {
@@ -1011,7 +1057,7 @@ mod tests {
         let (src_fd, dst_fd, _src_path, dst_path) = open_src_and_dst(&dir, "large.src");
         let from = vp(&dir).join("large.src").unwrap();
         let to = vp(&dir).join("large.src.dst").unwrap();
-        sparse_buffered_copy(&src_fd, &dst_fd, len as u64, &from, &to, &dst_path, &|| {
+        sparse_buffered_copy(&src_fd, &dst_fd, len as u64, &from, &to, &dst_path, &|_| {
             false
         })
         .unwrap();
@@ -1095,7 +1141,7 @@ mod tests {
         let from = VPath::local(UnixPathBuf::new(src_path.to_str().unwrap()).unwrap());
         let to = VPath::local(UnixPathBuf::new(ours_dst.to_str().unwrap()).unwrap());
         let start = std::time::Instant::now();
-        accelerated_copy(&from, &to, &|| false).unwrap();
+        accelerated_copy(&from, &to, &|_| false).unwrap();
         let ours = start.elapsed();
 
         let cp_dst = dir.path().join("cp.dst");
@@ -1119,6 +1165,159 @@ mod tests {
             ours.as_secs_f64() <= cp_time.as_secs_f64() * 1.0526,
             "our copy took {ours:?}, cp took {cp_time:?} ({ratio:.3}x) -- T-5.1.4's own AC \
              requires \u{2265}95% of cp's throughput"
+        );
+    }
+
+    /// The bug this whole fix targets, verified at its actual source: the
+    /// `copy_file_range` loop (rung 2) used to only ever check
+    /// `should_cancel()`, with no way to tell the caller how many bytes
+    /// had actually moved -- `duet-ops`'s executor could only credit a
+    /// file's entire size in one lump once `accelerated_copy` returned,
+    /// which broke both live throughput (reads `0 B/s` between that one
+    /// jump) and the ETA estimator (the single huge jump inflates the EWMA
+    /// rate, which then holds steady instead of decaying). Runs by
+    /// default at 200 MiB (a few real `copy_file_range` chunks, comfortably
+    /// fast on tmpfs -- no `DUET_BENCH_*` gate needed, unlike the
+    /// throughput-comparison benchmark above, which needs GiB scale and
+    /// real wall-clock comparison against `cp` to mean anything; this test
+    /// only needs *multiple* chunks to exist, not any particular speed).
+    #[test]
+    fn accelerated_copy_reports_incremental_progress_via_copy_file_range() {
+        let dir = TempDir::new().unwrap();
+        let src_path = dir.path().join("multi_chunk.src");
+        // A little over 3 chunks -- comfortably spans multiple
+        // COPY_FILE_RANGE_CHUNK_BYTES-sized calls (64 MiB each) without an
+        // unreasonably large test fixture.
+        let size = COPY_FILE_RANGE_CHUNK_BYTES as u64 * 3 + 8 * 1024 * 1024;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&src_path).unwrap();
+            let chunk = vec![11u8; 4 * 1024 * 1024];
+            let mut written = 0u64;
+            while written < size {
+                let n = (chunk.len() as u64).min(size - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+
+        let from = vp(&dir).join("multi_chunk.src").unwrap();
+        let to = vp(&dir).join("multi_chunk.dst").unwrap();
+
+        let calls: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let on_progress = |bytes: u64| {
+            calls.lock().unwrap().push(bytes);
+            false // never cancel
+        };
+
+        let outcome = accelerated_copy(&from, &to, &on_progress).unwrap();
+        assert_eq!(
+            outcome,
+            crate::CopyOutcome::Copied {
+                bytes: size,
+                reflinked: false
+            },
+            "tmpfs has no FICLONE (confirmed by probes_tmpfs_correctly), so this must have \
+             gone through the copy_file_range rung, not a reflink"
+        );
+
+        let recorded = calls.into_inner().unwrap();
+        let nonzero: Vec<u64> = recorded.iter().copied().filter(|&b| b > 0).collect();
+        let total: u64 = nonzero.iter().sum();
+        eprintln!(
+            "accelerated_copy_reports_incremental_progress_via_copy_file_range: {} on_progress \
+             call(s) total, {} of them nonzero: {nonzero:?} (summing to {total}, file size {size})",
+            recorded.len(),
+            nonzero.len()
+        );
+        assert!(
+            nonzero.len() > 1,
+            "expected more than one nonzero on_progress call for a {size}-byte file spanning \
+             several {COPY_FILE_RANGE_CHUNK_BYTES}-byte chunks -- got {}: {nonzero:?} (this is \
+             exactly the 'one big jump at the end' bug this fix targets)",
+            nonzero.len()
+        );
+        assert_eq!(
+            total, size,
+            "the sum of every reported chunk must equal the file's real size exactly"
+        );
+        assert!(
+            nonzero.iter().all(|&b| b < size),
+            "no single on_progress call should report the whole file's size at once -- that \
+             would just be the old one-big-jump behaviour under a new name: {nonzero:?}"
+        );
+    }
+
+    /// The `sparse_buffered_copy` half of the same fix: rung 3 must also
+    /// report real incremental progress, not just rung 2. Calls the
+    /// function directly (as `sparse_buffered_copy_preserves_holes_and_
+    /// content` and its siblings above already do) to force rung 3
+    /// specifically, bypassing whatever `copy_file_range` would otherwise
+    /// do -- exactly this module's own established precedent for testing
+    /// this rung in isolation. Uses a dense (non-sparse) source so every
+    /// reported byte comes from the inner (mid-extent) chunk loop, proving
+    /// that loop's own incremental reporting independent of the known,
+    /// disclosed "holes aren't reported" gap `sparse_buffered_copy`'s own
+    /// doc comment already covers.
+    #[test]
+    fn sparse_buffered_copy_reports_incremental_progress() {
+        let dir = TempDir::new().unwrap();
+        let src_path = dir.path().join("dense.src");
+        // Several SPARSE_COPY_BUFFER_BYTES (2 MiB) chunks.
+        let size = SPARSE_COPY_BUFFER_BYTES as u64 * 6;
+        let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src_path, &content).unwrap();
+
+        let (src_fd, dst_fd, _src_path, dst_path) = open_src_and_dst(&dir, "dense.src");
+        let from = vp(&dir).join("dense.src").unwrap();
+        let to = vp(&dir).join("dense.src.dst").unwrap();
+
+        let calls: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let on_progress = |bytes: u64| {
+            calls.lock().unwrap().push(bytes);
+            false // never cancel
+        };
+
+        let outcome =
+            sparse_buffered_copy(&src_fd, &dst_fd, size, &from, &to, &dst_path, &on_progress)
+                .unwrap();
+        assert_eq!(
+            outcome,
+            crate::CopyOutcome::Copied {
+                bytes: size,
+                reflinked: false
+            }
+        );
+        assert_eq!(std::fs::read(&dst_path).unwrap(), content);
+
+        let recorded = calls.into_inner().unwrap();
+        let nonzero: Vec<u64> = recorded.iter().copied().filter(|&b| b > 0).collect();
+        let zero_heartbeats = recorded.len() - nonzero.len();
+        let total: u64 = nonzero.iter().sum();
+        eprintln!(
+            "sparse_buffered_copy_reports_incremental_progress: {} on_progress call(s) total \
+             ({} zero-byte heartbeats between/around extents, {} nonzero mid-extent chunks: \
+             {nonzero:?}), nonzero sum {total} against file size {size}",
+            recorded.len(),
+            zero_heartbeats,
+            nonzero.len()
+        );
+        assert!(
+            nonzero.len() > 1,
+            "expected more than one nonzero on_progress call for a {size}-byte dense file \
+             spanning several {SPARSE_COPY_BUFFER_BYTES}-byte buffers -- got {}: {nonzero:?}",
+            nonzero.len()
+        );
+        // No holes in this source, so (unlike the general sparse case this
+        // function's own doc comment discloses) the reported total must
+        // match the file's real size exactly here -- nothing was skipped.
+        assert_eq!(
+            total, size,
+            "a dense (non-sparse) source has no holes to skip, so every byte must be reported"
+        );
+        assert!(
+            nonzero.iter().all(|&b| b < size),
+            "no single on_progress call should report the whole file's size at once: {nonzero:?}"
         );
     }
 }

@@ -1781,26 +1781,76 @@ async fn copy_file_step(
         Box::new(VfsError::new(ErrorKind::Fatal, e.to_string()).with_path(dest.clone()))
     })?;
 
-    // `used_naive` tracks whether `naive_copy` already accounted for this
-    // file's bytes incrementally (chunk by chunk, as real progress
-    // happened) -- if so, `bytes_done` must NOT also be bumped by
-    // `expected_size` below, or every naively-copied file would be
-    // double-counted. The accelerated path has no chunk-level signal to
-    // hook into (`server_side_copy` is one opaque backend call), so it
-    // still accounts for its whole file in one jump at completion.
-    let mut used_naive = false;
-    let should_cancel = || ctx.control.state() != ControlState::Running;
+    // The accelerated path now reports real incremental byte counts of its
+    // own (T-5.1.4's ladder rungs each call `on_progress` as they go -- see
+    // `local::probe::accelerated_copy`/`sparse_buffered_copy`), so this
+    // closure credits `ctx.counters` directly from those calls, the same
+    // way `naive_copy` already credits its own chunk loop. `credited_this_
+    // attempt` tracks how much *this* attempt has added so it can be
+    // rolled back cleanly if the attempt is interrupted, falls back, or
+    // errors out -- the retry loop restarts the whole step from scratch,
+    // so partial credit must never survive into the next attempt (exactly
+    // `naive_copy`'s existing invariant, extended to this path).
+    let credited_this_attempt = AtomicU64::new(0);
+    let is_large = !is_small_file(expected_size);
+    let on_progress = |bytes: u64| {
+        if bytes > 0 {
+            credited_this_attempt.fetch_add(bytes, Ordering::Relaxed);
+            ctx.counters.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+            if is_large {
+                ctx.counters
+                    .large_bytes_done
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+        ctx.control.state() != ControlState::Running
+    };
     match ctx
         .fs
-        .server_side_copy(source, &partial, &should_cancel)
+        .server_side_copy(source, &partial, &on_progress)
         .await
     {
-        Ok(duet_vfs::CopyOutcome::Copied { .. }) => {}
+        Ok(duet_vfs::CopyOutcome::Copied { .. }) => {
+            // Top up to `expected_size` for whatever this rung didn't (or
+            // structurally can't) report incrementally. This is a no-op
+            // for FICLONE and copy_file_range, which already report the
+            // full size via `on_progress` above; it's not a no-op for
+            // `sparse_buffered_copy`, whose hole-skipping means its own
+            // reported total can fall short of the file's logical size by
+            // design (see that function's own doc comment).
+            let remainder =
+                expected_size.saturating_sub(credited_this_attempt.load(Ordering::Relaxed));
+            if remainder > 0 {
+                ctx.counters
+                    .bytes_done
+                    .fetch_add(remainder, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_add(remainder, Ordering::Relaxed);
+                }
+            }
+        }
         Ok(duet_vfs::CopyOutcome::Unsupported) => {
+            // Roll back whatever this attempt already credited before
+            // falling back to naive_copy, which does its own independent
+            // incremental accounting from zero -- same reasoning as the
+            // Interrupted/error rollback below, just via a different path
+            // (falling back, not retrying).
+            let credited = credited_this_attempt.load(Ordering::Relaxed);
+            if credited > 0 {
+                ctx.counters
+                    .bytes_done
+                    .fetch_sub(credited, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(credited, Ordering::Relaxed);
+                }
+            }
             // Best-effort cleanup of any zero-byte artifact the failed
             // acceleration attempt may have left before falling back.
             let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
-            used_naive = true;
             match naive_copy(ctx, source, &partial, expected_size).await? {
                 StepAttempt::Done(StepOutcome::Succeeded) => {}
                 other => return Ok(other),
@@ -1811,7 +1861,19 @@ async fn copy_file_step(
             // T-5.1.4's ladder) -- the backend already cleaned up its own
             // partial per `CopyOutcome::Interrupted`'s own doc comment.
             // Same handling as `naive_copy`'s own interruption: the
-            // caller's retry loop restarts this whole step from scratch.
+            // caller's retry loop restarts this whole step from scratch,
+            // so this attempt's partial credit must be rolled back first.
+            let credited = credited_this_attempt.load(Ordering::Relaxed);
+            if credited > 0 {
+                ctx.counters
+                    .bytes_done
+                    .fetch_sub(credited, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(credited, Ordering::Relaxed);
+                }
+            }
             return Ok(StepAttempt::Interrupted);
         }
         Err(e) if e.kind() == ErrorKind::Conflict => {
@@ -1819,11 +1881,23 @@ async fn copy_file_step(
         }
         Err(e) => {
             // T-5.1.10: a hard error here (e.g. `ENOSPC`, about to be
-            // retried by the caller) gets the same best-effort cleanup as
-            // the `Unsupported` branch above, for the same reason -- don't
-            // leave a stray, possibly partially-written `.duet-partial-*`
-            // file for a retry to trip over or a full disk to get fuller
-            // from.
+            // retried by the caller) gets the same best-effort cleanup and
+            // rollback as the `Interrupted`/`Unsupported` branches above,
+            // for the same reason -- don't leave a stray, possibly
+            // partially-written `.duet-partial-*` file (or stale byte
+            // credit) for a retry to trip over or a full disk to get
+            // fuller from.
+            let credited = credited_this_attempt.load(Ordering::Relaxed);
+            if credited > 0 {
+                ctx.counters
+                    .bytes_done
+                    .fetch_sub(credited, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(credited, Ordering::Relaxed);
+                }
+            }
             let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
             return Err(e);
         }
@@ -1834,25 +1908,24 @@ async fn copy_file_step(
     match &attempt {
         StepAttempt::Done(StepOutcome::Succeeded) => {
             ctx.counters.files_done.fetch_add(1, Ordering::Relaxed);
-            if !used_naive {
-                ctx.counters
-                    .bytes_done
-                    .fetch_add(expected_size, Ordering::Relaxed);
-            }
-            // T-5.1.11: regime-split counters `EtaEstimator` reads. A small
-            // file's whole size lands in one jump regardless of which copy
-            // path was used (the small regime tracks *file count*, not
-            // bytes); a large file's bytes were already added incrementally
-            // by `naive_copy` when `used_naive`, so only the accelerated
-            // path's single final jump needs it here.
+            // `bytes_done`/`large_bytes_done` are no longer touched here:
+            // both the accelerated path (via `on_progress` above, plus its
+            // top-up to `expected_size`) and the naive fallback (via
+            // `naive_copy`'s own chunk loop, if that's the path this
+            // attempt took) have already credited this file's bytes
+            // incrementally by the time execution reaches this point.
+            // Crediting `expected_size` again here would double-count
+            // every successful copy.
+            //
+            // T-5.1.11: `small_files_done` is a real, unrelated, one-
+            // per-file counter (not bytes) that `EtaEstimator`'s small-file
+            // regime tracks by count rather than by size, so it still
+            // needs an explicit increment regardless of which copy path
+            // was used.
             if is_small_file(expected_size) {
                 ctx.counters
                     .small_files_done
                     .fetch_add(1, Ordering::Relaxed);
-            } else if !used_naive {
-                ctx.counters
-                    .large_bytes_done
-                    .fetch_add(expected_size, Ordering::Relaxed);
             }
         }
         StepAttempt::Done(StepOutcome::Skipped { .. }) => {
@@ -2186,7 +2259,7 @@ mod tests {
             &self,
             from: &VPath,
             to: &VPath,
-            should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(n, Ordering::SeqCst);
@@ -2196,7 +2269,7 @@ mod tests {
             let result = if self.force_unsupported {
                 Ok(duet_vfs::CopyOutcome::Unsupported)
             } else {
-                self.inner.server_side_copy(from, to, should_cancel).await
+                self.inner.server_side_copy(from, to, on_progress).await
             };
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             result
@@ -2325,7 +2398,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
-            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            _on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             Ok(duet_vfs::CopyOutcome::Unsupported)
         }
@@ -2427,7 +2500,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
-            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            _on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             Ok(duet_vfs::CopyOutcome::Unsupported)
         }
@@ -2525,7 +2598,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
-            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            _on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             Ok(duet_vfs::CopyOutcome::Unsupported)
         }
@@ -3684,6 +3757,417 @@ mod tests {
             "predicted {predicted}s, actual {actual_remaining:.1}s remaining -- {:.1}% off, \
              T-5.1.11's own AC allows 20%",
             error * 100.0
+        );
+    }
+
+    /// The bug this whole fix targets, reproduced end to end through
+    /// `copy_file_step` and fixed: an accelerated (same-device) copy of a
+    /// large file must credit `ctx.counters.bytes_done`/`large_bytes_done`
+    /// incrementally as real `copy_file_range` chunks land, not in one
+    /// lump once `server_side_copy` returns -- and a pause/resume episode
+    /// mid-copy (which discards the interrupted attempt and retries the
+    /// whole step from scratch, per this module's own "resume restarts
+    /// the step" design) must not leave those counters double- or
+    /// under-counted once the retried attempt finishes.
+    ///
+    /// Deliberately uses a real `LocalFs` on a real tempdir, not `TestFs`/
+    /// `ThrottledFs`/`PacedFs` -- all three of those force
+    /// `CopyOutcome::Unsupported`, which would only ever exercise
+    /// `naive_copy` (already known-correct before this fix) and prove
+    /// nothing about the accelerated path this bug actually lives in.
+    /// 900 MiB is large enough to span several real `copy_file_range`
+    /// chunks (64 MiB each) and several 100ms sampler ticks at this
+    /// development machine's measured tmpfs `copy_file_range` throughput
+    /// (~2 GiB/s, confirmed via a plain `cp` timing while writing this
+    /// test) -- scaled down from, but the same shape as, the user's own
+    /// reported ~2 GiB-per-file, 4-file, same-device job, so the test
+    /// finishes in well under a second of real copying instead of tens of
+    /// seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accelerated_copy_reports_incremental_progress_and_survives_pause_resume() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        const SIZE: u64 = 900 * 1024 * 1024;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(src.path().join("big.bin")).unwrap();
+            let chunk = vec![42u8; 4 * 1024 * 1024];
+            let mut written = 0u64;
+            while written < SIZE {
+                let n = (chunk.len() as u64).min(SIZE - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let control_for_task = control.clone();
+        let handle = tokio::spawn(execute(
+            Arc::clone(&fs),
+            JobIdT(1),
+            plan,
+            journal,
+            1,
+            tx,
+            control_for_task,
+            None,
+        ));
+
+        // Collect every observed `bytes_done` sample until the job
+        // finishes, pausing (then resuming) as soon as the first genuinely
+        // partial sample lands -- exercising the interrupted-attempt
+        // rollback path, not just the happy path's incremental crediting.
+        let mut samples: Vec<u64> = Vec::new();
+        let mut paused_once = false;
+        loop {
+            let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
+            else {
+                panic!("no event within 10s -- job likely stalled: samples so far {samples:?}");
+            };
+            match event {
+                JobEvent::Progress { snapshot, .. } => {
+                    samples.push(snapshot.bytes_done);
+                    if !paused_once && snapshot.bytes_done > 0 && snapshot.bytes_done < SIZE {
+                        paused_once = true;
+                        control.pause();
+                        // The copy_file_range loop only checks on_progress
+                        // once per up-to-64-MiB chunk -- give it a moment
+                        // to actually land mid-copy before resuming.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        control.resume();
+                    }
+                }
+                JobEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        let report = handle.await.expect("executor task panicked");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files_completed, 1);
+        assert!(
+            paused_once,
+            "test setup bug: never observed a partial sample to pause on -- samples: {samples:?}"
+        );
+
+        eprintln!(
+            "accelerated_copy_reports_incremental_progress_and_survives_pause_resume: {} \
+             bytes_done samples observed: {samples:?}",
+            samples.len()
+        );
+
+        let partial_mid_copy = samples.iter().filter(|&&b| b > 0 && b < SIZE).count();
+        assert!(
+            partial_mid_copy >= 1,
+            "expected at least one Progress sample with 0 < bytes_done < {SIZE} -- observed \
+             only {samples:?}, which looks like the old one-big-jump-at-completion bug this \
+             fix targets"
+        );
+
+        // No observed sample may ever exceed the file's real size -- an
+        // overshoot would be direct evidence of double-counting (the
+        // interrupted attempt's credit surviving into the retried
+        // attempt's credit instead of being rolled back first). Note this
+        // deliberately does *not* assert the *last* observed sample equals
+        // `SIZE` exactly: `execute()` aborts the 100ms progress sampler
+        // (`sampler.abort()`) immediately once the step loop finishes and
+        // *before* sending `JobEvent::Finished`, with no guaranteed final
+        // "100% done" tick in between -- so the last sample this test
+        // happens to observe is racing task teardown, not a meaningful
+        // signal. `copy_file_step_counters_survive_a_pause_resume_retry_
+        // without_double_or_under_counting` below checks the exact final
+        // counter value instead, by reading it directly (no sampler, no
+        // race) right after the step's own task handle is joined.
+        let max_seen = samples.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_seen <= SIZE,
+            "observed bytes_done={max_seen} exceeding the file's real size ({SIZE}) -- direct \
+             evidence of double-counting across the pause/resume episode. Samples: {samples:?}"
+        );
+        // Also expect to see a genuine *decrease* somewhere in the
+        // sequence -- direct evidence the rollback this fix adds actually
+        // fired (the interrupted attempt's partial credit being
+        // subtracted back out) rather than just happening to never
+        // trigger in this run.
+        let saw_a_decrease = samples.windows(2).any(|w| w[1] < w[0]);
+        assert!(
+            saw_a_decrease,
+            "expected to observe bytes_done decrease at least once (the pause-triggered \
+             rollback subtracting the interrupted attempt's partial credit back out) -- \
+             samples: {samples:?}"
+        );
+        // `plan_copy` copies the *source directory itself* into `dst`
+        // (matching `copies_a_directory_tree_and_completes_with_no_skips_
+        // or_errors`'s own established precedent for this), so the result
+        // lands at `dst/<src's own dir name>/big.bin`, not `dst/big.bin`.
+        let src_name = src.path().file_name().unwrap().to_str().unwrap();
+        let copied = std::fs::metadata(dst.path().join(src_name).join("big.bin"))
+            .unwrap()
+            .len();
+        assert_eq!(
+            copied, SIZE,
+            "the destination file itself must be the full, correct size"
+        );
+    }
+
+    /// The precise, race-free counterpart to the test above: instead of
+    /// inferring correctness from the 100ms `JobEvent::Progress` sampler
+    /// (which, per that test's own doc comment, is aborted before any
+    /// guaranteed "100% done" tick is sent), this test constructs an
+    /// [`ExecutorContext`] directly and calls [`run_step_with_retry`]
+    /// itself, reading `ctx.counters` straight from the `Arc` both while
+    /// the step is in flight (to decide when to pause) and immediately
+    /// after the task handle is joined (to check the exact final tally) --
+    /// no sampler, no 100ms granularity, no shutdown race.
+    ///
+    /// This is the test that most directly proves the "resume restarts the
+    /// step" invariant this codebase already relies on for `naive_copy`
+    /// (see that function's own doc comment) now holds for the
+    /// accelerated path too: a pause landing mid-`copy_file_range`
+    /// produces `CopyOutcome::Interrupted`, whose partial credit this fix
+    /// rolls back (see `copy_file_step`'s `Interrupted` arm), and the
+    /// retried attempt starts crediting from zero again -- so the final
+    /// tally must be exactly the file's real size, never more (double-
+    /// counted) or less (under-counted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_file_step_counters_survive_a_pause_resume_retry_without_double_or_under_counting()
+    {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        const SIZE: u64 = 300 * 1024 * 1024; // several copy_file_range chunks
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(src.path().join("big.bin")).unwrap();
+            let chunk = vec![7u8; 4 * 1024 * 1024];
+            let mut written = 0u64;
+            while written < SIZE {
+                let n = (chunk.len() as u64).min(SIZE - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let journal = JournalHandle::spawn(Journal::open(JobIdT(1), state.path()).unwrap());
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let counters = Arc::new(ProgressCounters::default());
+        let ctx = ExecutorContext {
+            fs,
+            job_id: JobIdT(1),
+            journal,
+            control: control.clone(),
+            counters: Arc::clone(&counters),
+            events: events_tx,
+            outcomes: Arc::new(Mutex::new(HashMap::new())),
+            default_conflict: ConflictPolicy::Skip,
+            resolver: None,
+            sticky_conflict: Arc::new(Mutex::new(None)),
+        };
+
+        let step = Step::CopyFile {
+            source: vpath_for(&src.path().join("big.bin")),
+            dest: vpath_for(&dst.path().join("big.bin")),
+            size: SIZE,
+            conflict: None,
+        };
+
+        let ctx_task = ctx.clone();
+        let handle = tokio::spawn(async move { run_step_with_retry(&ctx_task, 0, &step).await });
+
+        // Poll the raw counter directly until real, partial (neither zero
+        // nor complete) progress is observed, then pause -- exercising
+        // this fix's Interrupted -> rollback -> retry-from-scratch path,
+        // not just the happy path's incremental crediting.
+        // This loop only ever exits one of two ways: it breaks having just
+        // observed (and paused on) real partial progress, or the deadline
+        // assertion below panics the test first -- so reaching the code
+        // after it is itself the proof that partial progress was seen;
+        // no separate "did we ever see it" flag is needed.
+        let mut max_seen = 0u64;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let b = counters.bytes_done.load(Ordering::Relaxed);
+            max_seen = max_seen.max(b);
+            assert!(
+                b <= SIZE,
+                "bytes_done ({b}) observed exceeding the file's real size ({SIZE}) while still \
+                 in flight -- direct evidence of double-counting"
+            );
+            if b > 0 && b < SIZE {
+                // Pause immediately and stop polling here -- once paused,
+                // the step genuinely cannot finish until `resume()` is
+                // called below, so this loop must not keep waiting on
+                // `handle.is_finished()` (it never will, until resumed).
+                control.pause();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never observed partial progress within 10s -- max bytes_done seen: {max_seen}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Give `wait_out_pause`'s 20ms poll a moment to actually observe
+        // the paused state (and the interrupted attempt's rollback to
+        // complete) before resuming.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        control.resume();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "run_step_with_retry never finished within 10s of resuming -- max \
+                     bytes_done seen before pause: {max_seen}"
+                )
+            })
+            .expect("run_step_with_retry task panicked");
+        match outcome {
+            StepRun::Done(StepOutcome::Succeeded) => {}
+            StepRun::Done(other) => panic!("expected the step to succeed, got {other:?}"),
+            StepRun::Cancelled => panic!("expected the step to succeed, got Cancelled"),
+        }
+
+        // No sampler, no shutdown race: this is the exact, final counter
+        // state, read right after the task that mutated it was joined.
+        let final_bytes = counters.bytes_done.load(Ordering::Relaxed);
+        let final_large_bytes = counters.large_bytes_done.load(Ordering::Relaxed);
+        eprintln!(
+            "copy_file_step_counters_survive_a_pause_resume_retry_without_double_or_under_\
+             counting: final bytes_done={final_bytes} large_bytes_done={final_large_bytes} \
+             (file size {SIZE})"
+        );
+        assert_eq!(
+            final_bytes, SIZE,
+            "bytes_done after a pause/resume retry must equal the file's real size exactly -- \
+             {final_bytes} vs {SIZE} means the rollback either dropped or double-counted bytes"
+        );
+        assert_eq!(
+            final_large_bytes, SIZE,
+            "large_bytes_done must also equal the file's real size exactly -- this file is \
+             comfortably above the small-file regime threshold"
+        );
+
+        let copied = std::fs::metadata(dst.path().join("big.bin")).unwrap().len();
+        assert_eq!(
+            copied, SIZE,
+            "the destination file itself must be the full, correct size"
+        );
+    }
+
+    /// The literal symptom from the bug report this whole fix addresses:
+    /// copying several large same-device files showed `0 B/s` throughput
+    /// (and a bogus `ETA 0:00`) for the entire duration of a still-in-
+    /// progress copy, because the old accelerated path only ever credited
+    /// a whole file's bytes in one jump at completion -- so
+    /// `throughput_bytes_per_sec` (computed from the *delta* between
+    /// consecutive 100ms samples) read `0` on every sample except the one
+    /// instant a file's bytes landed, then `0` again on every sample
+    /// after. This test asserts the fixed behaviour directly: while a
+    /// large file is genuinely still copying, more than one *consecutive*
+    /// 100ms sample must report nonzero throughput -- not a single spike
+    /// surrounded by zeros.
+    ///
+    /// Real `LocalFs` on a real tempdir, same reasoning as the test above
+    /// for why `TestFs`/`ThrottledFs`/`PacedFs` would prove nothing here.
+    /// Multiple ~400 MiB files (same shape as the user's own multi-file
+    /// report, scaled down for test speed) copied with `concurrency: 2` --
+    /// closer to how the UI actually drives a multi-file job than a
+    /// single huge file would be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_file_accelerated_copy_reports_sustained_nonzero_throughput() {
+        let src = TempDir::new().unwrap();
+        const FILES: usize = 4;
+        const PER_FILE: u64 = 400 * 1024 * 1024;
+        for i in 0..FILES {
+            use std::io::Write;
+            let mut f = std::fs::File::create(src.path().join(format!("f{i}.bin"))).unwrap();
+            let chunk = vec![(i as u8).wrapping_add(1); 4 * 1024 * 1024];
+            let mut written = 0u64;
+            while written < PER_FILE {
+                let n = (chunk.len() as u64).min(PER_FILE - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let total_size = PER_FILE * FILES as u64;
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 2, tx, control, None));
+
+        let mut throughput_samples: Vec<(u64, u64)> = Vec::new(); // (bytes_done, throughput)
+        while let Some(event) = rx.recv().await {
+            match event {
+                JobEvent::Progress { snapshot, .. } => {
+                    throughput_samples
+                        .push((snapshot.bytes_done, snapshot.throughput_bytes_per_sec));
+                }
+                JobEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        let report = handle.await.expect("executor task panicked");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files_completed, FILES as u64);
+
+        eprintln!(
+            "multi_file_accelerated_copy_reports_sustained_nonzero_throughput: {} samples: \
+             {throughput_samples:?}",
+            throughput_samples.len()
+        );
+
+        // Find the longest run of *consecutive* samples, all mid-copy
+        // (bytes_done < total_size) and all reporting nonzero throughput.
+        // The old bug could produce at most a run of length 1 (one lucky
+        // sample landing right when a whole file's bytes jumped in) --
+        // this asserts a real, sustained run instead.
+        let mut best_run = 0usize;
+        let mut current_run = 0usize;
+        for &(bytes_done, throughput) in &throughput_samples {
+            if bytes_done < total_size && throughput > 0 {
+                current_run += 1;
+                best_run = best_run.max(current_run);
+            } else {
+                current_run = 0;
+            }
+        }
+        assert!(
+            best_run >= 2,
+            "expected at least 2 consecutive mid-copy samples with nonzero throughput -- \
+             longest run observed was {best_run}. Samples: {throughput_samples:?} (this is \
+             exactly the reported '0 B/s throughout, one spike at most' bug)"
         );
     }
 
