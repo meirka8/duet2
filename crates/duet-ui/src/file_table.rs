@@ -2484,6 +2484,44 @@ impl FileTable {
         self.navigate_to(dir, true, None, window, cx);
     }
 
+    /// Re-lists this table's own `current_dir` in place -- no history
+    /// entry (this isn't a navigation, `current_dir` doesn't change), and
+    /// deliberately bypasses `navigate_to`'s locked-tab redirect: a
+    /// locked tab still needs to reflect what `current_dir` actually
+    /// contains right now, since locking only guards against navigating
+    /// *elsewhere*, not against seeing real, current content in place.
+    /// T-5.2.1: called on both panels once a background copy/move job
+    /// finishes (`Workspace::render`'s `pending_panel_refresh` drain), so
+    /// a panel showing a directory that job touched picks up what's
+    /// really on disk instead of showing stale rows (moved-away sources,
+    /// missing new destinations) until the user manually re-navigates.
+    /// Shares `navigate_to`'s reload steps (quick-search invalidation,
+    /// generation bump, `spawn_directory_load`/`spawn_volume_stats_load`)
+    /// but not its `window`/lock-redirect handling -- nothing here needs
+    /// a live `Window`.
+    pub(crate) fn reread_current_dir(&mut self, cx: &mut Context<Self>) {
+        let dir = self.current_dir.clone();
+        self.exit_quick_search(cx);
+        cx.emit(FileTableEvent::DirectoryChanged);
+        let (generation, sort_options) = self.state.update(cx, |state, cx| {
+            let generation = state.delegate_mut().bump_nav_generation();
+            let sort_options = state.delegate().model().sort_options();
+            state.delegate_mut().set_loading(true);
+            cx.notify();
+            (generation, sort_options)
+        });
+        spawn_directory_load(
+            dir.clone(),
+            self.tokio_handle.clone(),
+            self.state.clone(),
+            None,
+            (sort_options.column, sort_options.ascending),
+            generation,
+            cx,
+        );
+        spawn_volume_stats_load(dir, self.tokio_handle.clone(), generation, cx);
+    }
+
     fn navigate_to(
         &mut self,
         dir: PathBuf,

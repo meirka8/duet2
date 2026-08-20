@@ -347,6 +347,21 @@ pub struct Workspace {
     /// ([`Self::close_copy_move_dialog`]) restores focus immediately and
     /// never touches this field.
     pending_focus_restore: Option<FocusHandle>,
+    /// `true` when a T-5.2.1 copy/move job has finished since the last
+    /// render and both panels need to re-list their current directory to
+    /// reflect what it actually did on disk -- same "no live `Window`"
+    /// problem `pending_notice`/`pending_focus_restore` document (the
+    /// `QueueManager` event-consumer task that sets this has neither),
+    /// drained by [`Self::render`] the same way. Deliberately not scoped
+    /// to *which* directories the finished job touched: `JobEvent::
+    /// Finished` carries a `JobReport` (counts/bytes), not the plan's
+    /// source/dest paths, and re-listing whichever directory each panel
+    /// already happens to be showing is always safe -- a panel unrelated
+    /// to the job just re-reads the same, unchanged listing. Set on
+    /// *every* `JobEvent::Finished`, regardless of outcome (even a
+    /// `Failed`/`Cancelled` job can have made real, partial progress
+    /// before stopping).
+    pending_panel_refresh: bool,
 
     /// T-4.3.6's command palette: the fuzzy-searchable index over every
     /// registered command (`docs/commands.md`'s 302-entry catalogue) plus
@@ -657,10 +672,13 @@ impl Workspace {
 
         // The queue's event-consumer loop: drains every job's `JobEvent`s
         // and, on `Finished`, queues a summary toast via
-        // `push_pending_notice`. Every other variant is ignored here --
-        // T-5.2.2's live progress UI is a separate, later task. Runs for
-        // the app's whole lifetime, same "stops polling once `Workspace`
-        // is dropped" shape as the periodic session-save loop just above.
+        // `push_pending_notice` and marks both panels for a refresh (see
+        // `pending_panel_refresh`'s own doc comment for why *every*
+        // `Finished`, not just a successful one). Every other variant is
+        // ignored here -- T-5.2.2's live progress UI is a separate, later
+        // task. Runs for the app's whole lifetime, same "stops polling
+        // once `Workspace` is dropped" shape as the periodic session-save
+        // loop just above.
         cx.spawn(async move |this, cx| {
             while let Some(event) = queue_events_rx.recv().await {
                 let JobEvent::Finished {
@@ -669,13 +687,15 @@ impl Workspace {
                 else {
                     continue;
                 };
-                let Some((level, message)) = summarize_job_finished(outcome, &report) else {
-                    continue;
-                };
-                if this
-                    .update(cx, |this, cx| this.push_pending_notice(level, message, cx))
-                    .is_err()
-                {
+                let notice = summarize_job_finished(outcome, &report);
+                let updated = this.update(cx, |this, cx| {
+                    if let Some((level, message)) = notice {
+                        this.push_pending_notice(level, message, cx);
+                    }
+                    this.pending_panel_refresh = true;
+                    cx.notify();
+                });
+                if updated.is_err() {
                     return;
                 }
             }
@@ -695,6 +715,7 @@ impl Workspace {
             session_path,
             pending_notice,
             pending_focus_restore: None,
+            pending_panel_refresh: false,
             palette_index,
             command_palette: None,
             palette_previous_focus: None,
@@ -1528,6 +1549,19 @@ impl Render for Workspace {
                 NoticeLevel::Error => Notification::error(notice.message),
             };
             window.push_notification(toast, cx);
+        }
+
+        // T-5.2.1 (post-UAT): a finished copy/move job means either panel
+        // may now be showing stale rows -- sources that moved away,
+        // destinations that just appeared -- until the user manually
+        // re-navigates. See `pending_panel_refresh`'s own doc comment for
+        // why this always refreshes both panels rather than trying to
+        // track exactly which directories a given job touched.
+        if std::mem::take(&mut self.pending_panel_refresh) {
+            for panel in [&self.left_panel, &self.right_panel] {
+                let table = panel.read(cx).active_table().clone();
+                table.update(cx, |table, cx| table.reread_current_dir(cx));
+            }
         }
 
         v_flex()
@@ -3145,6 +3179,15 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             vcx.run_until_parked();
+            // T-5.2.1 (post-UAT): `Workspace::render`-only state (e.g.
+            // `pending_panel_refresh`) only actually gets drained by a
+            // real draw pass, not merely by `run_until_parked` letting
+            // background tasks progress -- without this, a condition
+            // that depends on `Render::render` having run at least once
+            // since the state it's waiting on was set would hang until
+            // the deadline below, not because the app is broken but
+            // because nothing here ever asked it to draw.
+            let _ = vcx.update(|window, cx| window.draw(cx));
             if condition(vcx) {
                 return;
             }
@@ -3324,15 +3367,76 @@ mod tests {
             vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
 
             let dest_file = dest_dir.path().join("hello.txt");
+            // Waits for both the file landing on disk *and* the dialog
+            // closing in the same poll -- these are two independently
+            // eventually-consistent outcomes of the same background job
+            // (the file can land before the dialog's own close callback
+            // gets scheduled, or vice versa), so asserting the dialog is
+            // closed as a separate, immediate check right after only the
+            // first one is racy.
+            wait_until(vcx, |vcx| {
+                dest_file.is_file()
+                    && workspace.read_with(vcx, |ws, _| ws.copy_move_dialog.is_none())
+            });
+
+            assert_eq!(std::fs::read(&dest_file).unwrap(), b"hello world");
+        });
+    }
+
+    fn model_has_name(vcx: &mut VisualTestContext, table: &Entity<FileTable>, name: &str) -> bool {
+        table.read_with(vcx, |table, cx| {
+            table
+                .state()
+                .read(cx)
+                .delegate()
+                .model()
+                .ordered_names()
+                .any(|(_, n)| n == name)
+        })
+    }
+
+    /// Post-UAT (T-5.2.1): a real F6 move must leave *both* panels
+    /// showing the true, current state of disk without the user manually
+    /// re-navigating -- the source no longer listing the moved file, the
+    /// destination now listing it. Deliberately never calls
+    /// `navigate_panel_to` a second time after the move; the whole point
+    /// is that `Workspace`'s own `pending_panel_refresh` drain
+    /// (`Render::render`) does this automatically once the job's
+    /// `Finished` event lands, not that a manual re-navigation would
+    /// paper over a real gap.
+    #[gpui::test]
+    fn f6_move_end_to_end_refreshes_both_panels_without_manual_renavigation(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("move_me.txt"), b"move me").unwrap();
+
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &left_table, source_dir.path().to_path_buf());
+            navigate_panel_to(vcx, &right_table, dest_dir.path().to_path_buf());
+            assert!(model_has_name(vcx, &left_table, "move_me.txt"));
+            assert!(!model_has_name(vcx, &right_table, "move_me.txt"));
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(MoveDialog);
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+
+            let dest_file = dest_dir.path().join("move_me.txt");
             wait_until(vcx, |_vcx| dest_file.is_file());
 
-            workspace.read_with(vcx, |ws, _| {
-                assert!(
-                    ws.copy_move_dialog.is_none(),
-                    "a successful plan/enqueue must close the dialog"
-                );
+            wait_until(vcx, |vcx| {
+                !model_has_name(vcx, &left_table, "move_me.txt")
+                    && model_has_name(vcx, &right_table, "move_me.txt")
             });
-            assert_eq!(std::fs::read(&dest_file).unwrap(), b"hello world");
         });
     }
 }
