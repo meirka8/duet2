@@ -19,11 +19,6 @@
 //!   silently mishandled. `Link` belongs to T-5.1.7 (the hardlink-graph
 //!   task, the only one that will ever produce a `Link` step); `Verify`
 //!   belongs to T-5.1.12 (post-copy BLAKE3 verification).
-//! - **No retry-with-backoff for `Retryable` failures, no `ENOSPC`
-//!   queue-wide pause, no `EACCES` elevation offer.** A `Retryable`/
-//!   `Space`/`Permission` failure is classified and recorded as a
-//!   [`StepFailure`] like any other; T-5.1.10 ("Error taxonomy handling")
-//!   is where retry loops and queue-wide pause-on-space land.
 //! - **No ETA.** [`ProgressSnapshot::eta_secs`] is always `None` — the
 //!   dual-regime EWMA estimator is T-5.1.11's job. The counters and
 //!   100ms-cadence sampling T-5.1.11 needs to build on top of are real,
@@ -112,6 +107,35 @@
 //! claim on the same path the way an existing *file* at a `CopyFile`'s
 //! destination is. Only a non-directory occupying a `CreateDir`'s `dest`
 //! goes through the real seven-policy engine.
+//!
+//! # Error taxonomy & retry (T-5.1.10)
+//!
+//! design.md §9.3's classification (`duet_types::ErrorKind`, already fixed
+//! by T-2.2.x — this task wires *behaviour* onto it, not new classification
+//! logic): `Retryable` failures (`EINTR`/`EAGAIN`/a dropped connection) get
+//! bounded exponential backoff, retried from the same `run_step_with_retry`
+//! loop that already handles pause/cancel — see [`retry_backoff`] and its
+//! constants. `Space` failures (`ENOSPC`/`EDQUOT`) call
+//! `ExecutionControl::pause()` (the same primitive a user-initiated pause
+//! uses) and emit [`JobEvent::QueuePausedForSpace`], then retry indefinitely
+//! once resumed — the queue-wide half of "pause the whole queue, not just
+//! the job" is [`crate`]'s own disclosed gap (T-5.1.13, multi-job queueing,
+//! doesn't exist yet); within a single job, pausing *this* job and emitting
+//! a clearly-distinguished event is the whole of what's achievable here,
+//! and exactly what a future queue manager listening for this event would
+//! need to propagate the pause further. `Permission` failures
+//! (`EACCES`/`EPERM`) are not retried — FR-OPS-13's actual elevation
+//! mechanism (polkit, a D-Bus helper) is T-9.1.13's scope, which this task
+//! doesn't attempt to pre-empt — but the resulting [`StepFailure`] message
+//! says plainly that elevation would help, so the report is actionable
+//! rather than a bare "permission denied."
+//!
+//! Both retry paths reuse the exact same journal-bracketing machinery a
+//! pause/cancel-interrupted retry already uses (`continue` back to the top
+//! of `run_step_with_retry`'s loop — a fresh `Intent` record, a fresh
+//! `.duet-partial-*` name for copy-class steps): multiple `Intent` records
+//! for one `step_index` before its `Completion` is an already-established,
+//! already-recovery-safe pattern, not something new this task introduces.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -539,6 +563,10 @@ enum StepRun {
 /// scope note for why a retry-from-scratch loop, not byte-exact resume, is
 /// what "resumes correctly" means here.
 async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step) -> StepRun {
+    // T-5.1.10: bounded across the whole step (not reset by a `Space`
+    // pause/resume episode or a pause/cancel-interrupted retry) -- see
+    // `retry_backoff`'s own doc comment for the bound.
+    let mut retryable_attempts = 0u32;
     loop {
         if wait_out_pause(ctx).await == ControlState::Cancelled {
             return StepRun::Cancelled;
@@ -588,11 +616,34 @@ async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step
                 }
                 Ok(StepAttempt::Done(outcome)) => outcome,
                 Ok(StepAttempt::Interrupted) => continue, // pause/cancel mid-copy -- retry
+                Err(e) if e.kind() == ErrorKind::Space => {
+                    // T-5.1.10: ENOSPC/EDQUOT -- pause (the same primitive
+                    // a user-initiated pause uses) and retry this step
+                    // indefinitely once resumed, instead of failing the
+                    // job outright. See the module doc comment's "Error
+                    // taxonomy & retry" section for why this only pauses
+                    // *this* job, not a queue that doesn't exist yet
+                    // (T-5.1.13).
+                    ctx.control.pause();
+                    let _ = ctx
+                        .events
+                        .send(JobEvent::QueuePausedForSpace { job_id: ctx.job_id });
+                    continue;
+                }
+                Err(e)
+                    if e.kind().is_retryable() && retryable_attempts < RETRYABLE_MAX_ATTEMPTS =>
+                {
+                    retryable_attempts += 1;
+                    if retry_backoff(ctx, retryable_attempts).await == ControlState::Cancelled {
+                        return StepRun::Cancelled;
+                    }
+                    continue;
+                }
                 Err(e) => StepOutcome::Failed(StepFailure {
                     step_index,
                     path: step_primary_path(step),
                     kind: e.kind(),
-                    message: e.to_string(),
+                    message: permission_hint(e.kind(), &e.to_string()),
                 }),
             }
         };
@@ -722,6 +773,64 @@ fn dependency_block_reason(ctx: &ExecutorContext, step: &Step) -> Option<String>
             failure.message
         )),
         _ => None,
+    }
+}
+
+/// The bound on how many times a `Retryable` failure gets retried before
+/// `run_step_with_retry` gives up and reports it as a genuine
+/// [`StepOutcome::Failed`]. A documented, deliberately conservative choice
+/// (mirroring `suggested_concurrency`'s own precedent for "no numeric
+/// guidance exists anywhere in design.md/task.md") -- 5 attempts covers a
+/// real transient blip (a dropped connection, `EINTR`/`EAGAIN`) without
+/// letting a step spin close to forever against a condition that will
+/// never clear.
+const RETRYABLE_MAX_ATTEMPTS: u32 = 5;
+/// The first backoff delay; doubles on each subsequent attempt, capped at
+/// [`RETRYABLE_MAX_BACKOFF`]. Deliberately short relative to typical retry-
+/// with-backoff guidance elsewhere (seconds, not tens of milliseconds) so
+/// this crate's own test suite stays fast while still exercising genuine
+/// exponential growth and a real bound -- nothing in design.md/task.md
+/// specifies an exact figure.
+const RETRYABLE_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+const RETRYABLE_MAX_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Sleeps out `attempt`'s bounded-exponential-backoff delay (design.md
+/// §9.3: "Retryable errors get bounded exponential backoff"), in short
+/// increments so a cancel lands promptly instead of waiting out the full
+/// delay -- mirroring [`wait_out_pause`]'s own poll-and-check cadence.
+/// Returns the resulting [`ControlState`] so the caller can tell a
+/// cancel-during-backoff apart from a delay that ran to completion.
+async fn retry_backoff(ctx: &ExecutorContext, attempt: u32) -> ControlState {
+    // `attempt` is 1-based (the first retry passes 1); attempt N sleeps
+    // `INITIAL * 2^(N-1)`, capped at `RETRYABLE_MAX_BACKOFF`.
+    let delay = RETRYABLE_INITIAL_BACKOFF
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(RETRYABLE_MAX_BACKOFF);
+    let mut waited = Duration::ZERO;
+    while waited < delay {
+        if ctx.control.state() == ControlState::Cancelled {
+            return ControlState::Cancelled;
+        }
+        let chunk = Duration::from_millis(10).min(delay - waited);
+        tokio::time::sleep(chunk).await;
+        waited += chunk;
+    }
+    ctx.control.state()
+}
+
+/// Appends a plain-language hint to `message` when `kind` is
+/// `ErrorKind::Permission` -- FR-OPS-13's actual elevation offer (a real
+/// polkit/D-Bus prompt) is T-9.1.13's scope, not built here, but the report
+/// should still say plainly that elevation would help rather than leaving
+/// a bare "permission denied" for the user to puzzle out.
+fn permission_hint(kind: ErrorKind, message: &str) -> String {
+    if kind == ErrorKind::Permission {
+        format!(
+            "{message} (permission denied -- retrying elevated isn't available yet; \
+             tracked as T-9.1.13)"
+        )
+    } else {
+        message.to_string()
     }
 }
 
@@ -1307,7 +1416,16 @@ async fn copy_file_step(
         Err(e) if e.kind() == ErrorKind::Conflict => {
             return Ok(StepAttempt::Done(partial_collision(&partial)));
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // T-5.1.10: a hard error here (e.g. `ENOSPC`, about to be
+            // retried by the caller) gets the same best-effort cleanup as
+            // the `Unsupported` branch above, for the same reason -- don't
+            // leave a stray, possibly partially-written `.duet-partial-*`
+            // file for a retry to trip over or a full disk to get fuller
+            // from.
+            let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
+            return Err(e);
+        }
     }
 
     let attempt =
@@ -1373,17 +1491,29 @@ async fn naive_copy(
             ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
             return Ok(StepAttempt::Interrupted);
         }
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| Box::new(VfsError::from_io(e)))?;
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                // A real I/O error (T-5.1.10: e.g. `ENOSPC`/`EINTR`, about
+                // to be retried by the caller) gets the exact same
+                // cleanup as a control-state interruption above -- an
+                // aborted writer and a rolled-back byte count -- so a
+                // retried attempt starts from a clean slate instead of
+                // compounding a stray temp file onto an already-full
+                // disk.
+                let _ = writer.abort().await;
+                ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+                return Err(Box::new(VfsError::from_io(e)));
+            }
+        };
         if n == 0 {
             break;
         }
-        writer
-            .write_all(&buf[..n])
-            .await
-            .map_err(|e| Box::new(VfsError::from_io(e)))?;
+        if let Err(e) = writer.write_all(&buf[..n]).await {
+            let _ = writer.abort().await;
+            ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+            return Err(Box::new(VfsError::from_io(e)));
+        }
         copied += n as u64;
         ctx.counters
             .bytes_done
@@ -1748,6 +1878,286 @@ mod tests {
         ) -> Result<duet_vfs::CopyOutcome> {
             Ok(duet_vfs::CopyOutcome::Unsupported)
         }
+    }
+
+    /// A `FileSystem` test double wrapping a real [`LocalFs`], whose
+    /// `open_read` fails with a configurable [`ErrorKind`] a configurable
+    /// number of times before delegating for real -- T-5.1.10's injection
+    /// point for "transient errors retry and succeed" and "`ENOSPC` pauses
+    /// the job." `server_side_copy` always reports `Unsupported`, forcing
+    /// every copy through [`naive_copy`] (whose first call is
+    /// `open_read`), so failures are deterministic regardless of how a
+    /// real backend would actually accelerate a same-filesystem copy.
+    struct FlakyFs {
+        inner: LocalFs,
+        /// Remaining number of `open_read` calls that should fail before
+        /// succeeding for real. An `Arc` so a test can reset it after the
+        /// fact (simulating "the operator freed disk space") without
+        /// tearing down the running job.
+        remaining_failures: Arc<std::sync::atomic::AtomicU32>,
+        fail_kind: ErrorKind,
+        open_read_calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystem for FlakyFs {
+        fn scheme(&self) -> &'static str {
+            self.inner.scheme()
+        }
+        fn caps(&self) -> duet_types::Caps {
+            self.inner.caps()
+        }
+        fn read_dir(
+            &self,
+            p: &VPath,
+            opts: duet_vfs::ListOpts,
+        ) -> futures_util::stream::BoxStream<'_, Result<Vec<duet_vfs::DirEntry>>> {
+            self.inner.read_dir(p, opts)
+        }
+        async fn stat(&self, p: &VPath, follow: bool) -> Result<duet_types::Metadata> {
+            self.inner.stat(p, follow).await
+        }
+        async fn volume_stats(&self, p: &VPath) -> Result<duet_vfs::VolumeStats> {
+            self.inner.volume_stats(p).await
+        }
+        async fn open_read(&self, p: &VPath) -> Result<Box<dyn duet_vfs::AsyncReadSeek>> {
+            self.open_read_calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = self.remaining_failures.load(Ordering::SeqCst);
+            if remaining > 0 {
+                // Only actually decrement while still positive -- a test
+                // resetting `remaining_failures` to 0 concurrently (to
+                // simulate space being freed) must not race this into
+                // underflow.
+                let _ = self.remaining_failures.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Err(Box::new(
+                    VfsError::new(self.fail_kind, "injected failure").with_path(p.clone()),
+                ));
+            }
+            self.inner.open_read(p).await
+        }
+        async fn open_write(
+            &self,
+            p: &VPath,
+            o: WriteOpts,
+        ) -> Result<Box<dyn duet_vfs::AsyncWriteCommit>> {
+            self.inner.open_write(p, o).await
+        }
+        async fn create_dir(&self, p: &VPath, mode: Option<Mode>) -> Result<()> {
+            self.inner.create_dir(p, mode).await
+        }
+        async fn remove(&self, p: &VPath, kind: RemoveKind) -> Result<()> {
+            self.inner.remove(p, kind).await
+        }
+        async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
+            self.inner.rename(from, to, flags).await
+        }
+        async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
+            self.inner.set_meta(p, m).await
+        }
+        fn watch(
+            &self,
+            p: &VPath,
+        ) -> Result<futures_util::stream::BoxStream<'_, duet_vfs::ChangeEvent>> {
+            self.inner.watch(p)
+        }
+        async fn server_side_copy(
+            &self,
+            _from: &VPath,
+            _to: &VPath,
+            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<duet_vfs::CopyOutcome> {
+            Ok(duet_vfs::CopyOutcome::Unsupported)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_retries_with_backoff_and_succeeds() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+
+        let open_read_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fs: Arc<dyn FileSystem> = Arc::new(FlakyFs {
+            inner: LocalFs,
+            remaining_failures: Arc::new(std::sync::atomic::AtomicU32::new(2)),
+            fail_kind: ErrorKind::Retryable,
+            open_read_calls: Arc::clone(&open_read_calls),
+        });
+
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&src.path().join("a.txt")),
+                dest: vpath_for(&dst.path().join("a.txt")),
+                size: 5,
+                conflict: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files_completed, 1);
+        assert_eq!(
+            open_read_calls.load(Ordering::SeqCst),
+            3,
+            "2 failures + 1 real attempt"
+        );
+        assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_transient_error_gives_up_after_the_retry_bound_and_fails() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+
+        let open_read_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fs: Arc<dyn FileSystem> = Arc::new(FlakyFs {
+            inner: LocalFs,
+            // Never stops failing -- more than any bounded retry budget.
+            remaining_failures: Arc::new(std::sync::atomic::AtomicU32::new(1_000)),
+            fail_kind: ErrorKind::Retryable,
+            open_read_calls: Arc::clone(&open_read_calls),
+        });
+
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&src.path().join("a.txt")),
+                dest: vpath_for(&dst.path().join("a.txt")),
+                size: 5,
+                conflict: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].kind, ErrorKind::Retryable);
+        assert_eq!(
+            open_read_calls.load(Ordering::SeqCst),
+            RETRYABLE_MAX_ATTEMPTS + 1,
+            "the initial attempt plus every bounded retry, then give up"
+        );
+        assert!(!dst.path().join("a.txt").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enospc_pauses_the_job_and_completes_once_space_is_freed_and_resumed() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+
+        let remaining_failures = Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
+        let fs: Arc<dyn FileSystem> = Arc::new(FlakyFs {
+            inner: LocalFs,
+            remaining_failures: Arc::clone(&remaining_failures),
+            fail_kind: ErrorKind::Space,
+            open_read_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&src.path().join("a.txt")),
+                dest: vpath_for(&dst.path().join("a.txt")),
+                size: 5,
+                conflict: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let handle = tokio::spawn(execute(
+            fs,
+            JobIdT(1),
+            plan,
+            journal,
+            1,
+            tx,
+            control.clone(),
+            None,
+        ));
+
+        // Wait for the job to actually pause itself (no fixed sleep --
+        // poll the real control state, matching this file's own
+        // established "don't guess a timing budget" precedent).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.state() != ControlState::Paused {
+            assert!(Instant::now() < deadline, "job never paused for space");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Simulate the operator freeing space, then resume.
+        remaining_failures.store(0, Ordering::SeqCst);
+        control.resume();
+
+        let report = handle.await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files_completed, 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, JobEvent::QueuePausedForSpace { .. })),
+            "a clear, distinguishable pause-for-space event must be surfaced"
+        );
+        assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_permission_failure_is_not_retried_and_hints_at_elevation() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+
+        let open_read_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fs: Arc<dyn FileSystem> = Arc::new(FlakyFs {
+            inner: LocalFs,
+            remaining_failures: Arc::new(std::sync::atomic::AtomicU32::new(1_000)),
+            fail_kind: ErrorKind::Permission,
+            open_read_calls: Arc::clone(&open_read_calls),
+        });
+
+        let plan = Plan::new(
+            vec![Step::CopyFile {
+                source: vpath_for(&src.path().join("a.txt")),
+                dest: vpath_for(&dst.path().join("a.txt")),
+                size: 5,
+                conflict: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].kind, ErrorKind::Permission);
+        assert!(
+            report.errors[0].message.contains("T-9.1.13"),
+            "message should hint that elevation isn't available yet: {:?}",
+            report.errors[0].message
+        );
+        assert_eq!(
+            open_read_calls.load(Ordering::SeqCst),
+            1,
+            "a Permission failure must not be retried at all"
+        );
     }
 
     #[tokio::test]
