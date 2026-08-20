@@ -87,6 +87,47 @@ blake3 = "1.8"
 # debug_assert!-based check and is load-bearing for NFR-02, not decorative.
 debug-assertions = true
 
+# GPUI's text-shaping/rasterization stack (cosmic-text and its own
+# dependencies: swash, rustybuzz, ttf-parser, skrifa, resvg, tiny-skia,
+# zeno, yazi, the pathfinder_* crates) is pure-Rust, CPU-heavy code that is
+# dramatically slower at opt-level 0 than optimized -- easily the
+# difference between sub-frame and multi-second rendering for a directory
+# whose filenames haven't been shaped/glyph-cached before (exactly what
+# happens on every fresh navigation). S-1's own release-mode benchmark
+# already attributed its p99/max frame-time outliers to "layout re-flow or
+# cosmic-text glyph-cache misses" (documentation/spikes/S-1.md) -- at
+# opt-level 0 that effect is dramatically worse. Zed's own Cargo.toml
+# carries the identical override for the identical dependency stack, for
+# the identical reason. `opt-level = 3` on just these packages (not the
+# whole dev profile) keeps incremental rebuilds of this workspace's own
+# crates fast while fixing the actual bottleneck.
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.swash]
+opt-level = 3
+[profile.dev.package.rustybuzz]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.resvg]
+opt-level = 3
+[profile.dev.package.tiny-skia]
+opt-level = 3
+[profile.dev.package.zeno]
+opt-level = 3
+[profile.dev.package.yazi]
+opt-level = 3
+[profile.dev.package.fontdb]
+opt-level = 3
+[profile.dev.package.zed-font-kit]
+opt-level = 3
+[profile.dev.package.pathfinder_geometry]
+opt-level = 3
+[profile.dev.package.pathfinder_simd]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
