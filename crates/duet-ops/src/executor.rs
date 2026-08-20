@@ -14,10 +14,6 @@
 //!   `VerifyAlgorithm::SizeOnly` is real (T-5.1.5); `Blake3` fails cleanly
 //!   with a descriptive [`StepFailure`] rather than a `todo!()`, since
 //!   post-copy BLAKE3 verification is T-5.1.12's own scope.
-//! - **No ETA.** [`ProgressSnapshot::eta_secs`] is always `None` — the
-//!   dual-regime EWMA estimator is T-5.1.11's job. The counters and
-//!   100ms-cadence sampling T-5.1.11 needs to build on top of are real,
-//!   per `job.rs`'s own doc comment attributing that machinery to T-5.1.3.
 //! - **`current_file_bytes_done`/`current_file_bytes_total` are always
 //!   `0`.** FR-OPS-03's "current file + total" framing assumes one file
 //!   copies at a time; with `concurrency > 1`, several files can be
@@ -25,8 +21,8 @@
 //!   report without inventing an aggregate convention nothing has
 //!   specified. `files_done`/`bytes_done` (whole-job totals) are tracked
 //!   precisely; per-file live progress under concurrency is left for
-//!   whichever of T-5.1.11/T-5.2.2 first needs to reconcile that framing
-//!   with concurrent copying, rather than guessed at here.
+//!   whichever future task first needs to reconcile that framing with
+//!   concurrent copying, rather than guessed at here.
 //! - **No multi-job queueing.** This module runs exactly one job to
 //!   completion (or pause/cancel); ordering, priority, and aggregate
 //!   queue-wide state across many jobs is T-5.1.13.
@@ -131,6 +127,56 @@
 //! `.duet-partial-*` name for copy-class steps): multiple `Intent` records
 //! for one `step_index` before its `Completion` is an already-established,
 //! already-recovery-safe pattern, not something new this task introduces.
+//!
+//! # Progress and ETA (T-5.1.11)
+//!
+//! design.md §9.3: "ETA uses an exponentially-weighted moving average with
+//! separate small-file and large-file regimes, because a naive average
+//! lies badly on mixed sets" — a corpus of 10,000 tiny config files plus
+//! one 4 GiB video is bottlenecked on per-file syscall overhead for the
+//! former and raw throughput for the latter, and averaging the two
+//! together produces an estimate that's wrong for both. Every `CopyFile`/
+//! `Reflink` step is classified by [`is_small_file`] against
+//! [`SMALL_FILE_REGIME_THRESHOLD_BYTES`] (the same 1 MiB figure
+//! [`COPY_BUFFER_BYTES`] already uses, on the reasoning that a file
+//! smaller than one copy buffer is dominated by per-file overhead no
+//! matter what) into one of two regimes, each tracked by its own pair of
+//! atomics on [`ProgressCounters`] (`small_files_done`/`large_bytes_done`)
+//! alongside the pre-existing whole-job `files_done`/`bytes_done` (left
+//! untouched — this is additive, not a replacement).
+//!
+//! [`EtaEstimator`] is the pure (no atomics, no async) core: fed a
+//! `(small_done, large_done)` pair once per 100ms sampler tick (mirroring
+//! `throughput_bytes_per_sec`'s own existing "assume exactly 100ms between
+//! ticks" convention rather than measuring real elapsed time — consistent
+//! with the pre-existing `* 10` conversion just below), it maintains an
+//! independent EWMA rate for each regime (files/sec for small, bytes/sec
+//! for large), updated only on ticks where that regime actually made
+//! progress — a barrier-step stretch (a `SetMeta`/`CreateDir` run with no
+//! `CopyFile` in it) leaves both rates exactly where they were rather than
+//! decaying them toward zero, which would otherwise make the ETA spike
+//! upward for every barrier step in a plan. `sample()` combines the two
+//! regimes' individual ETAs with `max`, not a sum: both regimes are
+//! drained by the same shared, `concurrency`-bounded worker pool (not two
+//! independent resource lanes), so each regime's own observed rate
+//! already reflects whatever share of the pool it's actually been
+//! getting, and the job as a whole finishes once the slower-to-clear
+//! regime clears. The combined ETA is `None` (matching
+//! [`ProgressSnapshot::eta_secs`]'s own doc comment) until *both* regimes
+//! with outstanding work have an established rate — always true for at
+//! least the first tick or two of any job with both regimes present.
+//!
+//! **"Never runs backwards for more than one sample"** (T-5.1.11's own
+//! AC): a noisy single-tick rate dip is expected and shouldn't be hidden
+//! (the estimate should still visibly react), but an ETA that keeps
+//! climbing tick after tick reads as broken, not as an estimator being
+//! honest about a slowdown. `EtaEstimator` allows exactly one consecutive
+//! increase over the previous reported value; a second one in a row is
+//! clamped to hold at the last reported value instead of climbing further,
+//! until a tick produces a value that isn't an increase, which clears the
+//! clamp. See [`EtaEstimator::sample`]'s own doc comment and
+//! `eta_never_increases_for_more_than_one_consecutive_sample` for the
+//! exact rule and a test that would fail without it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -286,10 +332,187 @@ struct ExecutorContext {
 /// is sampled from every 100ms -- see `job.rs`'s own doc comment: "those
 /// atomics are an executor-internal implementation detail... `Job` itself
 /// is the queue-visible *snapshot* type."
+///
+/// `small_files_done`/`large_bytes_done` (T-5.1.11) are additive to, not a
+/// replacement for, `files_done`/`bytes_done`: they feed
+/// [`EtaEstimator`]'s dual-regime rate estimate specifically, split by
+/// [`is_small_file`] -- see the module doc comment's "Progress and ETA"
+/// section.
 #[derive(Debug, Default)]
 struct ProgressCounters {
     files_done: AtomicU64,
     bytes_done: AtomicU64,
+    small_files_done: AtomicU64,
+    large_bytes_done: AtomicU64,
+}
+
+/// The size boundary [`is_small_file`] classifies a `CopyFile`/`Reflink`
+/// step's regime against -- deliberately the same value as
+/// [`COPY_BUFFER_BYTES`] (not a separately-tuned constant): a file smaller
+/// than one copy buffer is, by construction, dominated by per-file open/
+/// close/rename syscall overhead rather than sustained throughput, which
+/// is exactly the "small-file regime" design.md §9.3 describes.
+const SMALL_FILE_REGIME_THRESHOLD_BYTES: u64 = COPY_BUFFER_BYTES as u64;
+
+/// `true` if `size` (a `CopyFile`/`Reflink` step's planned byte count)
+/// belongs to the small-file regime -- see
+/// [`SMALL_FILE_REGIME_THRESHOLD_BYTES`].
+fn is_small_file(size: u64) -> bool {
+    size < SMALL_FILE_REGIME_THRESHOLD_BYTES
+}
+
+/// Sums `plan.steps` into `(total_small_files, total_large_bytes)` --
+/// [`EtaEstimator`]'s two "how much work exists in each regime" totals,
+/// computed once up front (mirroring how [`PlanTotals`] itself is computed
+/// once at plan time, not re-derived every tick). Zero-byte files count as
+/// small (the file-count-based small regime handles a zero-byte file
+/// exactly as well as any other tiny one).
+fn regime_totals(steps: &[Step]) -> (u64, u64) {
+    let mut total_small_files = 0u64;
+    let mut total_large_bytes = 0u64;
+    for step in steps {
+        if let Step::CopyFile { size, .. } | Step::Reflink { size, .. } = step {
+            if is_small_file(*size) {
+                total_small_files += 1;
+            } else {
+                total_large_bytes += *size;
+            }
+        }
+    }
+    (total_small_files, total_large_bytes)
+}
+
+/// The pure (no atomics, no I/O, no async) dual-regime EWMA ETA core --
+/// see the module doc comment's "Progress and ETA" section for the full
+/// design rationale. Kept separate from [`spawn_progress_sampler`] so its
+/// tick-by-tick behaviour (convergence speed, the backward-run clamp) is
+/// directly unit-testable against a synthetic sequence of `sample()` calls
+/// instead of needing a real 10-second wall-clock test.
+struct EtaEstimator {
+    total_small_files: u64,
+    total_large_bytes: u64,
+    small_rate_ema: Option<f64>,
+    large_rate_ema: Option<f64>,
+    last_small_done: u64,
+    last_large_done: u64,
+    last_reported: Option<u64>,
+    /// `true` once this tick's report is a same-or-lower-than-`last_reported`
+    /// value has NOT yet happened since the last increase -- i.e. whether
+    /// the *next* increase, if any, must be clamped. See `sample`'s doc
+    /// comment.
+    backward_pending: bool,
+}
+
+/// How heavily each tick's freshly observed instantaneous rate is weighted
+/// against the running EWMA -- large enough to converge well within
+/// T-5.1.11's own "within 20% after the first 10s" AC (10s at 100ms/tick
+/// is up to 100 ticks; this converges in a handful), small enough that one
+/// unusually fast or slow 100ms tick doesn't swing the estimate wildly.
+/// No numeric guidance exists in design.md/task.md for the exact figure --
+/// chosen and tested empirically, mirroring `RETRYABLE_MAX_ATTEMPTS`'s own
+/// "documented, deliberately conservative choice" precedent.
+const ETA_EWMA_ALPHA: f64 = 0.3;
+
+impl EtaEstimator {
+    fn new(total_small_files: u64, total_large_bytes: u64) -> Self {
+        EtaEstimator {
+            total_small_files,
+            total_large_bytes,
+            small_rate_ema: None,
+            large_rate_ema: None,
+            last_small_done: 0,
+            last_large_done: 0,
+            last_reported: None,
+            backward_pending: false,
+        }
+    }
+
+    /// Folds one 100ms tick's cumulative regime-done counters into the
+    /// estimator and returns the ETA (in whole seconds) to report for this
+    /// tick, or `None` if a regime with outstanding work has no rate
+    /// estimate yet.
+    ///
+    /// Backward-run rule (T-5.1.11's own AC, verbatim: "never runs
+    /// backwards for more than one sample"): if this tick's freshly
+    /// computed estimate is strictly greater than the *previously
+    /// reported* value, it is allowed through once: `last_reported`
+    /// updates to the new, higher value, but a note is kept that the next
+    /// increase (if any) must be suppressed. If the very next tick would
+    /// also increase, the increase is dropped and `last_reported` is
+    /// repeated unchanged instead -- so any real slowdown is still visible
+    /// (one honest jump), but the value can never climb two ticks running.
+    /// Any tick whose estimate is flat or lower clears the pending flag,
+    /// so a later, separate slowdown gets its own one free jump again.
+    fn sample(&mut self, small_done: u64, large_done: u64) -> Option<u64> {
+        let small_delta = small_done.saturating_sub(self.last_small_done);
+        let large_delta = large_done.saturating_sub(self.last_large_done);
+        self.last_small_done = small_done;
+        self.last_large_done = large_done;
+
+        if small_delta > 0 {
+            let instant_rate = small_delta as f64 * 10.0; // per-100ms -> per-second
+            self.small_rate_ema = Some(match self.small_rate_ema {
+                None => instant_rate,
+                Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
+            });
+        }
+        if large_delta > 0 {
+            let instant_rate = large_delta as f64 * 10.0;
+            self.large_rate_ema = Some(match self.large_rate_ema {
+                None => instant_rate,
+                Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
+            });
+        }
+
+        let remaining_small = self.total_small_files.saturating_sub(small_done);
+        let remaining_large = self.total_large_bytes.saturating_sub(large_done);
+
+        let small_eta = if remaining_small == 0 {
+            Some(0.0)
+        } else {
+            self.small_rate_ema
+                .filter(|r| *r > 0.0)
+                .map(|r| remaining_small as f64 / r)
+        };
+        let large_eta = if remaining_large == 0 {
+            Some(0.0)
+        } else {
+            self.large_rate_ema
+                .filter(|r| *r > 0.0)
+                .map(|r| remaining_large as f64 / r)
+        };
+
+        // `max`, not `+`: both regimes are drained by the same shared,
+        // `concurrency`-bounded worker pool (see the module doc comment's
+        // "Concurrency model" section), not two independent resource
+        // lanes -- each regime's own observed rate already reflects
+        // whatever share of the pool it's actually been getting while
+        // sharing it with the other regime. The job as a whole finishes
+        // once the slower-to-clear regime clears, not after the sum of
+        // both as if they ran one after the other.
+        let raw = match (small_eta, large_eta) {
+            (Some(s), Some(l)) => Some(s.max(l).round() as u64),
+            _ => None,
+        };
+
+        let reported = match (raw, self.last_reported) {
+            (Some(raw), Some(last)) if raw > last => {
+                if self.backward_pending {
+                    Some(last)
+                } else {
+                    self.backward_pending = true;
+                    Some(raw)
+                }
+            }
+            (Some(raw), _) => {
+                self.backward_pending = false;
+                Some(raw)
+            }
+            (None, _) => None,
+        };
+        self.last_reported = reported;
+        reported
+    }
 }
 
 /// Runs `plan` to completion (or until paused/cancelled), bracketing every
@@ -383,7 +606,14 @@ pub async fn execute(
         sticky_conflict: Arc::new(Mutex::new(None)),
     };
 
-    let sampler = spawn_progress_sampler(job_id, Arc::clone(&ctx.counters), events.clone());
+    let (total_small_files, total_large_bytes) = regime_totals(&plan.steps);
+    let sampler = spawn_progress_sampler(
+        job_id,
+        Arc::clone(&ctx.counters),
+        events.clone(),
+        total_small_files,
+        total_large_bytes,
+    );
 
     let mut report = JobReport {
         files_completed: 0,
@@ -1609,6 +1839,21 @@ async fn copy_file_step(
                     .bytes_done
                     .fetch_add(expected_size, Ordering::Relaxed);
             }
+            // T-5.1.11: regime-split counters `EtaEstimator` reads. A small
+            // file's whole size lands in one jump regardless of which copy
+            // path was used (the small regime tracks *file count*, not
+            // bytes); a large file's bytes were already added incrementally
+            // by `naive_copy` when `used_naive`, so only the accelerated
+            // path's single final jump needs it here.
+            if is_small_file(expected_size) {
+                ctx.counters
+                    .small_files_done
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if !used_naive {
+                ctx.counters
+                    .large_bytes_done
+                    .fetch_add(expected_size, Ordering::Relaxed);
+            }
         }
         StepAttempt::Done(StepOutcome::Skipped { .. }) => {
             // Not published anywhere -- clean up the staged copy so a
@@ -1629,12 +1874,14 @@ async fn copy_file_step(
 /// its own internal staging sibling) and returns `Interrupted` for the
 /// caller's retry loop to handle.
 ///
-/// Updates `ctx.counters.bytes_done` incrementally, chunk by chunk, as
-/// real progress happens -- both so the 100ms progress sampler reflects
-/// genuine intra-file progress on a large single file (not just discrete
-/// per-file jumps), and so a paused job's progress observably stops
-/// advancing promptly rather than only becoming visible once the whole
-/// (now-abandoned) file would have finished.
+/// Updates `ctx.counters.bytes_done` (and, when `expected_size` is in the
+/// large-file regime, `ctx.counters.large_bytes_done` -- see
+/// [`is_small_file`]) incrementally, chunk by chunk, as real progress
+/// happens -- both so the 100ms progress sampler reflects genuine
+/// intra-file progress on a large single file (not just discrete per-file
+/// jumps), and so a paused job's progress observably stops advancing
+/// promptly rather than only becoming visible once the whole (now-
+/// abandoned) file would have finished.
 async fn naive_copy(
     ctx: &ExecutorContext,
     from: &VPath,
@@ -1660,6 +1907,11 @@ async fn naive_copy(
             // scratch, so any bytes counted here must not persist into
             // the next attempt's count.
             ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+            if !is_small_file(expected_size) {
+                ctx.counters
+                    .large_bytes_done
+                    .fetch_sub(copied, Ordering::Relaxed);
+            }
             return Ok(StepAttempt::Interrupted);
         }
         let n = match reader.read(&mut buf).await {
@@ -1674,6 +1926,11 @@ async fn naive_copy(
                 // disk.
                 let _ = writer.abort().await;
                 ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+                if !is_small_file(expected_size) {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(copied, Ordering::Relaxed);
+                }
                 return Err(Box::new(VfsError::from_io(e)));
             }
         };
@@ -1683,12 +1940,22 @@ async fn naive_copy(
         if let Err(e) = writer.write_all(&buf[..n]).await {
             let _ = writer.abort().await;
             ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+            if !is_small_file(expected_size) {
+                ctx.counters
+                    .large_bytes_done
+                    .fetch_sub(copied, Ordering::Relaxed);
+            }
             return Err(Box::new(VfsError::from_io(e)));
         }
         copied += n as u64;
         ctx.counters
             .bytes_done
             .fetch_add(n as u64, Ordering::Relaxed);
+        if !is_small_file(expected_size) {
+            ctx.counters
+                .large_bytes_done
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
     writer.commit().await?;
     Ok(StepAttempt::Done(StepOutcome::Succeeded))
@@ -1744,23 +2011,29 @@ fn spawn_progress_sampler(
     job_id: JobId,
     counters: Arc<ProgressCounters>,
     events: mpsc::UnboundedSender<JobEvent>,
+    total_small_files: u64,
+    total_large_bytes: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         let mut last_bytes = 0u64;
+        let mut eta = EtaEstimator::new(total_small_files, total_large_bytes);
         loop {
             interval.tick().await;
             let bytes_done = counters.bytes_done.load(Ordering::Relaxed);
             let files_done = counters.files_done.load(Ordering::Relaxed);
+            let small_files_done = counters.small_files_done.load(Ordering::Relaxed);
+            let large_bytes_done = counters.large_bytes_done.load(Ordering::Relaxed);
             let throughput = bytes_done.saturating_sub(last_bytes) * 10; // per-100ms -> per-second
             last_bytes = bytes_done;
+            let eta_secs = eta.sample(small_files_done, large_bytes_done);
             let snapshot = ProgressSnapshot {
                 files_done,
                 bytes_done,
                 current_file_bytes_done: 0,
                 current_file_bytes_total: 0,
                 throughput_bytes_per_sec: throughput,
-                eta_secs: None,
+                eta_secs,
             };
             if events
                 .send(JobEvent::Progress { job_id, snapshot })
@@ -2016,6 +2289,108 @@ mod tests {
                     }
                     remaining -= n as u64;
                     tokio::time::sleep(delay).await;
+                }
+            });
+            Ok(Box::new(ThrottledReader(rx)))
+        }
+        async fn open_write(
+            &self,
+            p: &VPath,
+            o: WriteOpts,
+        ) -> Result<Box<dyn duet_vfs::AsyncWriteCommit>> {
+            self.inner.open_write(p, o).await
+        }
+        async fn create_dir(&self, p: &VPath, mode: Option<Mode>) -> Result<()> {
+            self.inner.create_dir(p, mode).await
+        }
+        async fn remove(&self, p: &VPath, kind: RemoveKind) -> Result<()> {
+            self.inner.remove(p, kind).await
+        }
+        async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
+            self.inner.rename(from, to, flags).await
+        }
+        async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+            self.inner.link(source, dest).await
+        }
+        async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
+            self.inner.set_meta(p, m).await
+        }
+        fn watch(
+            &self,
+            p: &VPath,
+        ) -> Result<futures_util::stream::BoxStream<'_, duet_vfs::ChangeEvent>> {
+            self.inner.watch(p)
+        }
+        async fn server_side_copy(
+            &self,
+            _from: &VPath,
+            _to: &VPath,
+            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+        ) -> Result<duet_vfs::CopyOutcome> {
+            Ok(duet_vfs::CopyOutcome::Unsupported)
+        }
+    }
+
+    /// A `FileSystem` test double wrapping a real [`LocalFs`], whose
+    /// `open_read` streams a file's *real* content (unlike
+    /// [`ThrottledFs`]'s synthetic zero-filled stream, which ignores the
+    /// requested path entirely) but paced to a fixed `bytes_per_sec`
+    /// regardless of how fast the underlying storage actually is --
+    /// T-5.1.11's `eta_accuracy_is_within_20_percent_after_ten_seconds`
+    /// benchmark needs a real, sustained, multi-second copy to validate
+    /// ETA accuracy against, and tmpfs (this crate's test tempdir backend)
+    /// is fast enough that even several GiB copies in a couple of real
+    /// seconds -- nowhere near long enough to observe the AC's own "after
+    /// the first 10s" window without an unreasonable multi-tens-of-GiB
+    /// corpus. Reuses [`ThrottledReader`]'s exact "background task feeds a
+    /// duplex pipe at a controlled pace" shape, just forwarding real bytes
+    /// read from `inner` instead of synthesizing them. `open_write` is
+    /// left unthrottled (delegates straight to `inner`): pacing the read
+    /// side alone is sufficient to bound overall copy throughput, and
+    /// throttling both would just double-count the same slowdown.
+    struct PacedFs {
+        inner: LocalFs,
+        bytes_per_sec: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystem for PacedFs {
+        fn scheme(&self) -> &'static str {
+            self.inner.scheme()
+        }
+        fn caps(&self) -> duet_types::Caps {
+            self.inner.caps()
+        }
+        fn read_dir(
+            &self,
+            p: &VPath,
+            opts: duet_vfs::ListOpts,
+        ) -> futures_util::stream::BoxStream<'_, Result<Vec<duet_vfs::DirEntry>>> {
+            self.inner.read_dir(p, opts)
+        }
+        async fn stat(&self, p: &VPath, follow: bool) -> Result<duet_types::Metadata> {
+            self.inner.stat(p, follow).await
+        }
+        async fn volume_stats(&self, p: &VPath) -> Result<duet_vfs::VolumeStats> {
+            self.inner.volume_stats(p).await
+        }
+        async fn open_read(&self, p: &VPath) -> Result<Box<dyn duet_vfs::AsyncReadSeek>> {
+            let mut real = self.inner.open_read(p).await?;
+            const CHUNK: usize = 256 * 1024;
+            let (mut tx, rx) = tokio::io::duplex(CHUNK);
+            let bytes_per_sec = self.bytes_per_sec;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    let n = match real.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if tx.write_all(&buf[..n]).await.is_err() {
+                        break; // reader side dropped (e.g. the step was aborted)
+                    }
+                    tokio::time::sleep(Duration::from_secs_f64(n as f64 / bytes_per_sec as f64))
+                        .await;
                 }
             });
             Ok(Box::new(ThrottledReader(rx)))
@@ -3008,6 +3383,307 @@ mod tests {
             "verify_throughput_overhead_is_measured_and_documented: {mib} MiB -- \
              copy without verify={without_verify:?}, copy with verify={with_verify:?} \
              (BLAKE3 verification adds {overhead_pct:.1}% wall-clock overhead)"
+        );
+    }
+
+    // ---- T-5.1.11: progress and ETA --------------------------------------
+
+    #[test]
+    fn eta_is_none_before_any_regime_has_a_rate() {
+        let mut eta = EtaEstimator::new(10, 1_000_000);
+        assert_eq!(eta.sample(0, 0), None);
+    }
+
+    /// Outstanding work in *both* regimes, but only one has produced a rate
+    /// yet -- the combined estimate must stay `None` until both do (see the
+    /// module doc comment's "Progress and ETA" section), not silently
+    /// report a number that only accounts for half the job.
+    #[test]
+    fn eta_is_none_while_only_one_of_two_regimes_with_outstanding_work_has_a_rate() {
+        let mut eta = EtaEstimator::new(1_000, 1_000_000);
+        assert_eq!(eta.sample(0, 100_000), None, "large moved, small hasn't");
+        assert!(
+            eta.sample(50, 200_000).is_some(),
+            "both regimes have now produced at least one real delta"
+        );
+    }
+
+    /// A regime with no planned work at all (e.g. an all-small-files job,
+    /// `total_large_bytes == 0`) must not block the estimate forever
+    /// waiting for a rate that regime will never produce.
+    #[test]
+    fn eta_ignores_a_regime_with_no_outstanding_work() {
+        let mut eta = EtaEstimator::new(1_000, 0);
+        assert_eq!(eta.sample(0, 0), None);
+        // 10 files in one 100ms tick -> 100 files/sec instantaneous rate;
+        // 990 remaining / 100/s = 9.9s, rounds to 10. The empty large
+        // regime contributes a fixed `Some(0.0)` and never blocks this.
+        assert_eq!(eta.sample(10, 0), Some(10));
+    }
+
+    /// Constant, non-adversarial per-tick progress in both regimes -- the
+    /// EWMA reaches its fixed point immediately (a constant instantaneous
+    /// rate blended with itself via `alpha` is still that same rate), so
+    /// the reported ETA should land very close to the true remaining time
+    /// computed directly from the (known, constant) rates. This is the
+    /// arithmetic half of T-5.1.11's own AC ("within 20% after 10s") --
+    /// [`verify_throughput_overhead_is_measured_and_documented`]'s sibling
+    /// `DUET_BENCH_ETA_ACCURACY`-gated test below covers the real-I/O,
+    /// real-wall-clock half.
+    #[test]
+    fn eta_lands_close_to_the_true_remaining_time_for_steady_mixed_rates() {
+        // Small regime: 20 files/tick (200 files/sec). Large regime: 2 MiB/
+        // tick (20 MiB/sec) -- both well above the small-file threshold's
+        // own 1 MiB, so this is a genuine mixed-regime scenario.
+        let total_small_files = 100_000u64;
+        let total_large_bytes = 2_000_000_000u64; // ~1.9 GiB
+        let mut eta = EtaEstimator::new(total_small_files, total_large_bytes);
+
+        let mut small_done = 0u64;
+        let mut large_done = 0u64;
+        let mut last = None;
+        // 100 ticks = 10s, matching the AC's own "after the first 10s".
+        for _ in 0..100 {
+            small_done += 20;
+            large_done += 2_000_000;
+            last = eta.sample(small_done, large_done);
+        }
+
+        let small_rate = 200.0; // files/sec
+        let large_rate = 20_000_000.0; // bytes/sec
+        let true_small_eta = (total_small_files - small_done) as f64 / small_rate;
+        let true_large_eta = (total_large_bytes - large_done) as f64 / large_rate;
+        let true_eta = true_small_eta.max(true_large_eta);
+
+        let reported = last.expect("10s of steady progress in both regimes must have a rate");
+        let error = (reported as f64 - true_eta).abs() / true_eta;
+        assert!(
+            error <= 0.20,
+            "reported {reported}s, true remaining {true_eta:.1}s -- {:.1}% off, AC allows 20%",
+            error * 100.0
+        );
+    }
+
+    /// T-5.1.11's own AC, verbatim: "never runs backwards for more than one
+    /// sample." Establishes a fast rate, then feeds several consecutively
+    /// *slower* (but still nonzero -- a real slowdown, not a barrier-step
+    /// pause) ticks in a row, which pulls the EWMA down and would otherwise
+    /// make the raw ETA climb every single tick. Across the reported
+    /// sequence, no value may be strictly greater than the one immediately
+    /// before it more than once in a row.
+    #[test]
+    fn eta_never_increases_for_more_than_one_consecutive_sample() {
+        let mut eta = EtaEstimator::new(0, 1_000_000_000);
+        let mut large_done = 0u64;
+        let mut reported = Vec::new();
+
+        // Warm up at a fast, steady rate (10 MiB/tick = 100 MiB/sec).
+        for _ in 0..10 {
+            large_done += 10_000_000;
+            reported.push(eta.sample(0, large_done));
+        }
+        // Then a real, sustained slowdown: 1 MiB/tick for many ticks.
+        for _ in 0..30 {
+            large_done += 1_000_000;
+            reported.push(eta.sample(0, large_done));
+        }
+
+        let values: Vec<u64> = reported.into_iter().flatten().collect();
+        let mut consecutive_increases = 0u32;
+        for pair in values.windows(2) {
+            if pair[1] > pair[0] {
+                consecutive_increases += 1;
+                assert!(
+                    consecutive_increases <= 1,
+                    "eta increased for two samples in a row: {values:?}"
+                );
+            } else {
+                consecutive_increases = 0;
+            }
+        }
+        // The slowdown must still be visible somewhere (the clamp
+        // suppresses a *second* consecutive climb, not every climb).
+        assert!(
+            values.windows(2).any(|p| p[1] > p[0]),
+            "a genuine sustained slowdown never showed up as a single honest jump: {values:?}"
+        );
+    }
+
+    /// End-to-end sanity through the real `execute()`/sampler pipeline (no
+    /// throttling, no env-gate): a small mixed corpus is enough to prove
+    /// the wiring is real -- `eta_secs` starts `None` and becomes `Some`
+    /// once both regimes have moved. The literal "within 20% after 10s"
+    /// number is [`eta_accuracy_is_within_20_percent_after_ten_seconds`]'s
+    /// job, gated behind real wall-clock time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copying_a_mixed_corpus_reports_a_real_eta_before_finishing() {
+        let src = TempDir::new().unwrap();
+        for i in 0..80 {
+            std::fs::write(src.path().join(format!("small-{i}.txt")), b"tiny").unwrap();
+        }
+        // 16 MiB, comfortably above SMALL_FILE_REGIME_THRESHOLD_BYTES (1 MiB).
+        std::fs::write(src.path().join("large.bin"), vec![7u8; 16 * 1024 * 1024]).unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        // `delay`: an artificial per-step floor so this genuinely spans
+        // several 100ms sampler ticks even on tmpfs, where the real I/O
+        // for a corpus this size would otherwise finish inside a single
+        // tick and never exercise the estimator at all.
+        let fs: Arc<dyn FileSystem> = Arc::new(TestFs {
+            inner: LocalFs,
+            force_unsupported: true, // force naive_copy's incremental path
+            delay: Duration::from_millis(5),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let (report, events) = run(fs, plan, state.path(), 2).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let etas: Vec<Option<u64>> = events
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Progress { snapshot, .. } => Some(snapshot.eta_secs),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            etas.iter().any(|e| e.is_some()),
+            "a job with real mixed progress must report a real ETA at some point: {etas:?}"
+        );
+    }
+
+    /// T-5.1.11's own AC, verbatim, at real scale: "ETA on a mixed corpus
+    /// is within 20% after the first 10 s." Needs genuine, sustained
+    /// progress spanning at least 10 real seconds -- gated like this
+    /// crate's existing `DUET_BENCH_VERIFY_LARGE`/`duet-vfs`'s own
+    /// `DUET_BENCH_LARGE_COPY` precedent, not run by default. Uses
+    /// [`PacedFs`] rather than raw tmpfs throughput: tmpfs copies several
+    /// GiB in a couple of real seconds (confirmed empirically while
+    /// building this test), so reaching a genuine 10+ second run on raw
+    /// disk speed alone would need an unreasonably large corpus (tens of
+    /// GiB) and would vary wildly by machine; a fixed, paced read rate
+    /// keeps the corpus modest (under 1 GiB) and the measured duration
+    /// portable across environments.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eta_accuracy_is_within_20_percent_after_ten_seconds() {
+        if std::env::var("DUET_BENCH_ETA_ACCURACY").as_deref() != Ok("1") {
+            eprintln!(
+                "eta_accuracy_is_within_20_percent_after_ten_seconds: skipped by default \
+                 (runs for ~15s) -- set DUET_BENCH_ETA_ACCURACY=1 to run (optionally \
+                 DUET_BENCH_ETA_ACCURACY_MIB=750 to change the large-file total)"
+            );
+            return;
+        }
+        let mib: u64 = std::env::var("DUET_BENCH_ETA_ACCURACY_MIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(750);
+        // 50 MiB/s paced read rate -- chosen so the default 750 MiB corpus
+        // runs for ~15s (comfortably past the AC's 10s mark with margin
+        // for the small-file batch and setup), without either an
+        // unreasonably large corpus or an unreasonably long test.
+        const PACED_BYTES_PER_SEC: u64 = 50 * 1024 * 1024;
+
+        let src = TempDir::new().unwrap();
+        for i in 0..500 {
+            std::fs::write(src.path().join(format!("small-{i}.txt")), vec![1u8; 2048]).unwrap();
+        }
+        let large_dir = src.path().join("large");
+        std::fs::create_dir(&large_dir).unwrap();
+        let per_file_mib = mib / 4;
+        for i in 0..4 {
+            let path = large_dir.join(format!("bench-{i}.bin"));
+            let mut f = std::fs::File::create(&path).unwrap();
+            use std::io::Write;
+            let chunk = vec![9u8; 4 * 1024 * 1024];
+            let mut written = 0u64;
+            let target = per_file_mib * 1024 * 1024;
+            while written < target {
+                let n = (chunk.len() as u64).min(target - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(PacedFs {
+            inner: LocalFs,
+            bytes_per_sec: PACED_BYTES_PER_SEC,
+        });
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let start = std::time::Instant::now();
+        // `concurrency: 1` -- `PacedFs` throttles each independently
+        // opened read stream to `PACED_BYTES_PER_SEC` on its own; running
+        // several large-file copies concurrently would multiply the
+        // effective aggregate throughput by however many are in flight at
+        // once, making the paced rate meaningless as a bound. One stream
+        // at a time keeps the sustained rate exactly `PACED_BYTES_PER_SEC`.
+        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 1, tx, control, None));
+
+        // Find the Progress sample closest to (but not before) t=10s.
+        let mut predicted_at_10s: Option<u64> = None;
+        let mut ten_second_mark: Option<Duration> = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                JobEvent::Progress { snapshot, .. }
+                    if start.elapsed() >= Duration::from_secs(10) =>
+                {
+                    if predicted_at_10s.is_none() {
+                        predicted_at_10s = snapshot.eta_secs;
+                        ten_second_mark = Some(start.elapsed());
+                    }
+                }
+                JobEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        let report = handle.await.expect("executor task panicked");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let total_elapsed = start.elapsed();
+
+        let predicted = predicted_at_10s
+            .expect("a paced multi-hundred-MiB mixed copy still running past 10s must have a real ETA by then");
+        let sample_time = ten_second_mark.unwrap();
+        let actual_remaining = (total_elapsed.as_secs_f64() - sample_time.as_secs_f64()).max(0.0);
+        let error = (predicted as f64 - actual_remaining).abs() / actual_remaining.max(1.0);
+        eprintln!(
+            "eta_accuracy_is_within_20_percent_after_ten_seconds: {mib} MiB large + 500 small \
+             files, paced at {} MiB/s -- sampled at {sample_time:?}, predicted {predicted}s \
+             remaining, actual {actual_remaining:.1}s remaining ({:.1}% off)",
+            PACED_BYTES_PER_SEC / (1024 * 1024),
+            error * 100.0
+        );
+        assert!(
+            error <= 0.20,
+            "predicted {predicted}s, actual {actual_remaining:.1}s remaining -- {:.1}% off, \
+             T-5.1.11's own AC allows 20%",
+            error * 100.0
         );
     }
 
