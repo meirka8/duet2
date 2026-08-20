@@ -33,8 +33,13 @@
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
 //!   See its own module doc comment for the (deliberately disclosed)
-//!   scope cuts — retry/backoff, ETA, and multi-job queueing are each a
-//!   separate, later task.
+//!   scope cuts — retry/backoff (T-5.1.10) and ETA (T-5.1.11) are each a
+//!   separate task; multi-job queueing is [`queue`], below.
+//! - [`queue`] — T-5.1.13: [`queue::QueueManager`], a bounded-concurrency
+//!   scheduler over many [`job::Job`]s at once — priority ordering,
+//!   pause/resume/cancel/reorder, and the queue-wide `ErrorKind::Space`
+//!   propagation `executor`'s own module doc comment disclosed as not yet
+//!   built ("pause the whole queue, not just the job").
 //! - [`conflict`] — T-5.1.9: the FR-OPS-04 policy set, the per-conflict
 //!   prompt data the UI needs, and [`conflict::ConflictResolver`], the seam
 //!   a live UI (or a test) plugs into. All seven TC policies are real,
@@ -63,6 +68,7 @@ mod journal;
 mod mover;
 mod plan;
 mod planner;
+mod queue;
 mod step;
 
 pub use conflict::{
@@ -76,4 +82,5 @@ pub use journal::{Journal, JournalReader, JournalRecord, RecoveryReport, StepOut
 pub use mover::plan_move;
 pub use plan::{Plan, PlanOptions, PlanTotals};
 pub use planner::{CancelToken, PlannerError, plan_copy};
+pub use queue::{QueueError, QueueManager};
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
