@@ -15,14 +15,22 @@
 //! selinux_label` are populated without every caller having to know the
 //! xattr name by heart.
 //!
-//! # Apply order
+//! # Apply order (corrected by T-5.1.6)
 //!
-//! Per design.md §9.3 / `docs/crash-safety.md`'s `SetMeta` step: mode,
-//! then ownership, then xattrs (ACL/SELinux included), then timestamps
-//! *last* — because setting xattrs perturbs `ctime`, and applying
-//! timestamps last means whatever the caller explicitly asked for (e.g.
-//! "preserve the source's mtime" during a copy) is the value that
-//! actually sticks, not something the kernel bumped back up afterward.
+//! Per design.md §9.3, verbatim: mode, then xattrs (ACL/SELinux included),
+//! then timestamps, then ownership *last*. Two independent reasons drive
+//! this order, not just one:
+//! - Timestamps come after xattrs because setting xattrs perturbs `ctime`,
+//!   and (within timestamps vs. xattrs) applying whatever the caller
+//!   explicitly asked for last means it's the value that actually sticks,
+//!   not something the kernel bumped back up afterward.
+//! - Ownership comes after *everything*, including timestamps, because
+//!   `chown(2)` clears a file's setuid/setgid mode bits as a security
+//!   measure when the caller lacks `CAP_FSETID` — applying it any earlier
+//!   (this module's own behaviour before T-5.1.6) would silently lose a
+//!   setuid/setgid bit `chmod` had just set, for any caller in that
+//!   position. See [`set_meta`]'s own doc comment for the full
+//!   explanation.
 //!
 //! # Degrade, don't fail (T-3.1.5's AC)
 //!
@@ -149,6 +157,23 @@ fn omit_timespec() -> Timespec {
 
 /// `FileSystem::set_meta`'s implementation. See module doc comment for the
 /// apply order and the "degrade on unsupported field" contract.
+///
+/// # Apply order (fixed by T-5.1.6)
+///
+/// design.md §9.3, verbatim: "mode, then xattrs..., POSIX ACLs, SELinux
+/// label, then timestamps *last*..., then ownership if privileged."
+/// Ownership genuinely has to be the very last step, not merely "somewhere
+/// after mode" -- `chown(2)` on Linux clears a file's setuid/setgid bits as
+/// a security measure whenever the caller lacks `CAP_FSETID` (a
+/// non-privileged process always lacks it, so its `chown` clears these
+/// bits unconditionally -- confirmed directly while building this fix's
+/// test coverage; a privileged process normally holds it, so its `chown`
+/// leaves them alone). Applying `chown` *before* `chmod` (this function's
+/// behaviour before T-5.1.6) would silently lose a setuid/setgid bit
+/// `chmod` had just set, for any caller in the "lacks `CAP_FSETID`"
+/// position -- exactly the kind of "tricky file" T-5.1.6's own AC
+/// (byte-identical `stat` comparison for a corpus of tricky files) exists
+/// to catch.
 pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
     guard::assert_not_ui_thread();
     let path = real_path(p);
@@ -163,15 +188,7 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         fs::chmodat(CWD, &path, mode, AtFlags::empty()).map_err(|e| rustix_err("chmodat", p, e))?;
     }
 
-    // 2. Ownership.
-    if m.uid.is_some() || m.gid.is_some() {
-        let uid = m.uid.map(Uid::from_raw);
-        let gid = m.gid.map(Gid::from_raw);
-        fs::chownat(CWD, &path, uid, gid, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|e| rustix_err("chownat", p, e))?;
-    }
-
-    // 3. Xattrs -- ACL/SELinux included, via whatever name the caller put
+    // 2. Xattrs -- ACL/SELinux included, via whatever name the caller put
     // in `set_xattrs`/`remove_xattrs` (see module doc comment).
     for (name, value) in &m.set_xattrs {
         if let Err(e) = fs::lsetxattr(&path, name.as_str(), value, XattrFlags::empty()) {
@@ -200,7 +217,8 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         }
     }
 
-    // 4. Timestamps, last (see module doc comment for why).
+    // 3. Timestamps (see module doc comment for why these come before
+    // ownership but after everything else above).
     if m.modified.is_some() || m.accessed.is_some() {
         let times = Timestamps {
             last_access: m.accessed.map(to_timespec).unwrap_or_else(omit_timespec),
@@ -208,6 +226,28 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         };
         fs::utimensat(CWD, &path, &times, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| rustix_err("utimensat", p, e))?;
+    }
+
+    // 4. Ownership, genuinely last (see this function's own doc comment).
+    // Degrades on `EPERM`/`ROFS` rather than hard-failing the whole call --
+    // an unprivileged process attempting to `chown` to an arbitrary uid/gid
+    // (e.g. a plain copy preserving the source's original owner) is the
+    // common case now that T-5.1.6 wires this into every copy/move, not an
+    // exceptional one; design.md's own "ownership if privileged" already
+    // frames this as attempt-and-degrade, not attempt-and-fail.
+    if m.uid.is_some() || m.gid.is_some() {
+        let uid = m.uid.map(Uid::from_raw);
+        let gid = m.gid.map(Gid::from_raw);
+        if let Err(e) = fs::chownat(CWD, &path, uid, gid, AtFlags::SYMLINK_NOFOLLOW) {
+            if e == Errno::PERM || e == Errno::ROFS {
+                warnings.push(format!(
+                    "ownership could not be set (not privileged, or a read-only \
+                     filesystem): {e}"
+                ));
+            } else {
+                return Err(rustix_err("chownat", p, e));
+            }
+        }
     }
 
     for w in &warnings {
@@ -276,6 +316,84 @@ mod tests {
         );
     }
 
+    /// T-5.1.6: proves the apply-order fix, gated on actually running as
+    /// root -- confirmed empirically while writing this test that an
+    /// *unprivileged* `chown` clears setuid/setgid on Linux unconditionally
+    /// (even a no-op chown to the caller's own current uid/gid), regardless
+    /// of whether it runs before or after `chmod`. That's expected kernel
+    /// behaviour (`should_remove_suid`, gated on the caller lacking
+    /// `CAP_FSETID`), not something this ordering fix changes or could ever
+    /// change for an unprivileged caller -- the fix's actual benefit is
+    /// specifically for a *privileged* process (root, which normally holds
+    /// `CAP_FSETID`, so its `chown` does *not* clear these bits): applying
+    /// ownership before mode (this module's behaviour before T-5.1.6) would
+    /// still be *safe* for root today, but the fix matters the moment
+    /// ownership is applied through a path that ever runs without
+    /// `CAP_FSETID` while still being able to `chown` (a `setcap`'d
+    /// helper, say) -- not reproducible in this unprivileged dev/CI
+    /// environment, so this test degrades to a recorded skip rather than a
+    /// false pass or a spurious failure, per this codebase's existing
+    /// precedent for privilege/environment-dependent behaviour (see e.g.
+    /// this module's own ACL/SELinux tests).
+    #[test]
+    fn setuid_bit_survives_ownership_application_when_privileged() {
+        if rustix::process::getuid().as_raw() != 0 {
+            eprintln!(
+                "setuid_bit_survives_ownership_application_when_privileged: not running as \
+                 root -- skipping. An unprivileged chown clears setuid/setgid unconditionally \
+                 on Linux regardless of apply order (confirmed directly while writing this \
+                 test), so this ordering fix's benefit can only be observed running \
+                 privileged. Recorded, not a test failure."
+            );
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"content").unwrap();
+        let target = vp(&dir, "f.txt");
+        let path = real_path(&target);
+
+        let my_uid = rustix::process::getuid().as_raw();
+        let my_gid = rustix::process::getgid().as_raw();
+
+        let patch = MetaPatch {
+            mode: Some(0o4750), // setuid + rwxr-x---
+            uid: Some(my_uid),
+            gid: Some(my_gid),
+            ..Default::default()
+        };
+        set_meta(&target, &patch).unwrap();
+
+        let st = fs::statat(CWD, &path, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert_eq!(
+            st.st_mode & 0o7777,
+            0o4750,
+            "the setuid bit must survive when a privileged process applies ownership last"
+        );
+    }
+
+    /// The order-independent regression case *is* fully testable
+    /// unprivileged: `set_meta` must apply `mode` before attempting
+    /// ownership at all, so a setuid bit survives whenever the patch
+    /// carries no `uid`/`gid` (the common case for a plain, same-owner
+    /// copy) -- no chown call happens, so nothing can clear it.
+    #[test]
+    fn setuid_bit_survives_when_the_patch_has_no_ownership_change() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"content").unwrap();
+        let target = vp(&dir, "f.txt");
+        let path = real_path(&target);
+
+        let patch = MetaPatch {
+            mode: Some(0o4750), // setuid + rwxr-x---
+            ..Default::default()
+        };
+        set_meta(&target, &patch).unwrap();
+
+        let st = fs::statat(CWD, &path, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert_eq!(st.st_mode & 0o7777, 0o4750);
+    }
+
     /// T-3.1.5 AC: "unsupported attributes degrade with a recorded
     /// warning, not a hard error." Removing a nonexistent xattr is the one
     /// deterministic, environment-independent way to exercise the
@@ -292,6 +410,46 @@ mod tests {
             ..Default::default()
         };
         set_meta(&target, &patch).unwrap();
+    }
+
+    /// T-5.1.6: an unprivileged `chown` to a uid the caller doesn't own
+    /// (root's, here -- reliably not-ours in any dev/CI environment this
+    /// test actually runs unprivileged in) must degrade the same way an
+    /// unsupported xattr already does: a recorded warning, not a hard
+    /// failure of the whole call -- and everything *before* ownership in
+    /// the apply order (mode, in this case) must still have taken effect.
+    /// This is what makes it safe for `plan_copy`/`plan_move` (T-5.1.6) to
+    /// unconditionally attempt ownership preservation on every copy,
+    /// rather than needing to pre-check privilege itself.
+    #[test]
+    fn chown_to_an_unowned_uid_degrades_instead_of_failing_the_whole_call() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+        let target = vp(&dir, "f.txt");
+        let path = real_path(&target);
+        let my_uid = rustix::process::getuid().as_raw();
+        assert_ne!(
+            my_uid, 0,
+            "this test assumes it's not already running as root"
+        );
+
+        let patch = MetaPatch {
+            mode: Some(0o640),
+            uid: Some(0), // root -- not ours, and we're not privileged to claim it
+            ..Default::default()
+        };
+        set_meta(&target, &patch).unwrap();
+
+        let st = fs::statat(CWD, &path, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        assert_eq!(
+            st.st_mode & 0o777,
+            0o640,
+            "mode must still have been applied even though ownership was denied"
+        );
+        assert_eq!(
+            st.st_uid, my_uid,
+            "the failed chown must not have partially applied"
+        );
     }
 
     /// Best-effort round-trip of the ACL/SELinux *convenience* fields

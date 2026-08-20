@@ -88,7 +88,7 @@ use duet_vfs::{FileSystem, ListFields, ListOpts};
 use futures_util::StreamExt;
 
 use crate::plan::{Plan, PlanOptions};
-use crate::planner::{CancelToken, PlannerError};
+use crate::planner::{CancelToken, PlannerError, metadata_to_patch};
 use crate::step::{RemoveMode, Step, VerifyAlgorithm};
 
 /// A cross-device top-level source: its own `dest` path (already resolved
@@ -109,6 +109,19 @@ struct CrossDeviceEntry {
 struct PendingDir {
     source: VPath,
     dest: VPath,
+}
+
+/// A `CreateDir`/`CopyFile` step's index, destination, and source metadata,
+/// recorded so its own `Step::SetMeta` follow-up can be deferred to the
+/// very end of the plan (T-5.1.6) instead of interleaved right after it --
+/// see `planner::DeferredMeta`'s own doc comment for the full reasoning
+/// (directory mtimes, and keeping `execute`'s copy-class batching intact).
+/// Duplicated here rather than shared with `planner`'s own private type
+/// since the two walks otherwise share nothing else structurally.
+struct DeferredMeta {
+    step_index: u32,
+    dest: VPath,
+    meta: Metadata,
 }
 
 /// Walks `sources` (each moved as a child of `dest_dir`, keeping its own
@@ -172,11 +185,14 @@ pub async fn plan_move(
     }
 
     // Phase 2: walk every cross-device entry's subtree (BFS, mirroring
-    // `plan_copy`), collecting `CopyFile` step indices (for phase 3) and
-    // source-side directory paths in discovery order (for phase 4).
+    // `plan_copy`), collecting `CopyFile` step indices (for phase 3),
+    // source-side directory paths in discovery order (for phase 4), and
+    // every entry's own metadata for a deferred `SetMeta` (T-5.1.6, phase
+    // 5 below).
     let mut queue: VecDeque<PendingDir> = VecDeque::new();
     let mut copy_step_indices: Vec<usize> = Vec::new();
     let mut source_dirs: Vec<VPath> = Vec::new();
+    let mut deferred_meta: Vec<DeferredMeta> = Vec::new();
 
     for entry in &cross_device {
         if cancel.is_cancelled() {
@@ -187,6 +203,11 @@ pub async fn plan_move(
                 steps.push(Step::CreateDir {
                     dest: entry.dest.clone(),
                     mode: entry.meta.mode,
+                });
+                deferred_meta.push(DeferredMeta {
+                    step_index: (steps.len() - 1) as u32,
+                    dest: entry.dest.clone(),
+                    meta: entry.meta.clone(),
                 });
                 source_dirs.push(entry.source.clone());
                 queue.push_back(PendingDir {
@@ -202,13 +223,20 @@ pub async fn plan_move(
                     conflict: None,
                 });
                 copy_step_indices.push(steps.len() - 1);
+                deferred_meta.push(DeferredMeta {
+                    step_index: (steps.len() - 1) as u32,
+                    dest: entry.dest.clone(),
+                    meta: entry.meta.clone(),
+                });
             }
             _ => unreachable!("filtered to Directory | File in phase 1"),
         }
     }
 
+    // T-5.1.6: full metadata (xattrs/ACL/SELinux label included), not just
+    // mode -- mirrors `plan_copy`'s own upgrade from `MODE`-only.
     let list_opts = ListOpts {
-        fields: ListFields::MODE,
+        fields: ListFields::all(),
         follow_symlinks: false,
     };
     while let Some(dir) = queue.pop_front() {
@@ -236,17 +264,27 @@ pub async fn plan_move(
                             dest: dest.clone(),
                             mode: entry.metadata.mode,
                         });
+                        deferred_meta.push(DeferredMeta {
+                            step_index: (steps.len() - 1) as u32,
+                            dest: dest.clone(),
+                            meta: entry.metadata.clone(),
+                        });
                         source_dirs.push(source.clone());
                         queue.push_back(PendingDir { source, dest });
                     }
                     EntryKind::File => {
                         steps.push(Step::CopyFile {
                             source,
-                            dest,
+                            dest: dest.clone(),
                             size: entry.metadata.size,
                             conflict: None,
                         });
                         copy_step_indices.push(steps.len() - 1);
+                        deferred_meta.push(DeferredMeta {
+                            step_index: (steps.len() - 1) as u32,
+                            dest,
+                            meta: entry.metadata,
+                        });
                     }
                     _ => {} // symlinks etc -- see the module doc comment's scope cuts
                 }
@@ -293,6 +331,21 @@ pub async fn plan_move(
             target: dir_source,
             mode: RemoveMode::EmptyDir,
             depends_on: None,
+        });
+    }
+
+    // Phase 5 (T-5.1.6): every cross-device entry's own `SetMeta` follow-up
+    // lands last, after everything above -- see `planner::DeferredMeta`'s
+    // own doc comment (directory mtimes, and keeping every `CopyFile` run
+    // in phase 2 unbroken for `execute`'s copy-class batching). Order
+    // relative to phase 3/4's `Verify`/`Remove` steps doesn't matter:
+    // `SetMeta` only ever targets `dest`, never the source paths phase 3/4
+    // touch.
+    for entry in deferred_meta {
+        steps.push(Step::SetMeta {
+            target: entry.dest,
+            patch: metadata_to_patch(&entry.meta),
+            depends_on: Some(entry.step_index),
         });
     }
 
@@ -599,9 +652,10 @@ mod tests {
         );
         assert_eq!(
             report.skipped.len(),
-            2,
-            "both the dependency-gated file Remove AND the now-self-gated (still \
-             non-empty, ENOTEMPTY) parent directory Remove must be skipped"
+            3,
+            "the dependency-gated file Remove, the dependency-gated file SetMeta \
+             (T-5.1.6), AND the now-self-gated (still non-empty, ENOTEMPTY) parent \
+             directory Remove must all be skipped"
         );
         assert!(
             src.path().join("a.txt").exists(),
