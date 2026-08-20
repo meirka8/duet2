@@ -39,6 +39,8 @@ serde_json = "1"
 # make "concurrency respects rotational detection" untestable in the way
 # T-5.1.1's own cancellation test already established the precedent for.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+# T-5.1.12: FR-OPS-08's post-copy verification algorithm.
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile = "3.12"

@@ -919,7 +919,7 @@ async fn dispatch(
             dest,
             algorithm,
             ..
-        } => verify_step(&*ctx.fs, source, dest, *algorithm).await,
+        } => verify_step(ctx, source, dest, *algorithm).await,
     }
 }
 
@@ -1378,16 +1378,65 @@ async fn remove_step(fs: &dyn FileSystem, target: &VPath, mode: RemoveMode) -> R
 /// is a real, useful verification level on its own (catches a truncated
 /// or otherwise short/long copy), not a stub standing in for the real
 /// thing.
+/// One [`hash_file`] attempt's result: either it hashed the whole file, or
+/// a pause/cancel request landed mid-read -- mirrors [`StepAttempt`] at a
+/// smaller scope (a single side of a [`VerifyAlgorithm::Blake3`]
+/// comparison, not a whole step).
+enum HashAttempt {
+    Done(blake3::Hash),
+    Interrupted,
+}
+
+/// Reads `path` in [`COPY_BUFFER_BYTES`] chunks, feeding each into a BLAKE3
+/// hasher -- streaming rather than buffering the whole file in memory
+/// (T-5.1.12: a multi-gigabyte file must not need a multi-gigabyte
+/// allocation just to verify it), and checking `control` every chunk, the
+/// same cooperative-cancellation cadence [`naive_copy`] already uses.
+/// Takes owned/`Arc` arguments (not borrowed) so [`verify_step`] can
+/// `tokio::spawn` two of these concurrently -- genuine parallelism across
+/// real OS threads, not just cooperative interleaving on one, matters here
+/// the same way it does for the copy-class worker pool: `LocalFs`'s reads
+/// block their thread inline (this module's own "Operational requirement"
+/// doc comment on [`execute`]).
+async fn hash_file(
+    fs: Arc<dyn FileSystem>,
+    path: VPath,
+    control: ExecutionControl,
+) -> Result<HashAttempt> {
+    let mut reader = fs.open_read(&path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; COPY_BUFFER_BYTES];
+    loop {
+        if control.state() != ControlState::Running {
+            return Ok(HashAttempt::Interrupted);
+        }
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| Box::new(VfsError::from_io(e)))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(HashAttempt::Done(hasher.finalize()))
+}
+
+/// Compares `source` and `dest` per `algorithm` -- `SizeOnly` (a `stat` on
+/// each side, no content read) is cheap but only catches a truncated or
+/// otherwise wrong-length copy; `Blake3` (T-5.1.12, FR-OPS-08) reads and
+/// hashes both sides in full, concurrently, and catches genuine content
+/// corruption `SizeOnly` cannot (a bit-flip that doesn't change length).
 async fn verify_step(
-    fs: &dyn FileSystem,
+    ctx: &ExecutorContext,
     source: &VPath,
     dest: &VPath,
     algorithm: VerifyAlgorithm,
 ) -> Result<StepAttempt> {
     match algorithm {
         VerifyAlgorithm::SizeOnly => {
-            let source_meta = fs.stat(source, false).await?;
-            let dest_meta = fs.stat(dest, false).await?;
+            let source_meta = ctx.fs.stat(source, false).await?;
+            let dest_meta = ctx.fs.stat(dest, false).await?;
             if source_meta.size == dest_meta.size {
                 Ok(StepAttempt::Done(StepOutcome::Succeeded))
             } else {
@@ -1402,14 +1451,41 @@ async fn verify_step(
                 })))
             }
         }
-        VerifyAlgorithm::Blake3 => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
-            step_index: 0,
-            path: Some(dest.clone()),
-            kind: ErrorKind::Fatal,
-            message: "VerifyAlgorithm::Blake3 execution is not implemented yet (T-5.1.12 owns \
-                       post-copy BLAKE3 verification); use VerifyAlgorithm::SizeOnly instead"
-                .to_string(),
-        }))),
+        VerifyAlgorithm::Blake3 => {
+            let source_task = tokio::spawn(hash_file(
+                Arc::clone(&ctx.fs),
+                source.clone(),
+                ctx.control.clone(),
+            ));
+            let dest_task = tokio::spawn(hash_file(
+                Arc::clone(&ctx.fs),
+                dest.clone(),
+                ctx.control.clone(),
+            ));
+            let (source_result, dest_result) = tokio::join!(source_task, dest_task);
+            let source_attempt = source_result.expect("hash task panicked")?;
+            let dest_attempt = dest_result.expect("hash task panicked")?;
+            match (source_attempt, dest_attempt) {
+                (HashAttempt::Interrupted, _) | (_, HashAttempt::Interrupted) => {
+                    Ok(StepAttempt::Interrupted)
+                }
+                (HashAttempt::Done(source_hash), HashAttempt::Done(dest_hash)) => {
+                    if source_hash == dest_hash {
+                        Ok(StepAttempt::Done(StepOutcome::Succeeded))
+                    } else {
+                        Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+                            step_index: 0, // overwritten by the caller
+                            path: Some(dest.clone()),
+                            kind: ErrorKind::Fatal,
+                            message: format!(
+                                "content mismatch: {source} and {dest} have different BLAKE3 \
+                                 digests ({source_hash} vs {dest_hash})"
+                            ),
+                        })))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2714,6 +2790,225 @@ mod tests {
             "only the size-mismatched pair should fail"
         );
         assert!(report.errors[0].message.contains("size mismatch"));
+    }
+
+    // ---- T-5.1.12: BLAKE3 post-copy verification -------------------------
+
+    #[tokio::test]
+    async fn verify_blake3_succeeds_on_identical_content() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"identical payload").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"identical payload").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::Verify {
+                source: vpath_for(&dir.path().join("a.txt")),
+                dest: vpath_for(&dir.path().join("b.txt")),
+                algorithm: VerifyAlgorithm::Blake3,
+                depends_on: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// T-5.1.12's own AC, verbatim: "verification detects a deliberately
+    /// corrupted destination." Same size as the source (so `SizeOnly`
+    /// would have missed this entirely) but one flipped byte.
+    #[tokio::test]
+    async fn verify_blake3_detects_a_deliberately_corrupted_destination() {
+        let dir = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"correct payload!").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"corrupt payload!").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let plan = Plan::new(
+            vec![Step::Verify {
+                source: vpath_for(&dir.path().join("a.txt")),
+                dest: vpath_for(&dir.path().join("b.txt")),
+                algorithm: VerifyAlgorithm::Blake3,
+                depends_on: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].message.contains("content mismatch"));
+    }
+
+    #[tokio::test]
+    async fn copying_with_verify_enabled_runs_blake3_and_still_completes() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello, verified world").unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions {
+                verify: true,
+                ..PlanOptions::default()
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s.kind(), StepKind::Verify)),
+            "plan_copy must emit a Verify step when options.verify is set"
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let src_name = src.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(src_name).join("a.txt")).unwrap(),
+            "hello, verified world"
+        );
+    }
+
+    /// Proves [`hash_file`]'s own cancellation check (not just the outer
+    /// step-retry loop's) is real: a `ThrottledFs`-backed verify that would
+    /// otherwise take seconds to stream must stop within a bounded time
+    /// once cancelled, rather than reading the throttled stream to
+    /// completion regardless.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_blake3_honors_cancellation_and_does_not_hang() {
+        let state = TempDir::new().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(ThrottledFs {
+            inner: LocalFs,
+            total_bytes: 64 * 1024 * 1024,
+            chunk_bytes: 64 * 1024,
+            delay_per_chunk: Duration::from_millis(50),
+        });
+        // ThrottledFs's own `open_read` ignores the path entirely and
+        // always hands back the same synthetic throttled stream -- real
+        // paths aren't needed to prove cancellation is honored.
+        let plan = Plan::new(
+            vec![Step::Verify {
+                source: vpath_for(Path::new("/does-not-matter-a")),
+                dest: vpath_for(Path::new("/does-not-matter-b")),
+                algorithm: VerifyAlgorithm::Blake3,
+                depends_on: None,
+            }],
+            PlanOptions::default(),
+        );
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let control_for_task = control.clone();
+        let handle = tokio::spawn(execute(
+            fs,
+            JobIdT(1),
+            plan,
+            journal,
+            1,
+            tx,
+            control_for_task,
+            None,
+        ));
+
+        // The full throttled stream takes ~1024 chunks * 50ms = ~51s to
+        // read; let a little real progress happen, then cancel.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control.cancel();
+
+        let report = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("job never responded to cancellation")
+            .expect("executor task panicked");
+        assert!(
+            report.errors.is_empty(),
+            "a cancelled job ends Cancelled, not Failed: {:?}",
+            report.errors
+        );
+    }
+
+    /// T-5.1.12's own AC: "throughput cost measured and documented." Gated
+    /// like `duet-vfs`'s own `DUET_BENCH_LARGE_COPY`
+    /// (`crates/duet-vfs/src/local/probe.rs`) -- real disk I/O on a
+    /// multi-hundred-MiB file, not something to run on every `cargo test`.
+    /// Copies the same source twice (once with `verify: false`, once with
+    /// `verify: true`) and prints the wall-clock overhead BLAKE3 hashing
+    /// both sides adds on top of the copy itself.
+    #[tokio::test]
+    async fn verify_throughput_overhead_is_measured_and_documented() {
+        if std::env::var("DUET_BENCH_VERIFY_LARGE").as_deref() != Ok("1") {
+            eprintln!(
+                "verify_throughput_overhead_is_measured_and_documented: skipped by default \
+                 (real disk I/O) -- set DUET_BENCH_VERIFY_LARGE=1 to run (optionally \
+                 DUET_BENCH_VERIFY_LARGE_MIB=512 to change the file size)"
+            );
+            return;
+        }
+        let mib: u64 = std::env::var("DUET_BENCH_VERIFY_LARGE_MIB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let size = mib * 1024 * 1024;
+
+        let src_dir = TempDir::new().unwrap();
+        let src_path = src_dir.path().join("bench.src");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&src_path).unwrap();
+            let chunk = vec![7u8; 4 * 1024 * 1024];
+            let mut written = 0u64;
+            while written < size {
+                let n = (chunk.len() as u64).min(size - written) as usize;
+                f.write_all(&chunk[..n]).unwrap();
+                written += n as u64;
+            }
+        }
+
+        async fn run_copy(src: &Path, verify: bool) -> Duration {
+            let dst_dir = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            let cancel = crate::planner::CancelToken::new();
+            let plan = crate::planner::plan_copy(
+                &*fs,
+                &[vpath_for(src)],
+                &vpath_for(dst_dir.path()),
+                PlanOptions {
+                    verify,
+                    ..PlanOptions::default()
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+            let start = std::time::Instant::now();
+            let (report, _events) = run(fs, plan, state.path(), 4).await;
+            let elapsed = start.elapsed();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            elapsed
+        }
+
+        let without_verify = run_copy(&src_path, false).await;
+        let with_verify = run_copy(&src_path, true).await;
+        let overhead_pct =
+            (with_verify.as_secs_f64() / without_verify.as_secs_f64().max(f64::EPSILON) - 1.0)
+                * 100.0;
+        eprintln!(
+            "verify_throughput_overhead_is_measured_and_documented: {mib} MiB -- \
+             copy without verify={without_verify:?}, copy with verify={with_verify:?} \
+             (BLAKE3 verification adds {overhead_pct:.1}% wall-clock overhead)"
+        );
     }
 
     // ---- T-5.1.9: conflict-resolution engine ----------------------------
