@@ -10,15 +10,10 @@
 //! Mirroring [`crate::planner`]'s own precedent of disclosing scope cuts
 //! rather than silently omitting them:
 //!
-//! - **`Step::Link`/`Step::Verify` are not dispatched** — `duet-vfs`'s
-//!   `FileSystem` trait has no `link`/hardlink method today, and no
-//!   planner emits either step kind yet (`plan_copy` never produces one).
-//!   Both fail cleanly with a descriptive [`StepFailure`] rather than a
-//!   `todo!()`, so if a future planner *does* start emitting them before
-//!   their owning tasks land, the failure is loud and clear rather than
-//!   silently mishandled. `Link` belongs to T-5.1.7 (the hardlink-graph
-//!   task, the only one that will ever produce a `Link` step); `Verify`
-//!   belongs to T-5.1.12 (post-copy BLAKE3 verification).
+//! - **`Step::Verify`'s `Blake3` algorithm is not dispatched** —
+//!   `VerifyAlgorithm::SizeOnly` is real (T-5.1.5); `Blake3` fails cleanly
+//!   with a descriptive [`StepFailure`] rather than a `todo!()`, since
+//!   post-copy BLAKE3 verification is T-5.1.12's own scope.
 //! - **No ETA.** [`ProgressSnapshot::eta_secs`] is always `None` — the
 //!   dual-regime EWMA estimator is T-5.1.11's job. The counters and
 //!   100ms-cadence sampling T-5.1.11 needs to build on top of are real,
@@ -738,7 +733,8 @@ fn step_depends_on(step: &Step) -> Option<u32> {
     match step {
         Step::Remove { depends_on, .. }
         | Step::Verify { depends_on, .. }
-        | Step::SetMeta { depends_on, .. } => *depends_on,
+        | Step::SetMeta { depends_on, .. }
+        | Step::Link { depends_on, .. } => *depends_on,
         _ => None,
     }
 }
@@ -917,14 +913,7 @@ async fn dispatch(
         } => rename_step(ctx, step_index, *conflict, source, dest).await,
         Step::SetMeta { target, patch, .. } => set_meta_step(&*ctx.fs, target, patch).await,
         Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
-        Step::Link { .. } => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
-            step_index: 0, // overwritten by the caller
-            path: step_primary_path(step),
-            kind: ErrorKind::Fatal,
-            message: "Step::Link execution is not implemented yet (T-5.1.7 owns hardlink-graph \
-                       preservation, the only planner that will ever emit this step kind)"
-                .to_string(),
-        }))),
+        Step::Link { source, dest, .. } => link_step(ctx, step_index, source, dest).await,
         Step::Verify {
             source,
             dest,
@@ -1237,6 +1226,110 @@ async fn rename_step(
     dest: &VPath,
 ) -> Result<StepAttempt> {
     rename_with_conflict_resolution(ctx, step_index, conflict, source, source, dest).await
+}
+
+/// `Step::Link` dispatch (T-5.1.7): `fs.link(source, dest)`, going through
+/// the same seven-policy conflict engine as `CreateDir` on a real conflict
+/// -- `Step::Link` carries no `conflict` field of its own (like
+/// `CreateDir`), so `pre_resolved` is always `None` here.
+async fn link_step(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    source: &VPath,
+    dest: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.link(source, dest).await {
+        Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            let resolution = resolve_conflict(ctx, step_index, None, source, dest).await?;
+            apply_link_conflict_resolution(ctx, resolution, source, dest).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn apply_link_conflict_resolution(
+    ctx: &ExecutorContext,
+    resolution: ConflictResolution,
+    source: &VPath,
+    dest: &VPath,
+) -> Result<StepAttempt> {
+    match resolution.policy {
+        ConflictPolicy::Skip => Ok(skip_attempt(dest, "skip")),
+        ConflictPolicy::Abort => {
+            ctx.control.cancel();
+            Ok(skip_attempt(
+                dest,
+                "abort -- user chose to stop the job at this conflict",
+            ))
+        }
+        ConflictPolicy::Overwrite => replace_link(ctx, source, dest).await,
+        ConflictPolicy::OverwriteIfOlder => {
+            let source_meta = ctx.fs.stat(source, false).await?;
+            let dest_meta = ctx.fs.stat(dest, false).await?;
+            match (dest_meta.modified, source_meta.modified) {
+                (Some(d), Some(s)) if d < s => replace_link(ctx, source, dest).await,
+                _ => Ok(skip_attempt(
+                    dest,
+                    "destination is not older than the source",
+                )),
+            }
+        }
+        ConflictPolicy::OverwriteIfDifferentSize => {
+            let source_meta = ctx.fs.stat(source, false).await?;
+            let dest_meta = ctx.fs.stat(dest, false).await?;
+            if dest_meta.size != source_meta.size {
+                replace_link(ctx, source, dest).await
+            } else {
+                Ok(skip_attempt(
+                    dest,
+                    "destination is the same size as the source",
+                ))
+            }
+        }
+        ConflictPolicy::RenameTarget => match resolution.alternate {
+            Some(alt) => link_to_alternate(ctx, source, &alt).await,
+            None => Ok(rename_target_needs_a_name(dest)),
+        },
+        ConflictPolicy::AutoRename => {
+            let alt = auto_rename_target(ctx, dest).await?;
+            link_to_alternate(ctx, source, &alt).await
+        }
+    }
+}
+
+/// Forces `dest` to be replaced with a hardlink to `source` -- there is no
+/// atomic "link-over-destination" primitive (unlike `rename`'s
+/// `RENAME_EXCHANGE`/plain-replace semantics), so this necessarily removes
+/// `dest` first, non-atomically, before linking.
+async fn replace_link(ctx: &ExecutorContext, source: &VPath, dest: &VPath) -> Result<StepAttempt> {
+    ctx.fs.remove(dest, RemoveKind::File).await?;
+    ctx.fs.link(source, dest).await?;
+    Ok(StepAttempt::Done(StepOutcome::Succeeded))
+}
+
+/// Links `source` to `alt` (an alternate, expected-to-be-free destination
+/// chosen by `RenameTarget`'s resolver answer or [`auto_rename_target`]) --
+/// a second conflict here (the alternate name itself collided) is reported
+/// as a failure rather than looped on indefinitely, mirroring
+/// [`rename_to_alternate`].
+async fn link_to_alternate(
+    ctx: &ExecutorContext,
+    source: &VPath,
+    alt: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.link(source, alt).await {
+        Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+                step_index: 0, // overwritten by the caller
+                path: Some(alt.clone()),
+                kind: ErrorKind::Conflict,
+                message: format!("{alt} also already exists; refusing to guess another name"),
+            })))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn set_meta_step(
@@ -1728,6 +1821,9 @@ mod tests {
         async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
             self.inner.rename(from, to, flags).await
         }
+        async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+            self.inner.link(source, dest).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -1864,6 +1960,9 @@ mod tests {
         async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
             self.inner.rename(from, to, flags).await
         }
+        async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+            self.inner.link(source, dest).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -1958,6 +2057,9 @@ mod tests {
         }
         async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
             self.inner.rename(from, to, flags).await
+        }
+        async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+            self.inner.link(source, dest).await
         }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
@@ -3404,5 +3506,50 @@ mod tests {
             "the dependency-gated SetMeta must be skipped, not attempted"
         );
         assert!(!dest_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_link_step_is_skipped_not_attempted_when_its_source_copy_step_failed() {
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let link_dest = dst.path().join("would-be-hardlink.txt");
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        // Step 0: a CopyFile certain to fail (source doesn't exist) -- the
+        // "first occurrence" a hardlink-graph dedup would normally link
+        // against.
+        // Step 1: a Link wired to depend on it -- without dependency-
+        // gating, this would attempt to hardlink against a path that was
+        // never created.
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&dst.path().join("does-not-exist.txt")),
+                    dest: vpath_for(&dst.path().join("never-created.txt")),
+                    size: 5,
+                    conflict: None,
+                },
+                Step::Link {
+                    source: vpath_for(&dst.path().join("never-created.txt")),
+                    dest: vpath_for(&link_dest),
+                    depends_on: Some(0),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "the CopyFile step must genuinely fail"
+        );
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the dependency-gated Link must be skipped, not attempted"
+        );
+        assert!(!link_dest.exists());
     }
 }

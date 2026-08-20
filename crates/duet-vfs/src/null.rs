@@ -73,6 +73,10 @@ impl FileSystem for NullFs {
         Err(not_found(from))
     }
 
+    async fn link(&self, source: &VPath, _dest: &VPath) -> Result<()> {
+        Err(not_found(source))
+    }
+
     async fn set_meta(&self, p: &VPath, _m: &MetaPatch) -> Result<()> {
         Err(not_found(p))
     }

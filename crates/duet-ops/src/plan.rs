@@ -53,6 +53,12 @@ pub struct PlanTotals {
     pub files: u64,
     /// Sum of `Step::planned_bytes()` across the whole plan.
     pub bytes: u64,
+    /// Count of `Link` steps specifically — T-5.1.7's hardlink-graph dedup
+    /// "reports" itself through this field (a subset of `files`, which
+    /// already counts every `Link` step too): how many of this job's files
+    /// were preserved as a hardlink to an already-copied inode instead of
+    /// a second physical copy.
+    pub hardlinks_preserved: u64,
 }
 
 /// A materialised, ordered list of [`Step`]s, with the totals that make
@@ -89,7 +95,11 @@ impl Plan {
         for step in steps {
             match step.kind() {
                 StepKind::CreateDir => totals.dirs += 1,
-                StepKind::CopyFile | StepKind::Reflink | StepKind::Link => totals.files += 1,
+                StepKind::CopyFile | StepKind::Reflink => totals.files += 1,
+                StepKind::Link => {
+                    totals.files += 1;
+                    totals.hardlinks_preserved += 1;
+                }
                 StepKind::Rename | StepKind::SetMeta | StepKind::Remove | StepKind::Verify => {}
             }
             totals.bytes += step.planned_bytes();

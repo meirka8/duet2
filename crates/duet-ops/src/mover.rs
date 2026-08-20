@@ -88,7 +88,7 @@ use duet_vfs::{FileSystem, ListFields, ListOpts};
 use futures_util::StreamExt;
 
 use crate::plan::{Plan, PlanOptions};
-use crate::planner::{CancelToken, PlannerError, metadata_to_patch};
+use crate::planner::{CancelToken, HardlinkGraph, PlannerError, metadata_to_patch};
 use crate::step::{RemoveMode, Step, VerifyAlgorithm};
 
 /// A cross-device top-level source: its own `dest` path (already resolved
@@ -122,6 +122,21 @@ struct DeferredMeta {
     step_index: u32,
     dest: VPath,
     meta: Metadata,
+}
+
+/// A `CopyFile` step recorded so a later occurrence of the same source
+/// inode can be linked to it instead of copied again (T-5.1.7), deferred
+/// to the end of the plan same as `DeferredMeta` -- see
+/// `planner::DeferredLink`'s own doc comment.
+struct DeferredLink {
+    /// This entry's own original source path -- needed so phase 3 can
+    /// still remove it after the eventual `Step::Link` succeeds; a
+    /// deduped entry is still part of the move.
+    entry_source: VPath,
+    /// The already-planned `CopyFile` destination this hardlinks to.
+    link_source: VPath,
+    dest: VPath,
+    depends_on: u32,
 }
 
 /// Walks `sources` (each moved as a child of `dest_dir`, keeping its own
@@ -185,14 +200,25 @@ pub async fn plan_move(
     }
 
     // Phase 2: walk every cross-device entry's subtree (BFS, mirroring
-    // `plan_copy`), collecting `CopyFile` step indices (for phase 3),
-    // source-side directory paths in discovery order (for phase 4), and
-    // every entry's own metadata for a deferred `SetMeta` (T-5.1.6, phase
-    // 5 below).
+    // `plan_copy`), collecting each file entry's own source/dest/producing-
+    // step (for phase 3), source-side directory paths in discovery order
+    // (for phase 4), and every entry's own metadata for a deferred
+    // `SetMeta` (T-5.1.6, phase 5 below). T-5.1.7: a file whose inode has
+    // already been copied under this job becomes a deferred `Step::Link`
+    // (phase 2.5) instead of a second `CopyFile` -- see `HardlinkGraph`'s
+    // own doc comment.
     let mut queue: VecDeque<PendingDir> = VecDeque::new();
-    let mut copy_step_indices: Vec<usize> = Vec::new();
     let mut source_dirs: Vec<VPath> = Vec::new();
     let mut deferred_meta: Vec<DeferredMeta> = Vec::new();
+    let mut deferred_links: Vec<DeferredLink> = Vec::new();
+    let mut hardlinks = HardlinkGraph::default();
+    // (entry's own source, entry's own dest, step index that produced
+    // dest) for every file entry, whether a real `CopyFile` (index known
+    // immediately) or a hardlink-graph dedup (index only known once phase
+    // 2.5 below actually emits its `Step::Link`) -- phase 3 removes each
+    // entry's own source once its own destination is durable, regardless
+    // of which of the two produced it.
+    let mut file_sources: Vec<(VPath, VPath, u32)> = Vec::new();
 
     for entry in &cross_device {
         if cancel.is_cancelled() {
@@ -216,18 +242,29 @@ pub async fn plan_move(
                 });
             }
             EntryKind::File => {
-                steps.push(Step::CopyFile {
-                    source: entry.source.clone(),
-                    dest: entry.dest.clone(),
-                    size: entry.meta.size,
-                    conflict: None,
-                });
-                copy_step_indices.push(steps.len() - 1);
-                deferred_meta.push(DeferredMeta {
-                    step_index: (steps.len() - 1) as u32,
-                    dest: entry.dest.clone(),
-                    meta: entry.meta.clone(),
-                });
+                if let Some((link_source, link_depends_on)) = hardlinks.lookup(&entry.meta) {
+                    deferred_links.push(DeferredLink {
+                        entry_source: entry.source.clone(),
+                        link_source,
+                        dest: entry.dest.clone(),
+                        depends_on: link_depends_on,
+                    });
+                } else {
+                    steps.push(Step::CopyFile {
+                        source: entry.source.clone(),
+                        dest: entry.dest.clone(),
+                        size: entry.meta.size,
+                        conflict: None,
+                    });
+                    let copy_step = (steps.len() - 1) as u32;
+                    hardlinks.insert(&entry.meta, entry.dest.clone(), copy_step);
+                    file_sources.push((entry.source.clone(), entry.dest.clone(), copy_step));
+                    deferred_meta.push(DeferredMeta {
+                        step_index: copy_step,
+                        dest: entry.dest.clone(),
+                        meta: entry.meta.clone(),
+                    });
+                }
             }
             _ => unreachable!("filtered to Directory | File in phase 1"),
         }
@@ -273,18 +310,31 @@ pub async fn plan_move(
                         queue.push_back(PendingDir { source, dest });
                     }
                     EntryKind::File => {
-                        steps.push(Step::CopyFile {
-                            source,
-                            dest: dest.clone(),
-                            size: entry.metadata.size,
-                            conflict: None,
-                        });
-                        copy_step_indices.push(steps.len() - 1);
-                        deferred_meta.push(DeferredMeta {
-                            step_index: (steps.len() - 1) as u32,
-                            dest,
-                            meta: entry.metadata,
-                        });
+                        if let Some((link_source, link_depends_on)) =
+                            hardlinks.lookup(&entry.metadata)
+                        {
+                            deferred_links.push(DeferredLink {
+                                entry_source: source,
+                                link_source,
+                                dest,
+                                depends_on: link_depends_on,
+                            });
+                        } else {
+                            steps.push(Step::CopyFile {
+                                source: source.clone(),
+                                dest: dest.clone(),
+                                size: entry.metadata.size,
+                                conflict: None,
+                            });
+                            let copy_step = (steps.len() - 1) as u32;
+                            hardlinks.insert(&entry.metadata, dest.clone(), copy_step);
+                            file_sources.push((source, dest.clone(), copy_step));
+                            deferred_meta.push(DeferredMeta {
+                                step_index: copy_step,
+                                dest,
+                                meta: entry.metadata,
+                            });
+                        }
                     }
                     _ => {} // symlinks etc -- see the module doc comment's scope cuts
                 }
@@ -292,25 +342,41 @@ pub async fn plan_move(
         }
     }
 
-    // Phase 3: for every CopyFile, append its (optional Verify, then)
-    // Remove of the source -- each depends_on the step directly before it
-    // in its own chain, per the module doc comment's dependency-gating
-    // explanation.
-    for &copy_idx in &copy_step_indices {
-        let (source, dest) = match &steps[copy_idx] {
-            Step::CopyFile { source, dest, .. } => (source.clone(), dest.clone()),
-            _ => unreachable!("copy_step_indices only ever indexes CopyFile steps"),
-        };
+    // Phase 2.5 (T-5.1.7): emit every deferred hardlink now, before phase
+    // 3 -- phase 3 needs each one's own step index to gate its entry's
+    // Remove(source) on, which doesn't exist until the Link step is
+    // actually in `steps`. Emitting them as one block here (rather than
+    // interleaved during the walk above) keeps every `CopyFile` run in
+    // phase 2 unbroken for `execute`'s copy-class batching, same reasoning
+    // as `SetMeta`'s own deferral.
+    for link in deferred_links {
+        let dest = link.dest.clone();
+        steps.push(Step::Link {
+            source: link.link_source,
+            dest: link.dest,
+            depends_on: Some(link.depends_on),
+        });
+        file_sources.push((link.entry_source, dest, (steps.len() - 1) as u32));
+    }
+
+    // Phase 3: for every file entry (a real `CopyFile` or a hardlink-graph
+    // `Link` alike), append its (optional Verify, then) Remove of the
+    // source -- each depends_on the step that actually produced its own
+    // destination, per the module doc comment's dependency-gating
+    // explanation. A deduped entry is still part of the move: its source
+    // must be removed too, once its own `Link` step (not the *first*
+    // occurrence's `CopyFile`) has durably succeeded.
+    for (source, dest, produced_by) in file_sources {
         let remove_depends_on = if options.verify {
             steps.push(Step::Verify {
                 source: source.clone(),
                 dest,
                 algorithm: VerifyAlgorithm::SizeOnly,
-                depends_on: Some(copy_idx as u32),
+                depends_on: Some(produced_by),
             });
             (steps.len() - 1) as u32
         } else {
-            copy_idx as u32
+            produced_by
         };
         steps.push(Step::Remove {
             target: source,
@@ -456,6 +522,9 @@ mod tests {
         async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
             self.inner.rename(from, to, flags).await
         }
+        async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+            self.inner.link(source, dest).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -576,6 +645,69 @@ mod tests {
             std::fs::read_to_string(dst.path().join(src_name).join("sub/b.txt")).unwrap(),
             "world"
         );
+    }
+
+    /// T-5.1.7's own hardlink-graph preservation, exercised through a
+    /// cross-device *move* specifically -- the harder case, since a
+    /// deduped entry's own source still has to be removed (it's a move,
+    /// not a copy), and only once its own `Step::Link` (not the first
+    /// occurrence's `CopyFile`) has actually succeeded.
+    #[tokio::test]
+    async fn cross_device_move_preserves_a_hardlinked_pair_and_removes_both_sources() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"shared").unwrap();
+        std::fs::hard_link(
+            src.path().join("a.txt"),
+            src.path().join("hardlink_to_a.txt"),
+        )
+        .unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(FakeDeviceFs::new(dst.path()));
+        let cancel = CancelToken::new();
+        let plan = plan_move(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<StepKind> = plan.steps.iter().map(|s| s.kind()).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == StepKind::CopyFile).count(),
+            1
+        );
+        assert_eq!(kinds.iter().filter(|k| **k == StepKind::Link).count(), 1);
+        assert_eq!(
+            kinds.iter().filter(|k| **k == StepKind::Remove).count(),
+            3,
+            "2 file removes (one per source name) + 1 directory remove"
+        );
+
+        let report = run(fs, 3, plan, state.path()).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            !src.path().exists(),
+            "both source names (and the now-empty source directory) must be gone"
+        );
+
+        let src_name = src.path().file_name().unwrap().to_str().unwrap();
+        let dst_a = dst.path().join(src_name).join("a.txt");
+        let dst_link = dst.path().join(src_name).join("hardlink_to_a.txt");
+        use std::os::unix::fs::MetadataExt;
+        let a_meta = std::fs::metadata(&dst_a).unwrap();
+        let link_meta = std::fs::metadata(&dst_link).unwrap();
+        assert_eq!(
+            a_meta.ino(),
+            link_meta.ino(),
+            "both destination names must resolve to the same inode"
+        );
+        assert_eq!(a_meta.nlink(), 2);
+        assert_eq!(std::fs::read_to_string(&dst_link).unwrap(), "shared");
     }
 
     #[tokio::test]

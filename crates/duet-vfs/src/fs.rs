@@ -177,6 +177,35 @@ pub trait FileSystem: Send + Sync {
     /// - `Retryable` — transient I/O.
     async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()>;
 
+    /// Creates a new hard link at `dest` pointing at `source`'s inode
+    /// (T-5.1.7: `Step::Link`'s only real backend, both for an explicit
+    /// user "create hardlink" operation and for a job's own hardlink-graph
+    /// preservation — see `duet_ops::planner`'s `HardlinkGraph`). Only
+    /// meaningful when `caps()` includes `Caps::HARDLINK`; a backend
+    /// without any hardlink concept (most archive/remote backends) should
+    /// return `Err(ErrorKind::Fatal)` rather than silently duplicating the
+    /// content, since a caller relying on `Caps::HARDLINK` to decide
+    /// whether to even attempt this should never reach here in the first
+    /// place — this error path exists for a caller that skipped that
+    /// check, not as a real fallback.
+    ///
+    /// Like `rename`, not expected to work across filesystems (`EXDEV`
+    /// surfaces as `Fatal`, same as `rename`'s own doc comment) — a
+    /// hardlink is definitionally same-filesystem, so there is no
+    /// meaningful cross-device fallback for a caller to fall back to here.
+    ///
+    /// # Errors
+    /// - `NotFound` — `source` does not exist, or `dest`'s parent does not.
+    /// - `Conflict` — `dest` already exists.
+    /// - `Permission` — `dest`'s parent is not writable, or (rare, some
+    ///   filesystems) the backend refuses to hardlink `source`'s kind of
+    ///   entry (e.g. a directory — hardlinking directories is disallowed
+    ///   on every mainstream Linux filesystem today).
+    /// - `Fatal` — cross-device (`EXDEV`), or any other unclassified
+    ///   failure.
+    /// - `Retryable` — transient I/O.
+    async fn link(&self, source: &VPath, dest: &VPath) -> Result<()>;
+
     /// Applies a metadata patch to `p`. Only fields set in `m` are changed
     /// (see [`MetaPatch`]'s own doc comment); an empty patch
     /// (`MetaPatch::is_empty()`) is a valid no-op call, not an error.

@@ -77,10 +77,27 @@ pub enum Step {
     },
     /// Hardlink `dest` to `source` — either an explicit "create hardlink"
     /// user operation, or the second-and-later occurrence of an
-    /// already-copied inode in this job's hardlink graph (design.md §9.3:
-    /// `HashMap<(dev, ino), VPath>`), preserving link structure instead of
-    /// duplicating the data.
-    Link { source: VPath, dest: VPath },
+    /// already-copied inode in this job's hardlink graph (T-5.1.7,
+    /// design.md §9.3: `HashMap<(dev, ino), VPath>`), preserving link
+    /// structure instead of duplicating the data. `source` is always a
+    /// path *within this job's own destination tree* for the hardlink-graph
+    /// case — the already-published first copy of the shared inode, never
+    /// the original source file (linking to the original would make the
+    /// "copy" alias the source instead of duplicating it, which a copy job
+    /// must never do).
+    ///
+    /// `depends_on`: the `step_index` of the `CopyFile`/`Reflink` step that
+    /// produced `source`, so a hardlink is never attempted against a
+    /// destination whose own copy failed or was never reached — the same
+    /// dependency-gating mechanism `Remove`/`Verify`/`SetMeta`'s own fields
+    /// document. `None` for a hardlink with no such prerequisite (e.g. an
+    /// explicit user "create hardlink" command against an
+    /// already-existing, unrelated file).
+    Link {
+        source: VPath,
+        dest: VPath,
+        depends_on: Option<u32>,
+    },
     /// Apply a metadata patch to `target`. The *order* fields within `patch`
     /// are applied in (mode → xattrs/ACL/SELinux label → timestamps →
     /// ownership last, per design.md §9.3 — writing xattrs perturbs ctime,
