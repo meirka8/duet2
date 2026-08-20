@@ -52,7 +52,7 @@ use duet_widgets::menu::{PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
 };
-use duet_widgets::theme::TokenPalette;
+use duet_widgets::theme::{TokenPalette, suppress_row_hover, unsuppress_row_hover};
 use futures_util::StreamExt;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -2690,6 +2690,24 @@ impl Render for FileTable {
             // ever run (confirmed by reading `gpui-0.2.2/src/window.rs`)
             // -- so this listener only ever sees keystrokes nothing else
             // already claimed.
+            // T-5.2.1 (post-UAT, hover suppression): a capture-phase
+            // listener sees *every* keydown reaching this table,
+            // unconditionally -- unlike the bubble-phase `on_key_down`
+            // just below, which (per its own doc comment) only ever
+            // fires for a keystroke nothing else already claimed. Bound
+            // actions (`CursorUp`/`CursorDown`/etc.) stop bubble-phase
+            // propagation before that listener would ever see them, but
+            // the capture phase runs *first*, before any of that -- the
+            // one real choke point that covers every keyboard-driven row
+            // action without needing a call sprinkled into each of the
+            // dozen or so `on_action` handlers below individually. See
+            // `duet_widgets::theme::suppress_row_hover`'s own doc
+            // comment for what this fixes and why the counterpart
+            // (`unsuppress_row_hover`, on real mouse movement) is on this
+            // same root div rather than per-row.
+            .capture_key_down(|_event, _window, cx| {
+                suppress_row_hover(cx);
+            })
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     let modifiers = &event.keystroke.modifiers;
@@ -2719,6 +2737,15 @@ impl Render for FileTable {
                     window.focus(&this.focus_handle);
                 }),
             )
+            // The other half of the hover-suppression fix above: any real
+            // mouse movement anywhere within this table (not just over a
+            // specific row -- `Div::on_mouse_move` fires whenever the
+            // pointer is within *this* element's own hitbox, which
+            // encloses every row) means the mouse is genuinely back in
+            // use, so hover feedback should resume immediately.
+            .on_mouse_move(|_event, _window, cx| {
+                unsuppress_row_hover(cx);
+            })
             .on_action(cx.listener(|this, _: &CursorUp, _window, cx| {
                 this.exit_quick_search_if_jump(cx);
                 this.move_cursor(-1, cx);
