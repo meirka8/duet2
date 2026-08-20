@@ -1725,6 +1725,7 @@ dependencies = [
 name = "duet-ui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "duet-bench",
  "duet-commands",
  "duet-config",

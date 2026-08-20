@@ -86,3 +86,15 @@ gpui = { version = "0.2.2", features = ["test-support"] }
 # examples get dev-dependencies, and this benchmark harness has no business
 # being part of the normal `duet-ui` library build.
 duet-bench = { path = "../../benches" }
+# T-5.2.2: `workspace.rs`'s own end-to-end operation-manager test needs a
+# job that is still genuinely `Running` by the time the test opens the
+# manager and drives Pause/Resume through it -- a real (fast, tmpfs-
+# backed) copy finishes too quickly for that window to be observable. A
+# small `FileSystem` test double delaying `open_read` is the fix, mirroring
+# `duet-ops`'s own private `SlowFs` (`crates/duet-ops/src/queue.rs`'s test
+# module, not reachable from here) -- implementing `duet_vfs::FileSystem`
+# needs the same `#[async_trait]` attribute the trait itself is declared
+# with (see that trait's own doc comment for why it isn't native
+# async-fn-in-trait), so this dev-only dependency reaches the same version
+# `duet-vfs`/`duet-ops` already pin via the workspace.
+async-trait.workspace = true
