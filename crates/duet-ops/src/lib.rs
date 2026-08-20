@@ -23,6 +23,12 @@
 //!   becomes one zero-cost `Rename`; cross-device becomes a `CopyFile` +
 //!   (optional `Verify`) + `Remove` sequence, dependency-gated so the
 //!   source is never removed unless its copy is known to have succeeded.
+//! - [`deleter`] — T-5.1.8: `JobKind::Delete`'s two modes. Permanent
+//!   delete needs no walk of its own (`RemoveMode::Recursive` already
+//!   recurses safely at the `duet-vfs` layer, T-3.1.3); trash mode is
+//!   [`mover::plan_move`] reused wholesale, targeting a caller-supplied
+//!   trash directory — the full freedesktop trash spec itself is
+//!   T-5.3.1/T-5.3.2's later, separate scope.
 //! - [`executor`] — T-5.1.3: runs a `Plan`'s steps against a `FileSystem`,
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
@@ -49,6 +55,7 @@
 //!   of that proof this task covers versus leaves to T-10.2.1.
 
 mod conflict;
+mod deleter;
 mod event;
 mod executor;
 mod job;
@@ -61,6 +68,7 @@ mod step;
 pub use conflict::{
     ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
 };
+pub use deleter::{DeleteMode, plan_delete};
 pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
 pub use job::{Job, JobId, JobKind, JobOutcome, JobReport, JobState, SkipEntry, StepFailure};
