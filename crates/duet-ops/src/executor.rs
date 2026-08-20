@@ -736,7 +736,9 @@ fn step_primary_path(step: &Step) -> Option<VPath> {
 /// or was never reached).
 fn step_depends_on(step: &Step) -> Option<u32> {
     match step {
-        Step::Remove { depends_on, .. } | Step::Verify { depends_on, .. } => *depends_on,
+        Step::Remove { depends_on, .. }
+        | Step::Verify { depends_on, .. }
+        | Step::SetMeta { depends_on, .. } => *depends_on,
         _ => None,
     }
 }
@@ -913,7 +915,7 @@ async fn dispatch(
             dest,
             conflict,
         } => rename_step(ctx, step_index, *conflict, source, dest).await,
-        Step::SetMeta { target, patch } => set_meta_step(&*ctx.fs, target, patch).await,
+        Step::SetMeta { target, patch, .. } => set_meta_step(&*ctx.fs, target, patch).await,
         Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
         Step::Link { .. } => Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
             step_index: 0, // overwritten by the caller
@@ -1603,7 +1605,8 @@ fn spawn_progress_sampler(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -3212,5 +3215,194 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    // ---- T-5.1.6: metadata preservation, end to end -----------------
+
+    #[tokio::test]
+    async fn copying_preserves_mode_beyond_the_writers_default() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let script = src.path().join("script.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
+        // Deliberately not 0644 (`naive_copy`'s own `WriteOpts::create_new()`
+        // default) -- proves the follow-up `SetMeta` step, not the writer's
+        // own default mode, is what mode fidelity actually comes from.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(&script)],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let dest_meta = std::fs::metadata(dst.path().join("script.sh")).unwrap();
+        assert_eq!(
+            dest_meta.permissions().mode() & 0o777,
+            0o750,
+            "the source's exact mode must survive, not the writer's own default"
+        );
+    }
+
+    #[tokio::test]
+    async fn copying_preserves_mtime_and_xattrs() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let source_path = src.path().join("a.txt");
+        std::fs::write(&source_path, b"hello").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let source_vpath = vpath_for(&source_path);
+        // Set a distinctive mtime and a plain xattr on the source before
+        // planning -- both go through the same `FileSystem::set_meta`
+        // trait method `Step::SetMeta` itself dispatches through, so this
+        // needs no raw syscall access from this crate's own test suite.
+        fs.set_meta(
+            &source_vpath,
+            &MetaPatch {
+                modified: Some(Timestamp::new(1_700_000_000, 0)),
+                set_xattrs: BTreeMap::from([("user.duet.test".to_string(), b"payload".to_vec())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[source_vpath],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let (report, _events) = run(fs.clone(), plan, state.path(), 1).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let dest_vpath = vpath_for(&dst.path().join("a.txt"));
+        let dest_meta = fs.stat(&dest_vpath, false).await.unwrap();
+        assert_eq!(
+            dest_meta.modified,
+            Some(Timestamp::new(1_700_000_000, 0)),
+            "mtime must survive the copy"
+        );
+        assert_eq!(
+            dest_meta
+                .xattrs
+                .unwrap_or_default()
+                .get("user.duet.test")
+                .map(Vec::as_slice),
+            Some(b"payload".as_slice()),
+            "xattrs must survive the copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn copying_a_directory_does_not_disturb_its_restored_mtime() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.path().join("b.txt"), b"world").unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        // A distinctive mtime on the source directory itself -- if its
+        // own `SetMeta` ran before `a.txt`/`b.txt` were copied into it
+        // (instead of deferred to the very end of the plan, T-5.1.6's own
+        // fix), creating those two directory entries would bump this
+        // right back up to "now," and the assertion below would fail.
+        fs.set_meta(
+            &vpath_for(src.path()),
+            &MetaPatch {
+                modified: Some(Timestamp::new(1_600_000_000, 0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let (report, _events) = run(fs.clone(), plan, state.path(), 1).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let src_name = src.path().file_name().unwrap().to_str().unwrap();
+        let dest_dir_vpath = vpath_for(&dst.path().join(src_name));
+        let dest_meta = fs.stat(&dest_dir_vpath, false).await.unwrap();
+        assert_eq!(
+            dest_meta.modified,
+            Some(Timestamp::new(1_600_000_000, 0)),
+            "the directory's restored mtime must survive its own children being \
+             copied into it afterward"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setmeta_step_is_skipped_not_attempted_when_its_copy_step_failed() {
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let dest_path = dst.path().join("never-created.txt");
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        // Step 0: a CopyFile certain to fail (source doesn't exist).
+        // Step 1: a SetMeta on the same (never-created) destination,
+        // wired to depend on step 0 -- without dependency-gating, this
+        // would attempt to `chmod`/`utimensat` a path that doesn't exist.
+        let plan = Plan::new(
+            vec![
+                Step::CopyFile {
+                    source: vpath_for(&dst.path().join("does-not-exist.txt")),
+                    dest: vpath_for(&dest_path),
+                    size: 5,
+                    conflict: None,
+                },
+                Step::SetMeta {
+                    target: vpath_for(&dest_path),
+                    patch: MetaPatch {
+                        mode: Some(0o600),
+                        ..Default::default()
+                    },
+                    depends_on: Some(0),
+                },
+            ],
+            PlanOptions::default(),
+        );
+
+        let (report, _events) = run(fs, plan, state.path(), 1).await;
+
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "the CopyFile step must genuinely fail"
+        );
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "the dependency-gated SetMeta must be skipped, not attempted"
+        );
+        assert!(!dest_path.exists());
     }
 }

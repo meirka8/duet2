@@ -50,7 +50,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use duet_types::{EntryKind, VPath, VfsError};
+use duet_types::{EntryKind, MetaPatch, Metadata, VPath, VfsError};
 use duet_vfs::{FileSystem, ListFields, ListOpts};
 use futures_util::StreamExt;
 
@@ -113,6 +113,79 @@ struct PendingDir {
     dest: VPath,
 }
 
+/// A `CreateDir`/`CopyFile` step's index, destination, and source metadata,
+/// recorded so its own `Step::SetMeta` follow-up can be deferred to the
+/// very end of the plan (T-5.1.6) instead of interleaved right after it.
+/// Two independent reasons this needs to be *every* entry, not just
+/// directories:
+/// - A directory's own timestamps would otherwise risk getting bumped
+///   right back up the moment a child entry gets created inside it (every
+///   `CopyFile`/`CreateDir` publish is itself a new directory entry, which
+///   touches the parent directory's own mtime) -- deferring to the end,
+///   after the whole subtree is populated, avoids that entirely.
+/// - Interleaving a file's `SetMeta` immediately after its own `CopyFile`
+///   would insert a barrier step between every pair of otherwise-
+///   consecutive `CopyFile`s, destroying `execute`'s own copy-class
+///   batching (T-5.1.3's "Concurrency model") -- a plan with `N` files
+///   would run at effective concurrency 1 instead of `execute`'s actual
+///   `concurrency` bound, since `SetMeta` is a barrier step, not
+///   copy-class. Keeping every `CopyFile`/`CreateDir` step run
+///   uninterrupted, with all `SetMeta` steps appended after the walk
+///   finishes, preserves the exact batching shape this crate already had
+///   before T-5.1.6 (order among the deferred `SetMeta` steps themselves
+///   doesn't matter -- see [`metadata_to_patch`]'s own doc comment).
+struct DeferredMeta {
+    step_index: u32,
+    dest: VPath,
+    meta: Metadata,
+}
+
+/// The well-known xattr names POSIX ACLs and the SELinux label live under
+/// on Linux -- duplicated from `duet_vfs::local::meta`'s own (private)
+/// constants of the same name, per this codebase's existing convention of
+/// duplicating small, load-bearing naming primitives per-crate rather than
+/// exporting a backend implementation detail across the VFS abstraction
+/// boundary (see e.g. `executor::partial_file_name`'s own precedent).
+const ACL_ACCESS_XATTR: &str = "system.posix_acl_access";
+const SELINUX_XATTR: &str = "security.selinux";
+
+/// Builds the `MetaPatch` a follow-up [`Step::SetMeta`] step uses to bring
+/// a freshly-created destination's metadata in line with `source_meta`
+/// (T-5.1.6, design.md §9.3's metadata list: mode, xattrs, POSIX ACLs,
+/// SELinux label, timestamps, ownership -- content itself is already
+/// handled by whichever `CopyFile`/`Reflink`/`CreateDir` step this
+/// follows). Ownership is always included when known (`uid`/`gid`), even
+/// though it will commonly no-op under `EPERM` for an unprivileged
+/// process -- `duet_vfs::local::meta::set_meta` already degrades that
+/// gracefully (T-5.1.6's own fix there), which is exactly design.md's
+/// "then ownership if privileged" framing: attempt, don't pre-check.
+///
+/// Disclosed scope cut: only adds `source_meta`'s own xattrs/ACL/SELinux
+/// label to the destination's, never removes one already present on the
+/// destination that source doesn't have (e.g. a POSIX default ACL a
+/// freshly-created child inherited from its parent directory). Diffing
+/// against the destination's own xattr set would need an extra `listxattr`
+/// per entry on top of everything else this walk already does -- a real,
+/// rare-in-practice gap, not silently assumed away.
+pub(crate) fn metadata_to_patch(source_meta: &Metadata) -> MetaPatch {
+    let mut set_xattrs = source_meta.xattrs.clone().unwrap_or_default();
+    if let Some(acl) = &source_meta.acl {
+        set_xattrs.insert(ACL_ACCESS_XATTR.to_string(), acl.clone());
+    }
+    if let Some(label) = &source_meta.selinux_label {
+        set_xattrs.insert(SELINUX_XATTR.to_string(), label.clone().into_bytes());
+    }
+    MetaPatch {
+        mode: source_meta.mode,
+        uid: source_meta.uid,
+        gid: source_meta.gid,
+        modified: source_meta.modified,
+        accessed: source_meta.accessed,
+        set_xattrs,
+        remove_xattrs: Vec::new(),
+    }
+}
+
 /// Walks `sources` (each copied as a child of `dest_dir`, keeping its own
 /// basename -- exactly what F5 does with a panel's current selection) and
 /// returns the materialised, totalled [`Plan`] a `JobKind::Copy` job would
@@ -134,6 +207,9 @@ pub async fn plan_copy(
 ) -> Result<Plan, PlannerError> {
     let mut steps = Vec::new();
     let mut queue: VecDeque<PendingDir> = VecDeque::new();
+    // T-5.1.6: every entry's own `SetMeta` is deferred to the very end of
+    // the plan -- see `DeferredMeta`'s own doc comment for why.
+    let mut deferred_meta: Vec<DeferredMeta> = Vec::new();
 
     for source in sources {
         if cancel.is_cancelled() {
@@ -153,6 +229,11 @@ pub async fn plan_copy(
                     dest: dest.clone(),
                     mode: meta.mode,
                 });
+                deferred_meta.push(DeferredMeta {
+                    step_index: (steps.len() - 1) as u32,
+                    dest: dest.clone(),
+                    meta,
+                });
                 queue.push_back(PendingDir {
                     source: source.clone(),
                     dest,
@@ -161,9 +242,14 @@ pub async fn plan_copy(
             EntryKind::File => {
                 steps.push(Step::CopyFile {
                     source: source.clone(),
-                    dest,
+                    dest: dest.clone(),
                     size: meta.size,
                     conflict: None,
+                });
+                deferred_meta.push(DeferredMeta {
+                    step_index: (steps.len() - 1) as u32,
+                    dest,
+                    meta,
                 });
             }
             // Symlinks, fifos, sockets, device nodes: see the module doc
@@ -172,8 +258,12 @@ pub async fn plan_copy(
         }
     }
 
+    // T-5.1.6: full metadata (xattrs/ACL/SELinux label included), not just
+    // mode -- this walk is the only place cheap enough to fetch it once
+    // per entry; the executor's own conflict re-check doesn't re-stat the
+    // source at all.
     let list_opts = ListOpts {
-        fields: ListFields::MODE,
+        fields: ListFields::all(),
         follow_symlinks: false,
     };
 
@@ -202,20 +292,41 @@ pub async fn plan_copy(
                             dest: dest.clone(),
                             mode: entry.metadata.mode,
                         });
+                        deferred_meta.push(DeferredMeta {
+                            step_index: (steps.len() - 1) as u32,
+                            dest: dest.clone(),
+                            meta: entry.metadata,
+                        });
                         queue.push_back(PendingDir { source, dest });
                     }
                     EntryKind::File => {
                         steps.push(Step::CopyFile {
                             source,
-                            dest,
+                            dest: dest.clone(),
                             size: entry.metadata.size,
                             conflict: None,
+                        });
+                        deferred_meta.push(DeferredMeta {
+                            step_index: (steps.len() - 1) as u32,
+                            dest,
+                            meta: entry.metadata,
                         });
                     }
                     _ => {}
                 }
             }
         }
+    }
+
+    // T-5.1.6: every `SetMeta` follow-up lands after the whole walk, once
+    // -- see `DeferredMeta`'s own doc comment for why (directory mtimes,
+    // and keeping every `CopyFile` run unbroken for `execute`'s batching).
+    for entry in deferred_meta {
+        steps.push(Step::SetMeta {
+            target: entry.dest,
+            patch: metadata_to_patch(&entry.meta),
+            depends_on: Some(entry.step_index),
+        });
     }
 
     Ok(Plan::new(steps, options))
@@ -288,8 +399,13 @@ mod tests {
             .await
             .expect("planning must succeed");
 
-        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(
+            plan.steps.len(),
+            2,
+            "CopyFile plus its own follow-up SetMeta (T-5.1.6)"
+        );
         assert!(matches!(plan.steps[0].kind(), StepKind::CopyFile));
+        assert!(matches!(plan.steps[1].kind(), StepKind::SetMeta));
         assert_eq!(
             plan.totals,
             crate::plan::PlanTotals {

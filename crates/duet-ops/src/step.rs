@@ -82,10 +82,24 @@ pub enum Step {
     /// duplicating the data.
     Link { source: VPath, dest: VPath },
     /// Apply a metadata patch to `target`. The *order* fields within `patch`
-    /// are applied in (mode → xattrs/ACL/SELinux label → timestamps last,
-    /// per design.md §9.3 — writing xattrs perturbs ctime) is an executor
-    /// concern, not encoded in the data here.
-    SetMeta { target: VPath, patch: MetaPatch },
+    /// are applied in (mode → xattrs/ACL/SELinux label → timestamps →
+    /// ownership last, per design.md §9.3 — writing xattrs perturbs ctime,
+    /// and `chown` clears setuid/setgid bits for a non-`CAP_FSETID` caller)
+    /// is the VFS backend's concern (`duet_vfs::local::meta::set_meta`),
+    /// not encoded in the data here.
+    ///
+    /// `depends_on` (T-5.1.6): the `step_index` of the `CreateDir`/
+    /// `CopyFile`/`Reflink` step that produced `target`, so metadata is
+    /// never applied to a destination whose own creation/copy step failed
+    /// or was never reached -- the same dependency-gating mechanism
+    /// `Remove`/`Verify`'s own fields already document. `None` for a
+    /// standalone metadata edit with no such prerequisite (not emitted by
+    /// any planner today, but the field stays generally useful).
+    SetMeta {
+        target: VPath,
+        patch: MetaPatch,
+        depends_on: Option<u32>,
+    },
     /// Remove `target`. Deletes are journaled *before* execution (design.md
     /// §9.3: "so the undo stack has something to work from for trash
     /// operations"), which is exactly what an `Intent` journal record
