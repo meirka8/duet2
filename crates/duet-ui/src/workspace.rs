@@ -7,12 +7,14 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use duet_commands::keymap::{self, tc_csv};
 use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
+use duet_ops::{JobEvent, JobKind, JobOutcome, JobReport, QueueManager};
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
@@ -33,6 +35,7 @@ use gpui::{
 };
 
 use crate::command_palette::CommandPaletteDelegate;
+use crate::copy_move_dialog::{CopyMoveDialogState, bind_copy_move_dialog_keys};
 use crate::file_table::{
     FileTable, FileTableSettings, MouseMode, QuickSearchMode, write_byte_count,
 };
@@ -105,6 +108,17 @@ actions!(
     ]
 );
 
+// T-5.2.1's F5/F6 copy/move dialog (FR-OPS-01). `docs/keymap-tc.csv` rows
+// 5 and 7 (`ops.copy`/`ops.move_or_rename`) are both "known" TC bindings
+// -- unlike `OpenCommandPalette`/the hotlist bindings above, these two are
+// verified, not this codebase's own reasonable default. `Shift+F5`
+// ("copy into the same dir, prompting for a new name") and `Shift+F6`
+// ("rename in place, no dialog") are separate, narrower commands this
+// task's own scope doesn't cover -- see `crate::copy_move_dialog`'s
+// module doc comment for the full list of what this dialog does and
+// doesn't do.
+actions!(duet_workspace, [CopyDialog, MoveDialog]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -123,6 +137,8 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("delete", HotlistRemoveEntry, Some("HotlistOverlay")),
         KeyBinding::new("ctrl-up", HotlistMoveUp, Some("HotlistOverlay")),
         KeyBinding::new("ctrl-down", HotlistMoveDown, Some("HotlistOverlay")),
+        KeyBinding::new("f5", CopyDialog, Some("Workspace")),
+        KeyBinding::new("f6", MoveDialog, Some("Workspace")),
     ]);
 }
 
@@ -147,6 +163,7 @@ pub fn run() {
         bind_workspace_keys(cx);
         crate::file_table::bind_file_table_keys(cx);
         bind_panel_keys(cx);
+        bind_copy_move_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -229,6 +246,14 @@ const SPLITTER_KEYBOARD_STEP: f32 = 0.02;
 /// enough to matter for a background file write nobody's watching.
 const SESSION_PERIODIC_SAVE_INTERVAL: Duration = Duration::from_secs(3);
 
+/// A reasonable, documented placeholder for how many T-5.2.1 copy/move
+/// jobs the workspace's `QueueManager` runs at once -- there's no
+/// user-facing concurrency setting yet (a future task's job, not this
+/// one's); jobs beyond this bound simply wait `Queued` in priority order
+/// (`QueueManager`'s own module doc comment), so this is a throughput
+/// knob, not a correctness one.
+const COPY_MOVE_QUEUE_MAX_CONCURRENT: usize = 2;
+
 /// The root workspace view: the dual-pane splitter, the function-key bar,
 /// the status bar, and the command-line row (T-4.1.4), themed live by
 /// [`ThemeController`] (T-4.1.5).
@@ -295,19 +320,33 @@ pub struct Workspace {
     /// this eager.
     session_path: Option<PathBuf>,
 
-    /// A one-shot notice to surface via `window.push_notification` on the
-    /// first render after startup, then cleared -- T-4.3.7's "a corrupt
-    /// session file degrades to defaults with a notice". `None` covers
-    /// both "nothing went wrong" and "first launch, no `session.json`
-    /// yet" (a missing file is not a notice-worthy problem); only set
-    /// when `session.json` exists but failed to load. Can't push the
-    /// notification directly from [`Self::new`] -- `gpui-component`'s
-    /// `Root` (what `WindowExt::push_notification` routes through)
-    /// doesn't exist yet at that point in `run`'s window-open callback
-    /// (`Root::new(workspace, ..)` wraps `workspace` *after*
-    /// `Workspace::new` returns), so this bridges the one-frame gap the
-    /// same way the `theme` field below does for `ThemeController`.
-    pending_notice: Option<String>,
+    /// Deferred toasts to surface via `window.push_notification` on the
+    /// next render, then cleared -- T-4.3.7's "a corrupt session file
+    /// degrades to defaults with a notice" originally needed only one of
+    /// these (there was no `Window` yet at [`Self::new`] time --
+    /// `gpui-component`'s `Root`, what `WindowExt::push_notification`
+    /// routes through, doesn't exist until `Root::new(workspace, ..)`
+    /// wraps `workspace` *after* `Workspace::new` returns, the same
+    /// one-frame gap `theme` bridges for `ThemeController`). T-5.2.1
+    /// added a second source with the identical "no live `Window`"
+    /// problem -- the copy/move dialog's `QueueManager` event-consumer
+    /// task (spawned in [`Self::new`], runs for the app's whole
+    /// lifetime) -- and a *queue*, not the original `Option<String>`,
+    /// because that second source can fire more than once between
+    /// renders (two jobs finishing in the same tick, `max_concurrent >
+    /// 1`): an `Option` would silently drop every notice but the last.
+    /// [`Self::push_pending_notice`] is the one push site; [`Self::render`]
+    /// drains and fires all of them, in order, every render.
+    pending_notice: Vec<PendingNotice>,
+    /// A `FocusHandle` to restore via `window.focus` on the next render,
+    /// then cleared -- the exact same "no live `Window`" problem
+    /// `pending_notice` documents, for the one close path that hits it:
+    /// [`Self::close_copy_move_dialog_deferred`], called from the copy/
+    /// move dialog's async plan/enqueue success callback. The ordinary
+    /// Escape/Enter-with-a-live-`Window` close path
+    /// ([`Self::close_copy_move_dialog`]) restores focus immediately and
+    /// never touches this field.
+    pending_focus_restore: Option<FocusHandle>,
 
     /// T-4.3.6's command palette: the fuzzy-searchable index over every
     /// registered command (`docs/commands.md`'s 302-entry catalogue) plus
@@ -366,11 +405,70 @@ pub struct Workspace {
     /// panel is the user actually working in" answer.
     hotlist_target_panel: PanelSide,
 
+    /// `Some` while the F5/F6 copy/move dialog (T-5.2.1, FR-OPS-01) is
+    /// open -- constructed fresh on every `open_copy_move_dialog`, dropped
+    /// on close. Mirrors `hotlist`/`command_palette`'s own fields, except
+    /// there's no upstream `ListState<D>` to wrap: see
+    /// `crate::copy_move_dialog`'s module doc comment for why this is a
+    /// small, hand-rolled `Render`-implementing view instead.
+    copy_move_dialog: Option<Entity<CopyMoveDialogState>>,
+    /// Saved by `open_copy_move_dialog`, restored and cleared by
+    /// `close_copy_move_dialog`/`close_copy_move_dialog_deferred` -- same
+    /// reasoning as `hotlist_previous_focus`.
+    copy_move_dialog_previous_focus: Option<FocusHandle>,
+    /// The core's Tokio runtime handle, threaded down from [`run`] into
+    /// `Panel`/`FileTable` (each keeps its own clone for directory
+    /// listings) -- retained here too, as of T-5.2.1, since the copy/move
+    /// dialog is the first thing constructed *after* `Workspace::new`
+    /// returns (in response to a later F5/F6 keypress) that still needs
+    /// to spawn real background I/O (`plan_copy`/`plan_move`/
+    /// `QueueManager::enqueue`) and had no other way to reach a handle.
+    tokio_handle: tokio::runtime::Handle,
+    /// T-5.2.1: the in-memory, real, running multi-job scheduler every
+    /// copy/move dialog confirmation ultimately calls `enqueue` on.
+    /// Constructed once, here, with its own dedicated `JobEvent` channel
+    /// (`Self::new`'s consumer loop is the only reader). `Arc`, not a bare
+    /// value: `CopyMoveDialogState::confirm` needs to call `enqueue` (a
+    /// `&self` method) from inside a spawned Tokio task on a different
+    /// thread, and `QueueManager` itself isn't `Clone` -- an `Arc` around
+    /// it is the standard way to share a `&self`-only handle across
+    /// threads without giving every caller its own independent scheduler.
+    queue: Arc<QueueManager>,
+    /// `~/.local/state/duet`, resolved once here -- `None` under the same
+    /// rare XDG-resolution failure `settings_path`/`session_path`/
+    /// `hotlist_path` already tolerate. Passed to every
+    /// `CopyMoveDialogState` this workspace opens; `confirm` refuses to
+    /// enqueue (with a toast) rather than guessing a job journal location
+    /// when this is `None`.
+    state_dir: Option<PathBuf>,
+
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
     /// `ThemeController::install`'s doc comment). `Option` only to bridge
     /// that one-frame gap; every render after startup sees `Some`.
     theme: Option<ThemeController>,
+}
+
+/// Severity for one deferred toast in [`Workspace::pending_notice`] --
+/// mirrors three of `duet_widgets::toast::Notification`'s four
+/// constructors (everything but `info`, which no current caller of
+/// `push_pending_notice` needs -- the "Nothing selected." case has a live
+/// `Window` already and calls `window.push_notification` directly rather
+/// than going through this deferred queue at all), so [`Workspace::render`]'s
+/// drain loop can pick the right one without guessing from the message
+/// text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeLevel {
+    Success,
+    Warning,
+    Error,
+}
+
+/// One deferred toast -- see [`Workspace::pending_notice`]'s doc comment
+/// for why these queue instead of overwriting.
+pub(crate) struct PendingNotice {
+    level: NoticeLevel,
+    message: String,
 }
 
 /// Which of the two panels a palette-dispatched tab command should apply
@@ -534,6 +632,56 @@ impl Workspace {
             .map(load_hotlist_entries)
             .unwrap_or_default();
 
+        // T-4.3.7's original notice (see `pending_notice`'s doc comment)
+        // becomes the queue's first, possible entry.
+        let pending_notice: Vec<PendingNotice> = pending_notice
+            .into_iter()
+            .map(|message| PendingNotice {
+                level: NoticeLevel::Warning,
+                message,
+            })
+            .collect();
+
+        // T-5.2.1: the copy/move dialog's `QueueManager` and the event
+        // channel every job it enqueues reports through. `state_dir`
+        // shares `settings_path`/`session_path`/`hotlist_path`'s own "best
+        // -effort, `None` under a rare XDG failure" tolerance -- see that
+        // field's own doc comment for what happens when it's `None`.
+        let (queue_events_tx, mut queue_events_rx) =
+            tokio::sync::mpsc::unbounded_channel::<JobEvent>();
+        let queue = Arc::new(QueueManager::new(
+            COPY_MOVE_QUEUE_MAX_CONCURRENT,
+            queue_events_tx,
+        ));
+        let state_dir = duet_config::paths::duet_state_dir().ok();
+
+        // The queue's event-consumer loop: drains every job's `JobEvent`s
+        // and, on `Finished`, queues a summary toast via
+        // `push_pending_notice`. Every other variant is ignored here --
+        // T-5.2.2's live progress UI is a separate, later task. Runs for
+        // the app's whole lifetime, same "stops polling once `Workspace`
+        // is dropped" shape as the periodic session-save loop just above.
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = queue_events_rx.recv().await {
+                let JobEvent::Finished {
+                    outcome, report, ..
+                } = event
+                else {
+                    continue;
+                };
+                let Some((level, message)) = summarize_job_finished(outcome, &report) else {
+                    continue;
+                };
+                if this
+                    .update(cx, |this, cx| this.push_pending_notice(level, message, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
@@ -546,6 +694,7 @@ impl Workspace {
             settings_path,
             session_path,
             pending_notice,
+            pending_focus_restore: None,
             palette_index,
             command_palette: None,
             palette_previous_focus: None,
@@ -555,6 +704,11 @@ impl Workspace {
             hotlist: None,
             hotlist_previous_focus: None,
             hotlist_target_panel: PanelSide::Left,
+            copy_move_dialog: None,
+            copy_move_dialog_previous_focus: None,
+            tokio_handle: tokio_handle.clone(),
+            queue,
+            state_dir,
             theme: None,
         }
     }
@@ -1039,6 +1193,151 @@ impl Workspace {
             .detach();
     }
 
+    /// Pushes one deferred toast and wakes the next render -- the
+    /// `cx.notify()` here is load-bearing, not decorative: every caller of
+    /// this method runs from a background-completion callback with no
+    /// live `Window` (see `pending_notice`'s doc comment), so nothing else
+    /// would otherwise schedule the render that actually fires the toast.
+    pub(crate) fn push_pending_notice(
+        &mut self,
+        level: NoticeLevel,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_notice.push(PendingNotice {
+            level,
+            message: message.into(),
+        });
+        cx.notify();
+    }
+
+    /// F5 (`CopyDialog`) / F6 (`MoveDialog`), T-5.2.1: resolves what to
+    /// operate on from whichever panel currently has focus (selection, or
+    /// the cursor row if nothing's selected -- `resolve_source_names`),
+    /// defaults the destination to the *other* panel's current directory
+    /// (`docs/keymap-tc.csv`'s own "F5 ... to the other panel's
+    /// directory"), and opens the dialog. A no-op (with an explanatory
+    /// toast) if there is nothing to operate on -- an empty directory with
+    /// nothing selected and no cursor row to fall back to. A no-op,
+    /// silently, if the dialog is already open (same "reopening shouldn't
+    /// stack a second one" reasoning as `open_hotlist_for_panel`/
+    /// `open_command_palette`).
+    fn open_copy_move_dialog(
+        &mut self,
+        kind: JobKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.copy_move_dialog.is_some() {
+            return;
+        }
+
+        let source_side = self.focused_panel_side(window, cx);
+        let dest_side = match source_side {
+            PanelSide::Left => PanelSide::Right,
+            PanelSide::Right => PanelSide::Left,
+        };
+        let source_panel = match source_side {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let dest_panel = match dest_side {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+
+        let source_table = source_panel.read(cx).active_table().clone();
+        let current_dir = source_table.read(cx).current_dir().to_path_buf();
+        let names = {
+            let table_state = source_table.read(cx).state().read(cx);
+            crate::copy_move_dialog::resolve_source_names(table_state.delegate())
+        };
+        if names.is_empty() {
+            window.push_notification(Notification::info("Nothing selected."), cx);
+            return;
+        }
+        let sources: Vec<VPath> = names
+            .iter()
+            .filter_map(|name| crate::file_table::local_vpath(&current_dir.join(name)).ok())
+            .collect();
+        if sources.is_empty() {
+            window.push_notification(
+                Notification::warning("The selected item(s) don't have a valid path."),
+                cx,
+            );
+            return;
+        }
+
+        let dest_dir = dest_panel.read(cx).active_table().read(cx).current_dir();
+        let initial_destination = dest_dir.to_string_lossy().into_owned();
+
+        self.copy_move_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let state = cx.new(|cx| {
+            CopyMoveDialogState::new(
+                kind,
+                sources,
+                initial_destination,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                window,
+                cx,
+            )
+        });
+        self.copy_move_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// Closes the copy/move dialog (Escape, or a click outside it) and
+    /// restores keyboard focus to whatever had it before it opened.
+    /// Mirrors `close_hotlist` exactly -- always has a live `Window`.
+    pub(crate) fn close_copy_move_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_move_dialog = None;
+        if let Some(handle) = self.copy_move_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// The one close path with no live `Window` -- `CopyMoveDialogState::
+    /// confirm`'s async plan/enqueue success callback. See
+    /// `pending_focus_restore`'s doc comment: the actual `window.focus`
+    /// call happens on `Self::render`'s next pass instead.
+    pub(crate) fn close_copy_move_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.copy_move_dialog = None;
+        self.pending_focus_restore = self.copy_move_dialog_previous_focus.take();
+        cx.notify();
+    }
+
+    /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
+    /// "does `parent` match either panel's already-loaded directory" half
+    /// -- see that method's own doc comment for the full picture (T-5.2.1's
+    /// deliberately narrow Tab-completion). The actual name-matching logic
+    /// (`complete_against_model`) is factored into `copy_move_dialog` so
+    /// it stays unit-testable against a plain `DirectoryModel`, with no
+    /// live `Workspace`/panel needed.
+    pub(crate) fn completion_candidate(
+        &self,
+        parent: &Path,
+        prefix: &str,
+        cx: &App,
+    ) -> Option<String> {
+        for panel in [&self.left_panel, &self.right_panel] {
+            let table_entity = panel.read(cx).active_table();
+            let table = table_entity.read(cx);
+            if table.current_dir() == parent {
+                let model = table.state().read(cx).delegate().model();
+                return crate::copy_move_dialog::complete_against_model(model, parent, prefix);
+            }
+        }
+        None
+    }
+
     fn dual_pane(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let theme = cx.theme();
@@ -1208,14 +1507,27 @@ impl Render for Workspace {
         let bg = theme.background;
         let fg = theme.foreground;
 
-        // T-4.3.7: the one-shot "your session.json was corrupt" notice --
-        // see the `pending_notice` field's doc comment for why this can't
-        // happen any earlier than the first render (no `Root` exists yet
-        // during `Workspace::new`, and `push_notification` requires one).
-        // `.take()` so it fires exactly once, no matter how many renders
-        // follow.
-        if let Some(notice) = self.pending_notice.take() {
-            window.push_notification(Notification::warning(notice), cx);
+        // T-5.2.1: the one deferred close path with no live `Window` --
+        // see `pending_focus_restore`'s doc comment. Drained before the
+        // notice queue below on general principle (restoring focus first
+        // reads more naturally than the other order), though the two are
+        // otherwise independent.
+        if let Some(handle) = self.pending_focus_restore.take() {
+            window.focus(&handle);
+        }
+
+        // T-4.3.7 / T-5.2.1: every deferred toast queued since the last
+        // render -- see `pending_notice`'s doc comment for why this is a
+        // drain-everything loop rather than a single `.take()` (T-4.3.7's
+        // original shape): a background job-completion callback can push
+        // more than one of these before the next render ever runs.
+        for notice in self.pending_notice.drain(..) {
+            let toast = match notice.level {
+                NoticeLevel::Success => Notification::success(notice.message),
+                NoticeLevel::Warning => Notification::warning(notice.message),
+                NoticeLevel::Error => Notification::error(notice.message),
+            };
+            window.push_notification(toast, cx);
         }
 
         v_flex()
@@ -1244,6 +1556,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &AddCurrentDirToHotlist, window, cx| {
                 this.add_current_dir_to_hotlist(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &CopyDialog, window, cx| {
+                this.open_copy_move_dialog(JobKind::Copy, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveDialog, window, cx| {
+                this.open_copy_move_dialog(JobKind::Move, window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
@@ -1253,6 +1571,9 @@ impl Render for Workspace {
             })
             .when_some(self.hotlist.clone(), |this, state| {
                 this.child(hotlist_overlay(&state, cx))
+            })
+            .when_some(self.copy_move_dialog.clone(), |this, state| {
+                this.child(copy_move_dialog_overlay(&state, cx))
             })
     }
 }
@@ -1363,6 +1684,49 @@ fn hotlist_overlay(
                 }))
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_hotlist(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.1's copy/move dialog overlay -- same `.occlude()`-backdrop/card
+/// shape as `hotlist_overlay`/`command_palette_overlay` (see
+/// `command_palette_overlay`'s own doc comment for the full reasoning,
+/// including the real regression this pattern exists to avoid). Unlike
+/// those two, the card's body is `state.clone()` directly rather than a
+/// `duet_widgets::list::List` -- `CopyMoveDialogState` is its own
+/// `Render`-implementing view (see `crate::copy_move_dialog`'s module doc
+/// comment), and an `Entity<V: Render>` is `IntoElement` on its own, the
+/// same way `panel_view` already embeds `Entity<Panel>` directly. The
+/// card sets no `key_context` of its own here -- `CopyMoveDialogState::
+/// render` already sets `"CopyMoveDialog"` on its own root, which is an
+/// equally valid ancestor for key-context resolution purposes.
+fn copy_move_dialog_overlay(
+    state: &Entity<CopyMoveDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("copy-move-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("copy-move-dialog-card")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_copy_move_dialog(window, cx);
                 })),
         )
 }
@@ -1745,6 +2109,50 @@ fn save_splitter_ratio(path: &std::path::Path, ratio: f32) -> duet_config::Resul
     file.save()
 }
 
+/// Turns a finished T-5.2.1 copy/move job's outcome/report into one
+/// human-readable toast, for `Workspace::new`'s `QueueManager` event-
+/// consumer loop. `Cancelled` gets no toast at all -- the user asked for
+/// it, it's not noteworthy. Every other `JobEvent` variant is ignored by
+/// that loop entirely; a live progress UI (T-5.2.2) is a separate, later
+/// task this one deliberately doesn't attempt.
+fn summarize_job_finished(
+    outcome: JobOutcome,
+    report: &JobReport,
+) -> Option<(NoticeLevel, String)> {
+    match outcome {
+        JobOutcome::Completed => {
+            let mut bytes = String::new();
+            write_byte_count(&mut bytes, report.bytes_completed);
+            Some((
+                NoticeLevel::Success,
+                format!("Finished: {} file(s), {bytes}.", report.files_completed),
+            ))
+        }
+        JobOutcome::CompletedWithSkips => Some((
+            NoticeLevel::Warning,
+            format!(
+                "Finished with {} skipped: {} file(s) completed.",
+                report.skipped.len(),
+                report.files_completed
+            ),
+        )),
+        JobOutcome::Failed => {
+            let first = report
+                .errors
+                .first()
+                .map(|e| e.message.as_str())
+                .unwrap_or("unknown error");
+            let suffix = if report.errors.len() > 1 {
+                format!(" ({} errors total)", report.errors.len())
+            } else {
+                String::new()
+            };
+            Some((NoticeLevel::Error, format!("Failed: {first}{suffix}")))
+        }
+        JobOutcome::Cancelled => None,
+    }
+}
+
 /// Spawns the T-4.1.1 executor-wiring demo: a background task on the
 /// core's Tokio runtime lists the current directory through the real VFS
 /// (`duet_vfs::local::LocalFs`), then hands its result back to GPUI's
@@ -1843,6 +2251,7 @@ mod tests {
     use duet_commands::CommandId;
     use duet_widgets::layout::Root;
     use duet_widgets::list::ListDelegate as _;
+    use duet_widgets::table::TableDelegate as _;
     use gpui::{TestAppContext, VisualTestContext};
 
     use super::*;
@@ -1894,6 +2303,7 @@ mod tests {
             bind_workspace_keys(cx);
             crate::file_table::bind_file_table_keys(cx);
             bind_panel_keys(cx);
+            bind_copy_move_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -2715,5 +3125,214 @@ mod tests {
         let (tabs, active) = resolve_panel_session(Some(&session), Path::new("/tmp"));
         assert_eq!(tabs.len(), 1);
         assert_eq!(active, 0);
+    }
+
+    // -- T-5.2.1 copy/move dialog -----------------------------------------
+
+    /// Waits for `condition` to become true, alternating `run_until_parked`
+    /// with a short real sleep -- identical reasoning and shape to
+    /// `panel.rs`'s own private `wait_until` (that module's copy isn't
+    /// reachable from here): a single `run_until_parked()` isn't enough
+    /// for anything that depends on real background Tokio work (directory
+    /// listings, `plan_copy`/`QueueManager::enqueue`/`execute()`), all of
+    /// which cross onto the real, if minimal, Tokio runtime `with_workspace`
+    /// builds. Panics with a clear message rather than hanging a test run
+    /// indefinitely.
+    fn wait_until(
+        vcx: &mut VisualTestContext,
+        mut condition: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            vcx.run_until_parked();
+            if condition(vcx) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("wait_until: condition did not become true within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Navigates `table` to `dir` and waits for the resulting background
+    /// directory listing (`spawn_directory_load`) to finish -- `loading()`
+    /// flips back to `false` once it has, real content or not (an empty
+    /// destination directory is a real, expected case for the E2E test
+    /// below, so this can't just wait for a non-empty `order()`).
+    fn navigate_panel_to(vcx: &mut VisualTestContext, table: &Entity<FileTable>, dir: PathBuf) {
+        table.update_in(vcx, |table, window, cx| {
+            table.navigate_to_path(dir, window, cx);
+        });
+        wait_until(vcx, |vcx| {
+            table.read_with(vcx, |table, cx| {
+                !table.state().read(cx).delegate().loading(cx)
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn f5_opens_the_copy_dialog_defaulting_destination_to_the_other_panels_directory(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("hello.txt"), b"hi").unwrap();
+
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &left_table, source_dir.path().to_path_buf());
+            navigate_panel_to(vcx, &right_table, dest_dir.path().to_path_buf());
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(CopyDialog);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, cx| {
+                let state = ws
+                    .copy_move_dialog
+                    .clone()
+                    .expect("F5 must open the copy/move dialog");
+                state.read_with(cx, |state, cx| {
+                    assert_eq!(state.kind(), JobKind::Copy);
+                    assert_eq!(
+                        state.destination_value(cx),
+                        dest_dir.path().to_string_lossy(),
+                        "destination must default to the *other* (right) panel's directory"
+                    );
+                    assert_eq!(
+                        state.sources(),
+                        &[
+                            crate::file_table::local_vpath(&source_dir.path().join("hello.txt"))
+                                .unwrap()
+                        ],
+                        "with nothing explicitly selected, the sole cursor-row entry is used"
+                    );
+                });
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn f6_opens_the_move_dialog(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("a.txt"), b"a").unwrap();
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &left_table, source_dir.path().to_path_buf());
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(MoveDialog);
+
+            workspace.read_with(vcx, |ws, cx| {
+                let state = ws
+                    .copy_move_dialog
+                    .clone()
+                    .expect("F6 must open the copy/move dialog");
+                state.read_with(cx, |state, _cx| assert_eq!(state.kind(), JobKind::Move));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn f5_opens_the_dialog_with_nothing_to_operate_on_shows_a_notice_instead(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            // An empty source directory: nothing selected, no cursor row
+            // to fall back to either.
+            let empty_dir = tempfile::tempdir().unwrap();
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &left_table, empty_dir.path().to_path_buf());
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(CopyDialog);
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.copy_move_dialog.is_none(),
+                    "an empty directory with nothing selected must not open the dialog"
+                );
+            });
+        });
+    }
+
+    /// The most valuable test in this module: real tempdirs, the real
+    /// `LocalFs`, F5 to open the dialog, a real Enter keystroke inside the
+    /// destination field to confirm, and -- via the real off-thread
+    /// `plan_copy` -> `QueueManager::enqueue` -> `execute()` path, no
+    /// shortcuts -- the file actually landing on real disk at the
+    /// destination. This is the first proof the T-5.2.1 wiring works
+    /// end to end, not just that individual pieces return plausible
+    /// values in isolation.
+    #[gpui::test]
+    fn f5_copy_end_to_end_copies_a_real_file_to_the_other_panels_directory(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("hello.txt"), b"hello world").unwrap();
+
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &left_table, source_dir.path().to_path_buf());
+            navigate_panel_to(vcx, &right_table, dest_dir.path().to_path_buf());
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| window.focus(&left_handle));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(CopyDialog);
+            workspace.read_with(vcx, |ws, _| assert!(ws.copy_move_dialog.is_some()));
+
+            // The destination field already has real keyboard focus (see
+            // `CopyMoveDialogState::new`). Dispatches the resolved
+            // `duet_widgets::input::Enter` action directly rather than
+            // `vcx.simulate_keystrokes("enter")` -- the latter drives
+            // GPUI's synthetic IME/text-input pipeline, which hits an
+            // unrelated upstream panic (`gpui`'s own `shape_line`
+            // debug_assert) the moment a real, focused, non-empty
+            // `InputState` receives a simulated keystroke; confirmed by
+            // isolating it against `dispatch_action(CopyDialog)` (fine)
+            // and `dispatch_action(Enter{..})` (also fine) -- only
+            // `simulate_keystrokes` trips it. Dispatching the action
+            // directly still exercises the real thing this test cares
+            // about: `InputState::enter`'s own `cx.emit(PressEnter)` ->
+            // this dialog's `cx.subscribe_in` -> `confirm`, with no
+            // shortcut through any of this module's own private methods.
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+
+            let dest_file = dest_dir.path().join("hello.txt");
+            wait_until(vcx, |_vcx| dest_file.is_file());
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.copy_move_dialog.is_none(),
+                    "a successful plan/enqueue must close the dialog"
+                );
+            });
+            assert_eq!(std::fs::read(&dest_file).unwrap(), b"hello world");
+        });
     }
 }

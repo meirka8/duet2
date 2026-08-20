@@ -856,8 +856,13 @@ impl FileTableDelegate {
     /// Moves the cursor directly to `row` (display-row terms, like
     /// `move_cursor_by`), clamped into range (so `usize::MAX` is a
     /// convenient "last row" for End/Ctrl+End). Ends any in-progress
-    /// range-select session, same as `move_cursor_by`.
-    fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
+    /// range-select session, same as `move_cursor_by`. `pub(crate)` (not
+    /// just used within this module any more) -- `copy_move_dialog.rs`'s
+    /// own tests (T-5.2.1) need it to park the cursor on the synthetic
+    /// ".." row and confirm `resolve_source_names` correctly treats that
+    /// as "nothing usable," same reasoning as `local_vpath`'s own
+    /// visibility bump.
+    pub(crate) fn move_cursor_to(&mut self, row: usize) -> Option<usize> {
         let len = self.display_rows_count();
         if len == 0 {
             return None;
@@ -2947,8 +2952,11 @@ fn spawn_directory_load(
 }
 
 /// Converts `dir` into a local `VPath` -- the shared first step every
-/// `LocalFs` call this module makes off the UI thread needs.
-fn local_vpath(dir: &std::path::Path) -> Result<VPath, String> {
+/// `LocalFs` call this module makes off the UI thread needs. `pub(crate)`
+/// (not just used within this module any more) -- `copy_move_dialog.rs`
+/// (T-5.2.1) needs the exact same conversion for its `sources`/`dest_dir`
+/// `VPath`s and there's no reason to duplicate this one-liner.
+pub(crate) fn local_vpath(dir: &std::path::Path) -> Result<VPath, String> {
     let path_str = dir
         .to_str()
         .ok_or_else(|| "directory path is not valid UTF-8".to_string())?;
