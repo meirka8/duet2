@@ -75,10 +75,23 @@ pub enum ConflictScope {
 /// A resolved conflict answer: the chosen policy plus its scope. What the
 /// executor records after either consulting `PlanOptions::default_conflict`
 /// or receiving a user's answer to a [`ConflictPrompt`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Not `Copy` (unlike most small enums/structs in this crate) because
+/// `alternate` carries an owned `VPath` when present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConflictResolution {
     pub policy: ConflictPolicy,
     pub scope: ConflictScope,
+    /// The destination `RenameTarget` should use instead of the original,
+    /// conflicting one. Only meaningful when `policy == RenameTarget` --
+    /// that policy's whole definition is "a new name chosen by the user"
+    /// (see its own doc comment), which nothing inside `duet-ops` can
+    /// invent on its own; a resolver that returns `RenameTarget` without
+    /// supplying one produces a `StepFailure` rather than guessing.
+    /// `ConflictPolicy::AutoRename` computes its own name internally
+    /// instead (see the executor's `auto_rename_target`) and ignores this
+    /// field entirely.
+    pub alternate: Option<VPath>,
 }
 
 impl ConflictResolution {
@@ -87,6 +100,7 @@ impl ConflictResolution {
         ConflictResolution {
             policy,
             scope: ConflictScope::ThisOnly,
+            alternate: None,
         }
     }
 
@@ -96,8 +110,41 @@ impl ConflictResolution {
         ConflictResolution {
             policy,
             scope: ConflictScope::AllRemaining,
+            alternate: None,
         }
     }
+
+    /// A one-off `RenameTarget` answer: use `alternate` instead of the
+    /// conflicting destination for this single step.
+    pub fn rename_to(alternate: VPath) -> Self {
+        ConflictResolution {
+            policy: ConflictPolicy::RenameTarget,
+            scope: ConflictScope::ThisOnly,
+            alternate: Some(alternate),
+        }
+    }
+}
+
+/// A live decision-maker for a conflict that neither a pre-resolved
+/// `Step`'s own `conflict` field nor an already-established per-job
+/// "apply to all" answer already covers.
+///
+/// design.md §9.3 is explicit that the actual UI round trip -- showing a
+/// human the prompt and waiting for their click -- is "out-of-band...
+/// not modelled in this crate." This trait is the seam a caller (a queue
+/// manager, a test harness, eventually T-5.2.3's conflict dialog) plugs
+/// into, not that round trip itself: `resolve` is a plain synchronous
+/// callback, not `async`, because nothing in this crate needs it to block
+/// on I/O. A future interactive implementation that genuinely has to wait
+/// on a human is expected to bridge that itself (e.g. blocking on a
+/// channel fed by the UI thread) -- this trait only has to be able to
+/// *represent* the answer once it arrives.
+///
+/// `execute()` accepts an `Option<Arc<dyn ConflictResolver>>`; passing
+/// `None` means every conflict falls back to `PlanOptions::default_conflict`
+/// with no live consultation at all -- the fully-automatic/background case.
+pub trait ConflictResolver: Send + Sync {
+    fn resolve(&self, prompt: &ConflictPrompt) -> ConflictResolution;
 }
 
 /// Data surfaced to the UI for an interactive conflict prompt (FR-OPS-04:
