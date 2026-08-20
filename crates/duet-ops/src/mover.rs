@@ -529,7 +529,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
-            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            _on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<CopyOutcome> {
             // Force the naive fallback loop for every file in these tests
             // -- keeps behaviour deterministic regardless of whether the

@@ -181,9 +181,9 @@ impl FileSystem for LocalFs {
         &self,
         from: &VPath,
         to: &VPath,
-        should_cancel: &(dyn Fn() -> bool + Send + Sync),
+        on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
     ) -> Result<CopyOutcome> {
-        super::probe::accelerated_copy(from, to, should_cancel)
+        super::probe::accelerated_copy(from, to, on_progress)
     }
 }
 
@@ -348,7 +348,7 @@ mod tests {
         std::fs::write(dir.path().join("src.txt"), b"copy me").unwrap();
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
         let outcome = fs
-            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|| false)
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|_| false)
             .await
             .unwrap();
         match outcome {
@@ -374,7 +374,7 @@ mod tests {
         std::fs::write(dir.path().join("dst.txt"), b"already here").unwrap();
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
         let err = fs
-            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|| false)
+            .server_side_copy(&vp(&dir, "src.txt"), &vp(&dir, "dst.txt"), &|_| false)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Conflict);

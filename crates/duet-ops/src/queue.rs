@@ -672,7 +672,7 @@ mod tests {
             &self,
             _from: &VPath,
             _to: &VPath,
-            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+            _on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
         ) -> Result<duet_vfs::CopyOutcome> {
             // Always `Unsupported` -- forces every copy through
             // `naive_copy`, whose first call is `open_read`, so `delay`/
