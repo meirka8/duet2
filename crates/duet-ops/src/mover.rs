@@ -63,15 +63,9 @@
 //!   variant exists for "recreate a symlink pointing at X," so a symlink
 //!   inside a cross-device-moved directory is silently left behind in the
 //!   source rather than mishandled.
-//! - **`VerifyAlgorithm::SizeOnly`, never `Blake3`**, when `PlanOptions::
-//!   verify` is set — `Blake3` execution is unimplemented in the executor
-//!   (T-5.1.12's own scope) and this task's own AC only requires "never
-//!   unlinks before the destination is fsync'd," which a successful
-//!   `CopyFile` `Completion` already satisfies without any verification at
-//!   all when `verify` is `false` (design.md §9.3: "verify (if enabled)").
 //! - **No destination conflict pre-check** (every step's `conflict` field
-//!   is `None`) and **no hardlink-graph interaction** — same reasoning
-//!   `plan_copy`'s own module doc comment already gives for both.
+//!   is `None`) — same reasoning `plan_copy`'s own module doc comment
+//!   already gives.
 //! - **A subtree is assumed to stay on one device throughout its own
 //!   walk** — the same-device-vs-cross-device decision is made once per
 //!   top-level source (from its own `stat`), not re-checked per descendant.
@@ -371,7 +365,7 @@ pub async fn plan_move(
             steps.push(Step::Verify {
                 source: source.clone(),
                 dest,
-                algorithm: VerifyAlgorithm::SizeOnly,
+                algorithm: VerifyAlgorithm::Blake3,
                 depends_on: Some(produced_by),
             });
             (steps.len() - 1) as u32
@@ -711,7 +705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_device_move_with_verify_uses_size_only_and_still_completes() {
+    async fn cross_device_move_with_verify_uses_blake3_and_still_completes() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
         let dst = TempDir::new().unwrap();
@@ -741,7 +735,7 @@ mod tests {
         assert!(matches!(
             verify_steps[0],
             Step::Verify {
-                algorithm: VerifyAlgorithm::SizeOnly,
+                algorithm: VerifyAlgorithm::Blake3,
                 ..
             }
         ));

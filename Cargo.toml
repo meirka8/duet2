@@ -78,6 +78,9 @@ rand = "0.9"
 # T-3.3.4's benchmark harness. `harness = false` on every `[[bench]]` below;
 # criterion drives its own `main`/reporting instead of libtest's bench harness.
 criterion = "0.8"
+# T-5.1.12: FR-OPS-08's post-copy verification algorithm, already anticipated
+# in design.md §7.5's dependency list ("blake3/sha2 (hashing)").
+blake3 = "1.8"
 
 [profile.dev]
 # debug_assertions must stay on: T-3.1.6's UI-thread blocking guard is a

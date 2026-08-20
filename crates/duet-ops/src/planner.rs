@@ -50,7 +50,7 @@ use duet_vfs::{FileSystem, ListFields, ListOpts};
 use futures_util::StreamExt;
 
 use crate::plan::{Plan, PlanOptions};
-use crate::step::Step;
+use crate::step::{Step, VerifyAlgorithm};
 
 /// A cheaply cloneable flag a caller uses to ask an in-progress
 /// [`plan_copy`] walk to stop.
@@ -291,6 +291,16 @@ pub async fn plan_copy(
     // `Step::Link` -- see `DeferredLink`'s own doc comment.
     let mut deferred_links: Vec<DeferredLink> = Vec::new();
     let mut hardlinks = HardlinkGraph::default();
+    // T-5.1.12: ditto for a freshly-copied file's own `Step::Verify`, when
+    // `options.verify` is set -- `Verify` is a barrier step (not
+    // copy-class) exactly like `SetMeta`/`Link`, so it gets the same
+    // deferred-to-the-end treatment for the same batching-preservation
+    // reason. `(source, dest, depends_on)`; never populated for a
+    // hardlink-graph-deduped entry, since a `Link` step's destination is
+    // definitionally byte-identical to its already-verified-or-not first
+    // occurrence -- re-verifying it would be pure overhead for a
+    // guaranteed match.
+    let mut deferred_verify: Vec<(VPath, VPath, u32)> = Vec::new();
 
     for source in sources {
         if cancel.is_cancelled() {
@@ -336,6 +346,9 @@ pub async fn plan_copy(
                     });
                     let copy_step = (steps.len() - 1) as u32;
                     hardlinks.insert(&meta, dest.clone(), copy_step);
+                    if options.verify {
+                        deferred_verify.push((source.clone(), dest.clone(), copy_step));
+                    }
                     deferred_meta.push(DeferredMeta {
                         step_index: copy_step,
                         dest,
@@ -401,13 +414,16 @@ pub async fn plan_copy(
                             });
                         } else {
                             steps.push(Step::CopyFile {
-                                source,
+                                source: source.clone(),
                                 dest: dest.clone(),
                                 size: entry.metadata.size,
                                 conflict: None,
                             });
                             let copy_step = (steps.len() - 1) as u32;
                             hardlinks.insert(&entry.metadata, dest.clone(), copy_step);
+                            if options.verify {
+                                deferred_verify.push((source, dest.clone(), copy_step));
+                            }
                             deferred_meta.push(DeferredMeta {
                                 step_index: copy_step,
                                 dest,
@@ -430,6 +446,18 @@ pub async fn plan_copy(
             source: link.source,
             dest: link.dest,
             depends_on: Some(link.depends_on),
+        });
+    }
+
+    // T-5.1.12: ditto for every deferred `Verify` (FR-OPS-08, when
+    // `options.verify` is set) -- same barrier/batching reasoning as
+    // `SetMeta`/`Link` above.
+    for (source, dest, depends_on) in deferred_verify {
+        steps.push(Step::Verify {
+            source,
+            dest,
+            algorithm: VerifyAlgorithm::Blake3,
+            depends_on: Some(depends_on),
         });
     }
 
