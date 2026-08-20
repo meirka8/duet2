@@ -24,11 +24,6 @@
 //!   call per destination purely to pick a `Step` variant the executor
 //!   could just as easily reinterpret at execution time from `Caps` it
 //!   already has to consult anyway.
-//! - **No hardlink graph.** Design.md §9.3 describes `HashMap<(dev, ino),
-//!   VPath>` deduplication in the same "Planning" paragraph, but
-//!   `documentation/task.md` gives it its own task, T-5.1.7 ("Hardlink
-//!   graph preservation within a job"), depending on T-5.1.4 rather than
-//!   this one -- so it's out of scope here, not silently dropped.
 //! - **No destination conflict pre-check**, so every emitted step's
 //!   `conflict` field is `None`. [`Step`]'s own doc comment establishes
 //!   this is a safe, well-defined state ("the executor still has to
@@ -186,6 +181,88 @@ pub(crate) fn metadata_to_patch(source_meta: &Metadata) -> MetaPatch {
     }
 }
 
+/// A `CopyFile` step recorded so a *later* occurrence of the same source
+/// inode can be linked to it instead of copied again (T-5.1.7); recorded
+/// but not yet emitted as a `Step::Link`, since the second occurrence
+/// (like every other `SetMeta`) is deferred to the end of the plan --
+/// see [`DeferredLink`]'s own doc comment.
+struct DeferredLink {
+    /// The already-planned `CopyFile` destination this hardlinks to.
+    source: VPath,
+    /// This occurrence's own destination.
+    dest: VPath,
+    /// The `source` `CopyFile` step's own index, so the eventual
+    /// `Step::Link` can gate on it (T-5.1.5's dependency-gating
+    /// mechanism) — never attempt a hardlink against a copy that failed.
+    depends_on: u32,
+}
+
+/// design.md §9.3's `HashMap<(dev, ino), VPath>` for hardlink-graph
+/// preservation within a job (T-5.1.7): "the second occurrence of an
+/// inode becomes a `Link` step rather than a second copy" -- preserving
+/// e.g. an rsnapshot backup tree's link structure instead of silently
+/// exploding it into independent copies.
+///
+/// **Bounded by construction** (this task's own AC: "memory for the inode
+/// map is bounded"): [`HardlinkGraph::insert`] only ever records an entry
+/// with `nlink > 1` -- a file with exactly one link, by definition, can
+/// never have a second occurrence anywhere else in the source set, so
+/// tracking it would only ever grow the map without ever being looked up
+/// again. In a real-world source tree the overwhelming majority of files
+/// have `nlink == 1`; only genuine hardlink farms (an rsnapshot tree,
+/// this task's own named example) grow this map to any meaningful size,
+/// and even then it's bounded by the count of *distinct multiply-linked
+/// inodes*, not the total file count.
+///
+/// **Reported** (the AC's other half): every `Step::Link` this graph
+/// causes to be emitted is counted, same as any other step, by
+/// [`crate::plan::Plan::compute_totals`] into
+/// [`crate::plan::PlanTotals::hardlinks_preserved`] -- the number this
+/// task's own dedup work actually surfaces to a caller/report.
+/// `pub(crate)`, reused as-is by [`crate::mover`]'s own cross-device walk
+/// -- the graph's semantics don't depend on which planner is driving it.
+#[derive(Default)]
+pub(crate) struct HardlinkGraph {
+    seen: std::collections::HashMap<(u64, u64), (VPath, u32)>,
+}
+
+impl HardlinkGraph {
+    /// `Some((dev, ino))` only for entries that could possibly collide with
+    /// another later in the walk -- `nlink <= 1` (or an unknown dev/ino,
+    /// e.g. a backend that can't report inode identity) never can, and is
+    /// deliberately excluded so [`insert`](Self::insert) never grows the
+    /// map for them.
+    fn key(meta: &Metadata) -> Option<(u64, u64)> {
+        if meta.nlink.unwrap_or(1) <= 1 {
+            return None;
+        }
+        Some((meta.dev?, meta.ino?))
+    }
+
+    /// If `meta`'s inode has already been recorded (a hardlink to a file
+    /// this walk already planned to copy), returns that first copy's
+    /// destination and `CopyFile` step index -- the caller should emit a
+    /// deferred [`Step::Link`] to it instead of copying `meta`'s entry
+    /// again. `None` for a first occurrence (including every `nlink <= 1`
+    /// file, which can never collide) — the caller proceeds with its
+    /// normal `Step::CopyFile` and should call [`insert`](Self::insert)
+    /// with the step it just planned.
+    pub(crate) fn lookup(&self, meta: &Metadata) -> Option<(VPath, u32)> {
+        let key = Self::key(meta)?;
+        self.seen.get(&key).cloned()
+    }
+
+    /// Records `dest`/`step_index` as the first-seen copy of `meta`'s
+    /// inode, if it could ever be linked to again (`nlink > 1`) — a no-op
+    /// otherwise, which is exactly what keeps this map's size bounded (see
+    /// the struct's own doc comment).
+    pub(crate) fn insert(&mut self, meta: &Metadata, dest: VPath, step_index: u32) {
+        if let Some(key) = Self::key(meta) {
+            self.seen.insert(key, (dest, step_index));
+        }
+    }
+}
+
 /// Walks `sources` (each copied as a child of `dest_dir`, keeping its own
 /// basename -- exactly what F5 does with a panel's current selection) and
 /// returns the materialised, totalled [`Plan`] a `JobKind::Copy` job would
@@ -210,6 +287,10 @@ pub async fn plan_copy(
     // T-5.1.6: every entry's own `SetMeta` is deferred to the very end of
     // the plan -- see `DeferredMeta`'s own doc comment for why.
     let mut deferred_meta: Vec<DeferredMeta> = Vec::new();
+    // T-5.1.7: ditto for a second-and-later hardlinked occurrence's own
+    // `Step::Link` -- see `DeferredLink`'s own doc comment.
+    let mut deferred_links: Vec<DeferredLink> = Vec::new();
+    let mut hardlinks = HardlinkGraph::default();
 
     for source in sources {
         if cancel.is_cancelled() {
@@ -240,17 +321,27 @@ pub async fn plan_copy(
                 });
             }
             EntryKind::File => {
-                steps.push(Step::CopyFile {
-                    source: source.clone(),
-                    dest: dest.clone(),
-                    size: meta.size,
-                    conflict: None,
-                });
-                deferred_meta.push(DeferredMeta {
-                    step_index: (steps.len() - 1) as u32,
-                    dest,
-                    meta,
-                });
+                if let Some((link_source, link_depends_on)) = hardlinks.lookup(&meta) {
+                    deferred_links.push(DeferredLink {
+                        source: link_source,
+                        dest,
+                        depends_on: link_depends_on,
+                    });
+                } else {
+                    steps.push(Step::CopyFile {
+                        source: source.clone(),
+                        dest: dest.clone(),
+                        size: meta.size,
+                        conflict: None,
+                    });
+                    let copy_step = (steps.len() - 1) as u32;
+                    hardlinks.insert(&meta, dest.clone(), copy_step);
+                    deferred_meta.push(DeferredMeta {
+                        step_index: copy_step,
+                        dest,
+                        meta,
+                    });
+                }
             }
             // Symlinks, fifos, sockets, device nodes: see the module doc
             // comment's "Scope cuts" section.
@@ -300,22 +391,46 @@ pub async fn plan_copy(
                         queue.push_back(PendingDir { source, dest });
                     }
                     EntryKind::File => {
-                        steps.push(Step::CopyFile {
-                            source,
-                            dest: dest.clone(),
-                            size: entry.metadata.size,
-                            conflict: None,
-                        });
-                        deferred_meta.push(DeferredMeta {
-                            step_index: (steps.len() - 1) as u32,
-                            dest,
-                            meta: entry.metadata,
-                        });
+                        if let Some((link_source, link_depends_on)) =
+                            hardlinks.lookup(&entry.metadata)
+                        {
+                            deferred_links.push(DeferredLink {
+                                source: link_source,
+                                dest,
+                                depends_on: link_depends_on,
+                            });
+                        } else {
+                            steps.push(Step::CopyFile {
+                                source,
+                                dest: dest.clone(),
+                                size: entry.metadata.size,
+                                conflict: None,
+                            });
+                            let copy_step = (steps.len() - 1) as u32;
+                            hardlinks.insert(&entry.metadata, dest.clone(), copy_step);
+                            deferred_meta.push(DeferredMeta {
+                                step_index: copy_step,
+                                dest,
+                                meta: entry.metadata,
+                            });
+                        }
                     }
                     _ => {}
                 }
             }
         }
+    }
+
+    // T-5.1.7: every deferred hardlink follow-up lands after the whole
+    // walk too -- same reasoning as `SetMeta`'s own deferral (keeps every
+    // `CopyFile` run unbroken for `execute`'s batching; a `Link` step is
+    // just as much a barrier as `SetMeta` is).
+    for link in deferred_links {
+        steps.push(Step::Link {
+            source: link.source,
+            dest: link.dest,
+            depends_on: Some(link.depends_on),
+        });
     }
 
     // T-5.1.6: every `SetMeta` follow-up lands after the whole walk, once
@@ -334,6 +449,7 @@ pub async fn plan_copy(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use duet_types::UnixPathBuf;
@@ -384,6 +500,99 @@ mod tests {
         )));
     }
 
+    /// T-5.1.7's own AC, verbatim: "copying an rsnapshot-style tree
+    /// preserves link counts." `a.txt` and `hardlink_to_a.txt` are the
+    /// same inode (two names for one file, exactly what an rsnapshot
+    /// backup tree's dedup produces); `b.txt` is an unrelated, genuinely
+    /// distinct file. The plan must contain exactly one `CopyFile` (for
+    /// whichever of the two hardlinked names is encountered first) and one
+    /// `Step::Link` (for the other) -- not two `CopyFile`s -- and, after
+    /// actually running the plan, the two destination names must resolve
+    /// to the same inode with `nlink == 2`, exactly mirroring the source.
+    #[tokio::test]
+    async fn plans_and_executes_an_rsnapshot_style_hardlinked_pair() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"shared content").unwrap();
+        std::fs::hard_link(
+            src.path().join("a.txt"),
+            src.path().join("hardlink_to_a.txt"),
+        )
+        .unwrap();
+        std::fs::write(src.path().join("b.txt"), b"unrelated").unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = CancelToken::new();
+        let plan = plan_copy(
+            &*fs,
+            &[vpath_for(&src)],
+            &vpath_for(&dst),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .expect("planning must succeed");
+
+        let copy_count = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s.kind(), StepKind::CopyFile))
+            .count();
+        let link_count = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s.kind(), StepKind::Link))
+            .count();
+        assert_eq!(
+            copy_count, 2,
+            "one CopyFile for a.txt/hardlink_to_a.txt (whichever comes first) plus one \
+             for the unrelated b.txt"
+        );
+        assert_eq!(
+            link_count, 1,
+            "the second occurrence of the shared inode must become a Link, not a second copy"
+        );
+        assert_eq!(plan.totals.hardlinks_preserved, 1);
+        assert_eq!(
+            plan.totals.files, 3,
+            "still 3 files total (2 copies + 1 link)"
+        );
+
+        let journal = crate::journal::Journal::open(crate::job::JobId(1), state.path()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let control = crate::executor::ExecutionControl::new();
+        let report = crate::executor::execute(
+            fs,
+            crate::job::JobId(1),
+            plan,
+            journal,
+            2,
+            tx,
+            control,
+            None,
+        )
+        .await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let src_name = src.path().file_name().unwrap().to_str().unwrap();
+        let dst_a = dst.path().join(src_name).join("a.txt");
+        let dst_link = dst.path().join(src_name).join("hardlink_to_a.txt");
+        use std::os::unix::fs::MetadataExt;
+        let a_meta = std::fs::metadata(&dst_a).unwrap();
+        let link_meta = std::fs::metadata(&dst_link).unwrap();
+        assert_eq!(
+            a_meta.ino(),
+            link_meta.ino(),
+            "both destination names must resolve to the same inode"
+        );
+        assert_eq!(a_meta.nlink(), 2, "link count must survive the copy");
+        assert_eq!(
+            std::fs::read_to_string(&dst_link).unwrap(),
+            "shared content"
+        );
+    }
+
     #[tokio::test]
     async fn a_single_top_level_file_source_produces_one_copyfile_step() {
         let src = TempDir::new().unwrap();
@@ -411,7 +620,8 @@ mod tests {
             crate::plan::PlanTotals {
                 dirs: 0,
                 files: 1,
-                bytes: 5
+                bytes: 5,
+                hardlinks_preserved: 0,
             }
         );
     }

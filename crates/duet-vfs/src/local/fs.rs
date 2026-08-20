@@ -51,6 +51,7 @@ impl FileSystem for LocalFs {
         Caps::RANDOM_READ
             | Caps::RENAME
             | Caps::ATOMIC_REPLACE
+            | Caps::HARDLINK
             | Caps::SYMLINK
             | Caps::XATTR
             | Caps::PERMISSIONS
@@ -144,6 +145,24 @@ impl FileSystem for LocalFs {
             .map_err(|e| super::pathutil::rustix_err("renameat2", from, e))
     }
 
+    async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+        super::guard::assert_not_ui_thread();
+        let source_path = real_path(source);
+        let dest_path = real_path(dest);
+        // No `AtFlags::SYMLINK_FOLLOW`: `source` is expected to be a
+        // regular file this backend itself created (T-5.1.7's hardlink-
+        // graph dedup, or an explicit non-symlink "create hardlink"
+        // request), never a symlink to follow.
+        rustix::fs::linkat(
+            CWD,
+            &source_path,
+            CWD,
+            &dest_path,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|e| super::pathutil::rustix_err("linkat", source, e))
+    }
+
     async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
         super::meta::set_meta(p, m)
     }
@@ -170,6 +189,7 @@ impl FileSystem for LocalFs {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
     use duet_types::UnixPathBuf;
@@ -261,6 +281,62 @@ mod tests {
                 &vp(&dir, "b.txt"),
                 RenameFlags::NO_REPLACE,
             )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Conflict);
+    }
+
+    #[tokio::test]
+    async fn link_creates_a_second_name_for_the_same_inode() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"shared content").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+
+        fs.link(&vp(&dir, "a.txt"), &vp(&dir, "b.txt"))
+            .await
+            .unwrap();
+
+        let a_meta = std::fs::metadata(dir.path().join("a.txt")).unwrap();
+        let b_meta = std::fs::metadata(dir.path().join("b.txt")).unwrap();
+        assert_eq!(
+            a_meta.ino(),
+            b_meta.ino(),
+            "both names must resolve to the same inode"
+        );
+        assert_eq!(a_meta.nlink(), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "shared content"
+        );
+
+        // Writing through either name must be visible through the other --
+        // they share one inode, not two copies of the same bytes.
+        std::fs::write(dir.path().join("a.txt"), b"changed").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_reports_not_found_for_a_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let err = fs
+            .link(&vp(&dir, "missing.txt"), &vp(&dir, "b.txt"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn link_reports_conflict_for_an_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let err = fs
+            .link(&vp(&dir, "a.txt"), &vp(&dir, "b.txt"))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Conflict);
