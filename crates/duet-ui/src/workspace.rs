@@ -5,6 +5,7 @@
 //! dual-pane splitter, a function-key bar, a status bar, and a
 //! command-line row, all themed by [`crate::theme_controller`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use duet_commands::keymap::{self, tc_csv};
 use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
-use duet_ops::{JobEvent, JobKind, JobOutcome, JobReport, QueueManager};
+use duet_ops::{JobEvent, JobId, JobKind, JobOutcome, JobReport, ProgressSnapshot, QueueManager};
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
@@ -30,8 +31,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Application, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, px,
-    size,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, px, size,
 };
 
 use crate::command_palette::CommandPaletteDelegate;
@@ -41,6 +42,7 @@ use crate::file_table::{
 };
 use crate::function_bar::{self, FKeySlot};
 use crate::hotlist::HotlistDelegate;
+use crate::operation_manager::{OperationManagerState, bind_operation_manager_keys};
 use crate::panel::{Panel, bind_panel_keys};
 use crate::theme_controller::ThemeController;
 
@@ -119,6 +121,21 @@ actions!(
 // doesn't do.
 actions!(duet_workspace, [CopyDialog, MoveDialog]);
 
+// T-5.2.2's expandable operation manager (FR-OPS-02/03, design.md §9.3).
+// `OpenOperationManager` is this codebase's own reasonable-default choice
+// -- TC itself has no single canonical keystroke for "open the background
+// transfer manager" (`docs/keymap-tc.csv` has no row for it, same
+// situation `OpenCommandPalette`'s `Ctrl+Shift+P` and the hotlist
+// bindings above were already in), and `Ctrl+O` ("Operations") is
+// unclaimed by any other `KeyBinding::new` call site in this crate.
+// Everything the overlay itself needs once it's already open
+// (`CloseOperationManager`, the cursor/pause/resume/cancel actions) is
+// declared in `crate::operation_manager`, not here -- same split
+// `CopyDialog`/`MoveDialog` (open-the-overlay, here) versus
+// `copy_move_dialog::SetConflictSkip`/friends (overlay-internal, there)
+// already establishes.
+actions!(duet_workspace, [OpenOperationManager]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -139,6 +156,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-down", HotlistMoveDown, Some("HotlistOverlay")),
         KeyBinding::new("f5", CopyDialog, Some("Workspace")),
         KeyBinding::new("f6", MoveDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-o", OpenOperationManager, Some("Workspace")),
     ]);
 }
 
@@ -164,6 +182,7 @@ pub fn run() {
         crate::file_table::bind_file_table_keys(cx);
         bind_panel_keys(cx);
         bind_copy_move_dialog_keys(cx);
+        bind_operation_manager_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -456,6 +475,38 @@ pub struct Workspace {
     /// enqueue (with a toast) rather than guessing a job journal location
     /// when this is `None`.
     state_dir: Option<PathBuf>,
+    /// T-5.2.2: the latest [`ProgressSnapshot`] sample for every job that
+    /// has ever emitted a `JobEvent::Progress` and not yet finished --
+    /// populated by [`Self::new`]'s `QueueManager` event-consumer loop
+    /// (broadened, as of this task, beyond just `Finished`), read by the
+    /// status-bar tray and `crate::operation_manager` for the byte-level
+    /// numbers (`bytes_done`, `throughput_bytes_per_sec`, `eta_secs`, ...)
+    /// that `duet_ops::Job`/`JobState` themselves deliberately do not
+    /// carry (see `duet_ops::job`'s own module doc comment: `Job` is the
+    /// queue-visible snapshot type, `ProgressSnapshot` is the separate,
+    /// higher-frequency sample). This is the *only* place that data
+    /// lives -- `crate::operation_manager` never duplicates it into a
+    /// second cache, it only ever reads through
+    /// [`Self::job_progress_snapshot`], so there is exactly one source of
+    /// truth for "what did the last 100 ms sample say" and one for "what
+    /// is this job's lifecycle state" (`self.queue.snapshot()`), matching
+    /// this task's own instruction not to let the two responsibilities
+    /// blur together. A finished job's entry is removed the moment its
+    /// `Finished` event lands (same loop) -- without that eviction this
+    /// map would grow for as long as the process runs, one entry per job
+    /// ever enqueued, never freed.
+    job_progress: HashMap<JobId, ProgressSnapshot>,
+
+    /// `Some` while the T-5.2.2 operation manager overlay (FR-OPS-02/03)
+    /// is open -- constructed fresh on every `open_operation_manager`,
+    /// dropped on close. Mirrors `copy_move_dialog`'s own field exactly,
+    /// including the "no upstream `ListState<D>` to wrap" reasoning --
+    /// see `crate::operation_manager`'s module doc comment.
+    operation_manager: Option<Entity<OperationManagerState>>,
+    /// Saved by `open_operation_manager`, restored and cleared by
+    /// `close_operation_manager` -- same reasoning as
+    /// `copy_move_dialog_previous_focus`.
+    operation_manager_previous_focus: Option<FocusHandle>,
 
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
@@ -671,28 +722,65 @@ impl Workspace {
         let state_dir = duet_config::paths::duet_state_dir().ok();
 
         // The queue's event-consumer loop: drains every job's `JobEvent`s
-        // and, on `Finished`, queues a summary toast via
-        // `push_pending_notice` and marks both panels for a refresh (see
-        // `pending_panel_refresh`'s own doc comment for why *every*
-        // `Finished`, not just a successful one). Every other variant is
-        // ignored here -- T-5.2.2's live progress UI is a separate, later
-        // task. Runs for the app's whole lifetime, same "stops polling
-        // once `Workspace` is dropped" shape as the periodic session-save
-        // loop just above.
+        // in one `this.update` per event (not one per handled variant --
+        // see the loop body's own comment) and always ends with
+        // `cx.notify()`, so the tray/manager's next render always reflects
+        // whatever just happened. T-5.2.1 originally handled only
+        // `Finished` here (toast + `pending_panel_refresh`, see that
+        // field's own doc comment for why *every* `Finished`, not just a
+        // successful one, triggers a refresh); T-5.2.2 broadens it to also
+        // cache `Progress` samples (`job_progress`) for the tray/manager's
+        // live byte-level numbers. Every other variant (`Queued`,
+        // `Started`, `Paused`, `StepStarted`, `ConflictDetected`, ...)
+        // still needs no *state* update of its own -- `self.queue.
+        // snapshot()` already reflects a job's current `JobState` the
+        // moment the event that caused it was sent (the executor updates
+        // `Job::state` before emitting the corresponding event) -- but
+        // still triggers the unconditional `cx.notify()` below, since
+        // that's what actually wakes a redraw to pick the new snapshot up.
+        // Runs for the app's whole lifetime, same "stops polling once
+        // `Workspace` is dropped" shape as the periodic session-save loop
+        // just above.
         cx.spawn(async move |this, cx| {
             while let Some(event) = queue_events_rx.recv().await {
-                let JobEvent::Finished {
-                    outcome, report, ..
-                } = event
-                else {
-                    continue;
-                };
-                let notice = summarize_job_finished(outcome, &report);
                 let updated = this.update(cx, |this, cx| {
-                    if let Some((level, message)) = notice {
-                        this.push_pending_notice(level, message, cx);
+                    match event {
+                        JobEvent::Progress { job_id, snapshot } => {
+                            this.job_progress.insert(job_id, snapshot);
+                        }
+                        JobEvent::Finished {
+                            job_id,
+                            outcome,
+                            report,
+                        } => {
+                            let notice = summarize_job_finished(outcome, &report);
+                            if let Some((level, message)) = notice {
+                                this.push_pending_notice(level, message, cx);
+                            }
+                            this.pending_panel_refresh = true;
+                            // A finished job stops sampling `Progress` for
+                            // good -- see `job_progress`'s own doc comment
+                            // for why this eviction matters (an
+                            // unboundedly growing map otherwise).
+                            this.job_progress.remove(&job_id);
+                        }
+                        JobEvent::ConflictDetected { job_id, prompt } => {
+                            // A real interactive answer is T-5.2.3's own
+                            // scope, not this task's -- logged (deliberately
+                            // just the step index and source path, not the
+                            // full `Metadata` payload `prompt` also
+                            // carries) so a conflict occurring today isn't
+                            // entirely silent in the meantime.
+                            tracing::debug!(
+                                target: "duet_ui::workspace",
+                                job_id = job_id.0,
+                                step_index = prompt.step_index,
+                                source = %prompt.source,
+                                "conflict detected with no live prompt UI yet (T-5.2.3)"
+                            );
+                        }
+                        _ => {}
                     }
-                    this.pending_panel_refresh = true;
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -730,6 +818,9 @@ impl Workspace {
             tokio_handle: tokio_handle.clone(),
             queue,
             state_dir,
+            job_progress: HashMap::new(),
+            operation_manager: None,
+            operation_manager_previous_focus: None,
             theme: None,
         }
     }
@@ -1359,6 +1450,67 @@ impl Workspace {
         None
     }
 
+    /// `Ctrl+O` (`OpenOperationManager`, T-5.2.2, FR-OPS-02/03): opens the
+    /// expandable operation manager overlay listing every T-5.1.13 queue
+    /// job (`self.queue.snapshot()`, read directly by the overlay itself
+    /// once open) with live progress and per-job pause/resume/cancel --
+    /// see `crate::operation_manager`'s module doc comment for the
+    /// overlay's own architecture. A no-op if already open, mirroring
+    /// every other overlay's "reopening shouldn't stack a second one"
+    /// convention (`open_hotlist_for_panel`/`open_command_palette`/
+    /// `open_copy_move_dialog`).
+    fn open_operation_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.operation_manager.is_some() {
+            return;
+        }
+
+        self.operation_manager_previous_focus = window.focused(cx);
+        let weak_workspace = cx.entity().downgrade();
+        let queue = self.queue.clone();
+        let state = cx.new(|cx| OperationManagerState::new(weak_workspace, queue, cx));
+        let handle = state.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        self.operation_manager = Some(state);
+        cx.notify();
+    }
+
+    /// Closes the operation manager overlay (Escape, or a click outside
+    /// it) and restores keyboard focus to whatever had it before it
+    /// opened. Mirrors `close_hotlist`/`close_copy_move_dialog` exactly --
+    /// always has a live `Window` (nothing about closing this overlay
+    /// needs the deferred, no-`Window` path `close_copy_move_dialog_
+    /// deferred` exists for).
+    pub(crate) fn close_operation_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.operation_manager = None;
+        if let Some(handle) = self.operation_manager_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// A single job's latest T-5.1.11 progress sample, if any has landed
+    /// yet -- see `job_progress`'s own doc comment. `None` covers both
+    /// "not currently `Running`/`Paused`" and the real window between
+    /// `JobEvent::Started` and that job's first 100 ms sample;
+    /// `crate::operation_manager` treats both the same way ("no progress
+    /// data yet") since there is nothing to synthesize for either.
+    pub(crate) fn job_progress_snapshot(&self, id: JobId) -> Option<ProgressSnapshot> {
+        self.job_progress.get(&id).copied()
+    }
+
+    /// The status-bar tray's own aggregate line (T-5.2.2, FR-OPS-02:
+    /// "a tray in the status bar showing aggregate progress"). `None`
+    /// renders nothing at all -- see [`crate::operation_manager::
+    /// tray_summary`]'s own doc comment for the full aggregation rule
+    /// and why "nothing," not a "0 operations" placeholder, is this
+    /// task's own reading of "unobtrusive." `self.queue.snapshot()` is
+    /// the same `O(job count)` call the operation manager itself makes on
+    /// every render -- no separate aggregate is cached here, so there is
+    /// nothing that could drift out of sync with the queue's own truth.
+    fn operations_tray_text(&self) -> Option<String> {
+        crate::operation_manager::tray_summary(&self.queue.snapshot(), &self.job_progress)
+    }
+
     fn dual_pane(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let theme = cx.theme();
@@ -1468,6 +1620,13 @@ impl Workspace {
             None => "theme: (initializing)".into(),
         };
 
+        // T-5.2.2's status-bar tray (FR-OPS-02): `None` while the queue is
+        // idle, so nothing renders at all -- see `operations_tray_text`'s
+        // own doc comment. Clicking it is a nice-to-have shortcut to the
+        // same overlay `Ctrl+O` opens, not a replacement for the
+        // keybinding (this task's own instruction).
+        let tray_text = self.operations_tray_text();
+
         h_flex()
             .w_full()
             .px_2()
@@ -1477,7 +1636,21 @@ impl Workspace {
             .text_color(tokens.color.statusbar_fg)
             .text_size(px(12.))
             .child(gpui::div().child(status_text))
-            .child(gpui::div().child(theme_text))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .children(tray_text.map(|text| {
+                        gpui::div()
+                            .id("operations-tray")
+                            .cursor_pointer()
+                            .child(text)
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.open_operation_manager(window, cx);
+                            }))
+                    }))
+                    .child(gpui::div().child(theme_text)),
+            )
     }
 
     fn function_key_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1596,6 +1769,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &MoveDialog, window, cx| {
                 this.open_copy_move_dialog(JobKind::Move, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenOperationManager, window, cx| {
+                this.open_operation_manager(window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
@@ -1608,6 +1784,9 @@ impl Render for Workspace {
             })
             .when_some(self.copy_move_dialog.clone(), |this, state| {
                 this.child(copy_move_dialog_overlay(&state, cx))
+            })
+            .when_some(self.operation_manager.clone(), |this, state| {
+                this.child(operation_manager_overlay(&state, cx))
             })
     }
 }
@@ -1761,6 +1940,46 @@ fn copy_move_dialog_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_copy_move_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.2's operation manager overlay -- same `.occlude()`-backdrop/card
+/// shape as `copy_move_dialog_overlay` (see `command_palette_overlay`'s
+/// own doc comment for the full reasoning, including the real regression
+/// this pattern exists to avoid). Wider than the copy/move dialog's own
+/// card (`560px` vs `480px`): a job row's kind/state/progress line is
+/// naturally wider than a destination path plus three option toggles.
+/// The card sets no `key_context` of its own here, same reasoning as
+/// `copy_move_dialog_overlay`'s: `OperationManagerState::render` already
+/// sets `"OperationManager"` on its own root.
+fn operation_manager_overlay(
+    state: &Entity<OperationManagerState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("operation-manager-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("operation-manager-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_operation_manager(window, cx);
                 })),
         )
 }
@@ -2283,7 +2502,22 @@ async fn count_current_dir_entries() -> Result<(String, usize), String> {
 #[cfg(test)]
 mod tests {
     use duet_commands::CommandId;
+    // T-5.2.2: `JobState` itself is only ever inspected by this test
+    // module's own assertions (`workspace.rs`'s non-test code only ever
+    // reads a job's `JobState` indirectly, through `crate::
+    // operation_manager`) -- imported here, not at the top of the file,
+    // so a plain `cargo build` (no `cfg(test)`) doesn't warn about an
+    // otherwise-unused import.
+    use duet_ops::JobState;
     use duet_widgets::layout::Root;
+    // T-5.2.2's own overlay-internal actions -- declared in
+    // `crate::operation_manager`, not `workspace.rs`, so (unlike
+    // `OpenOperationManager`, defined right in this file and already
+    // reachable via `use super::*;` below) they need naming explicitly.
+    use crate::operation_manager::{
+        OperationManagerCursorDown, OperationManagerCursorUp, OperationManagerPauseSelected,
+        OperationManagerResumeSelected,
+    };
     use duet_widgets::list::ListDelegate as _;
     use duet_widgets::table::TableDelegate as _;
     use gpui::{TestAppContext, VisualTestContext};
@@ -2338,6 +2572,7 @@ mod tests {
             crate::file_table::bind_file_table_keys(cx);
             bind_panel_keys(cx);
             bind_copy_move_dialog_keys(cx);
+            bind_operation_manager_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -3437,6 +3672,482 @@ mod tests {
                 !model_has_name(vcx, &left_table, "move_me.txt")
                     && model_has_name(vcx, &right_table, "move_me.txt")
             });
+        });
+    }
+
+    // -- T-5.2.2 operation manager -------------------------------------------
+
+    /// A `FileSystem` test double wrapping a real `LocalFs`, delaying
+    /// every `open_read` by a fixed duration -- mirrors `duet-ops`'s own
+    /// `SlowFs` (`crates/duet-ops/src/queue.rs`'s test module), private to
+    /// that crate and so not reachable from here. This module's own E2E
+    /// test below needs a job that is still genuinely `Running` by the
+    /// time it opens the manager and drives Pause/Resume through it -- a
+    /// real (fast, tmpfs-backed) copy of a couple of small files finishes
+    /// too quickly for that window to be reliably observable otherwise.
+    struct SlowLocalFs {
+        inner: LocalFs,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystem for SlowLocalFs {
+        fn scheme(&self) -> &'static str {
+            self.inner.scheme()
+        }
+        fn caps(&self) -> duet_types::Caps {
+            self.inner.caps()
+        }
+        fn read_dir(
+            &self,
+            p: &VPath,
+            opts: ListOpts,
+        ) -> futures_util::stream::BoxStream<'_, duet_types::Result<Vec<duet_vfs::DirEntry>>>
+        {
+            self.inner.read_dir(p, opts)
+        }
+        async fn stat(&self, p: &VPath, follow: bool) -> duet_types::Result<duet_types::Metadata> {
+            self.inner.stat(p, follow).await
+        }
+        async fn volume_stats(&self, p: &VPath) -> duet_types::Result<duet_vfs::VolumeStats> {
+            self.inner.volume_stats(p).await
+        }
+        async fn open_read(
+            &self,
+            p: &VPath,
+        ) -> duet_types::Result<Box<dyn duet_vfs::AsyncReadSeek>> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.open_read(p).await
+        }
+        async fn open_write(
+            &self,
+            p: &VPath,
+            o: duet_vfs::WriteOpts,
+        ) -> duet_types::Result<Box<dyn duet_vfs::AsyncWriteCommit>> {
+            self.inner.open_write(p, o).await
+        }
+        async fn create_dir(
+            &self,
+            p: &VPath,
+            mode: Option<duet_vfs::Mode>,
+        ) -> duet_types::Result<()> {
+            self.inner.create_dir(p, mode).await
+        }
+        async fn remove(&self, p: &VPath, kind: duet_vfs::RemoveKind) -> duet_types::Result<()> {
+            self.inner.remove(p, kind).await
+        }
+        async fn rename(
+            &self,
+            from: &VPath,
+            to: &VPath,
+            flags: duet_vfs::RenameFlags,
+        ) -> duet_types::Result<()> {
+            self.inner.rename(from, to, flags).await
+        }
+        async fn link(&self, source: &VPath, dest: &VPath) -> duet_types::Result<()> {
+            self.inner.link(source, dest).await
+        }
+        async fn set_meta(&self, p: &VPath, m: &duet_types::MetaPatch) -> duet_types::Result<()> {
+            self.inner.set_meta(p, m).await
+        }
+        fn watch(
+            &self,
+            p: &VPath,
+        ) -> duet_types::Result<futures_util::stream::BoxStream<'_, duet_vfs::ChangeEvent>>
+        {
+            self.inner.watch(p)
+        }
+        async fn server_side_copy(
+            &self,
+            _from: &VPath,
+            _to: &VPath,
+            _should_cancel: &(dyn Fn() -> bool + Send + Sync),
+        ) -> duet_types::Result<duet_vfs::CopyOutcome> {
+            // Always `Unsupported` -- forces every copy through the
+            // naive path, whose first call is `open_read`, so `delay`
+            // above is actually reached, same reasoning as `duet-ops`'s
+            // own `SlowFs`.
+            Ok(duet_vfs::CopyOutcome::Unsupported)
+        }
+    }
+
+    /// Plans and enqueues a real `JobKind::Copy` job (`src` -> `dst_dir`)
+    /// against `fs` directly through `duet_ops::plan_copy`/
+    /// `QueueManager::enqueue` -- the same off-UI-thread path
+    /// `CopyMoveDialogState::confirm` uses, but driven here without a live
+    /// dialog so the test can inject `SlowLocalFs` (`confirm` hardcodes a
+    /// plain `LocalFs`, see its own doc comment). Blocks on a
+    /// `std::sync::mpsc` channel, not GPUI polling -- `tokio_handle` is a
+    /// real multi-threaded runtime already running on its own OS thread
+    /// (`with_workspace`'s own setup), so the spawned task makes real
+    /// progress independent of anything GPUI does.
+    fn enqueue_slow_copy(
+        tokio_handle: &tokio::runtime::Handle,
+        queue: Arc<QueueManager>,
+        fs: Arc<dyn FileSystem>,
+        src: VPath,
+        dst: VPath,
+        state_dir: PathBuf,
+    ) -> duet_ops::JobId {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs_for_plan = fs.clone();
+        tokio_handle.spawn(async move {
+            let cancel = duet_ops::CancelToken::new();
+            let plan = duet_ops::plan_copy(
+                fs_for_plan.as_ref(),
+                &[src],
+                &dst,
+                duet_ops::PlanOptions::default(),
+                &cancel,
+            )
+            .await
+            .expect("plan_copy over a real tempdir must succeed");
+            let id = queue.enqueue(JobKind::Copy, plan, 0, fs_for_plan, state_dir, 1, None);
+            let _ = tx.send(id);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("plan_copy + enqueue must complete quickly even with a slowed FileSystem")
+    }
+
+    /// (a) The tray's own "hidden when idle, shown when active" logic,
+    /// exercised against a real `Workspace`/`QueueManager`, not just
+    /// `operation_manager::tray_summary`'s own pure-logic unit tests: idle
+    /// at start, `Some` while a real slowed job is genuinely `Running`,
+    /// back to `None` once it finishes.
+    #[gpui::test]
+    fn operations_tray_text_is_hidden_when_idle_and_shown_while_a_job_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            workspace.read_with(vcx, |ws, _| {
+                assert_eq!(
+                    ws.operations_tray_text(),
+                    None,
+                    "an idle queue must render nothing in the tray"
+                );
+            });
+
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("a.bin"), vec![0u8; 256]).unwrap();
+
+            let (queue, state_dir, tokio_handle) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                )
+            });
+            let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
+                inner: LocalFs,
+                delay: Duration::from_millis(200),
+            });
+            let src = crate::file_table::local_vpath(source_dir.path()).unwrap();
+            let dst = crate::file_table::local_vpath(dest_dir.path()).unwrap();
+            let job_id = enqueue_slow_copy(&tokio_handle, queue.clone(), fs, src, dst, state_dir);
+
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.operations_tray_text().is_some())
+            });
+
+            wait_until(vcx, |_vcx| {
+                matches!(
+                    queue.job(job_id).map(|j| j.state),
+                    Some(JobState::Terminal { .. })
+                )
+            });
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.operations_tray_text().is_none())
+            });
+        });
+    }
+
+    /// `dispatch_action` routes an action by walking up from whatever
+    /// element currently holds keyboard focus -- with nothing focused at
+    /// all (the state a freshly built `with_workspace` window starts in),
+    /// there is no dispatch path for it to walk, so `OpenOperationManager`
+    /// (bound on the workspace root, same as every other `Open*` action)
+    /// never reaches its handler. Every existing F5/F6 test already
+    /// established this same "focus the left panel first" step for
+    /// exactly this reason; factored out here since three T-5.2.2 tests
+    /// need it too.
+    fn focus_left_panel(workspace: &Entity<Workspace>, vcx: &mut VisualTestContext) {
+        let left_handle =
+            workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+        vcx.update(|window, _cx| window.focus(&left_handle));
+        let _ = vcx.update(|window, cx| window.draw(cx));
+    }
+
+    /// (b) `Ctrl+O` opens the manager, and it lists a real job from
+    /// `queue.snapshot()` -- kind, id, and state all coming from the real
+    /// queue, not a stub.
+    #[gpui::test]
+    fn operation_manager_opens_via_its_keybinding_and_lists_real_queue_jobs(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("b.bin"), vec![0u8; 256]).unwrap();
+
+            let (queue, state_dir, tokio_handle) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                )
+            });
+            let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
+                inner: LocalFs,
+                delay: Duration::from_millis(200),
+            });
+            let src = crate::file_table::local_vpath(source_dir.path()).unwrap();
+            let dst = crate::file_table::local_vpath(dest_dir.path()).unwrap();
+            let job_id = enqueue_slow_copy(&tokio_handle, queue, fs, src, dst, state_dir);
+
+            focus_left_panel(&workspace, vcx);
+            vcx.dispatch_action(OpenOperationManager);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.operation_manager.is_some(),
+                    "Ctrl+O must open the operation manager"
+                );
+            });
+
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.operation_manager.clone())
+                .unwrap();
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| {
+                    s.jobs_for_test()
+                        .iter()
+                        .any(|j| j.id == job_id && j.kind == JobKind::Copy)
+                })
+            });
+        });
+    }
+
+    /// Real keyboard-only row navigation (Up/Down) between two rows --
+    /// see `crate::operation_manager`'s module doc comment for the
+    /// cursor-index design this exercises. Two independent slow jobs
+    /// (separate source subdirectories) so `sorted_jobs`'s own
+    /// most-recently-enqueued-first order is deterministic: the second
+    /// job enqueued must be row 0, the first row 1.
+    #[gpui::test]
+    fn operation_manager_cursor_navigates_rows_with_up_and_down(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let (queue, state_dir, tokio_handle) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                )
+            });
+
+            // Two independent source/dest tempdir pairs, kept alive for
+            // this whole test body (not just a loop iteration) -- each
+            // still-`Running` slowed copy needs its own source directory
+            // to keep reading from until this test explicitly cancels it
+            // below.
+            let source_dir_a = tempfile::tempdir().unwrap();
+            let dest_dir_a = tempfile::tempdir().unwrap();
+            let source_dir_b = tempfile::tempdir().unwrap();
+            let dest_dir_b = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir_a.path().join("c.bin"), vec![0u8; 256]).unwrap();
+            std::fs::write(source_dir_b.path().join("c.bin"), vec![0u8; 256]).unwrap();
+
+            let mut job_ids = Vec::new();
+            for (source_dir, dest_dir) in
+                [(&source_dir_a, &dest_dir_a), (&source_dir_b, &dest_dir_b)]
+            {
+                let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
+                    inner: LocalFs,
+                    delay: Duration::from_millis(300),
+                });
+                let src = crate::file_table::local_vpath(source_dir.path()).unwrap();
+                let dst = crate::file_table::local_vpath(dest_dir.path()).unwrap();
+                let id = enqueue_slow_copy(
+                    &tokio_handle,
+                    queue.clone(),
+                    fs,
+                    src,
+                    dst,
+                    state_dir.clone(),
+                );
+                job_ids.push(id);
+            }
+
+            focus_left_panel(&workspace, vcx);
+            vcx.dispatch_action(OpenOperationManager);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.operation_manager.clone())
+                .expect("Ctrl+O must open the manager");
+
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| s.jobs_for_test().len() == 2)
+            });
+
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.cursor_for_test(), 0, "the cursor must start on row 0");
+            });
+
+            vcx.dispatch_action(OperationManagerCursorDown);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.cursor_for_test(), 1, "Down must move the cursor to row 1");
+            });
+
+            // Down again, past the last row, must clamp rather than go
+            // out of bounds.
+            vcx.dispatch_action(OperationManagerCursorDown);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.cursor_for_test(), 1, "Down past the last row must clamp");
+            });
+
+            vcx.dispatch_action(OperationManagerCursorUp);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |s, _| {
+                assert_eq!(
+                    s.cursor_for_test(),
+                    0,
+                    "Up must move the cursor back to row 0"
+                );
+            });
+
+            // Up again, past the first row, must clamp too.
+            vcx.dispatch_action(OperationManagerCursorUp);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.cursor_for_test(), 0, "Up past the first row must clamp");
+            });
+
+            // Drain both jobs so the test doesn't leave background work
+            // running past its own scope.
+            for id in job_ids {
+                let _ = queue.cancel(id);
+            }
+        });
+    }
+
+    /// (c) The real end-to-end path: enqueue a genuinely slow job, open
+    /// the manager, confirm it shows live progress, Pause it via the
+    /// manager's own keyboard control and confirm `queue.job(id)`'s state
+    /// actually becomes `Paused`, then Resume and let it finish,
+    /// confirming the manager reflects `Terminal` -- and that
+    /// `Workspace::job_progress` evicted the finished job's entry (see
+    /// that field's own doc comment).
+    #[gpui::test]
+    fn operation_manager_end_to_end_pause_resume_via_keyboard(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            for i in 0..3 {
+                std::fs::write(source_dir.path().join(format!("f{i}.bin")), vec![0u8; 4096])
+                    .unwrap();
+            }
+
+            let (queue, state_dir, tokio_handle) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                )
+            });
+            let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
+                inner: LocalFs,
+                delay: Duration::from_millis(400),
+            });
+            let src = crate::file_table::local_vpath(source_dir.path()).unwrap();
+            let dst = crate::file_table::local_vpath(dest_dir.path()).unwrap();
+            let job_id = enqueue_slow_copy(&tokio_handle, queue.clone(), fs, src, dst, state_dir);
+
+            focus_left_panel(&workspace, vcx);
+            vcx.dispatch_action(OpenOperationManager);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            let state = workspace
+                .read_with(vcx, |ws, _| ws.operation_manager.clone())
+                .expect("Ctrl+O must open the manager");
+
+            // The manager must observe the job actually `Running` ...
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| {
+                    s.jobs_for_test()
+                        .iter()
+                        .any(|j| j.id == job_id && matches!(j.state, JobState::Running { .. }))
+                })
+            });
+            // ... and, separately, that live progress has actually landed
+            // (there is a real window between `Started` and the first
+            // 100ms sample -- see `job_progress`'s own doc comment).
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.job_progress_snapshot(job_id).is_some())
+            });
+
+            // Pause via the manager's own keyboard control -- the cursor
+            // defaults to row 0, and this is the only job in the queue.
+            vcx.dispatch_action(OperationManagerPauseSelected);
+            wait_until(vcx, |_vcx| {
+                matches!(
+                    queue.job(job_id).map(|j| j.state),
+                    Some(JobState::Paused { .. })
+                )
+            });
+
+            // Resume, and let it run to completion.
+            vcx.dispatch_action(OperationManagerResumeSelected);
+            wait_until(vcx, |_vcx| {
+                matches!(
+                    queue.job(job_id).map(|j| j.state),
+                    Some(JobState::Terminal { .. })
+                )
+            });
+
+            // The manager's own next render must reflect the terminal
+            // state too, not just `QueueManager`'s internal one.
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| {
+                    s.jobs_for_test()
+                        .iter()
+                        .any(|j| j.id == job_id && j.state.is_terminal())
+                })
+            });
+
+            // And `job_progress` must have evicted this job's entry once
+            // it finished -- see that field's own doc comment.
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.job_progress_snapshot(job_id).is_none(),
+                    "a finished job's progress sample must be evicted, not linger forever"
+                );
+            });
+
+            // `plan_copy` copies a directory *source* as a subdirectory of
+            // `dest_dir` (named after the source's own basename), not by
+            // flattening its contents directly into `dest_dir` -- see
+            // `planner::plan_copy`'s own `dest_dir.join(name)` where `name`
+            // is `source`'s file name.
+            let copied_subdir = dest_dir.path().join(source_dir.path().file_name().unwrap());
+            let dest_files_copied = (0..3)
+                .filter(|i| copied_subdir.join(format!("f{i}.bin")).is_file())
+                .count();
+            assert_eq!(
+                dest_files_copied, 3,
+                "pausing and resuming must not have dropped any of the three files"
+            );
         });
     }
 }

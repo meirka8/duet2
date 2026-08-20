@@ -22,6 +22,7 @@ mod copy_move_dialog;
 pub mod file_table;
 mod function_bar;
 mod hotlist;
+mod operation_manager;
 pub mod panel;
 mod theme_controller;
 mod workspace;
