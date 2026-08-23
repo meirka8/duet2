@@ -586,7 +586,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cross_device_move_copies_then_removes_the_entire_source_tree() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
@@ -646,7 +646,7 @@ mod tests {
     /// deduped entry's own source still has to be removed (it's a move,
     /// not a copy), and only once its own `Step::Link` (not the first
     /// occurrence's `CopyFile`) has actually succeeded.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cross_device_move_preserves_a_hardlinked_pair_and_removes_both_sources() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"shared").unwrap();
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dst_link).unwrap(), "shared");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cross_device_move_with_verify_uses_blake3_and_still_completes() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
@@ -749,7 +749,7 @@ mod tests {
     /// the destination is fsync'd; verified by injection test." Injects a
     /// real `CopyFile` failure (a read error on the source) and confirms
     /// the dependency-gated `Remove` never ran -- the source must survive.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cross_device_move_never_removes_source_when_copy_fails() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
@@ -801,7 +801,7 @@ mod tests {
     /// `Succeeded`. This is exactly the scenario
     /// `dependency_block_reason`'s own doc comment explains gating on
     /// "not `Failed`" (rather than "`Succeeded`") is for.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resuming_after_a_partial_run_still_removes_sources_whose_copy_already_succeeded() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();

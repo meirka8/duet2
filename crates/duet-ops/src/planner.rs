@@ -537,7 +537,7 @@ mod tests {
     /// `Step::Link` (for the other) -- not two `CopyFile`s -- and, after
     /// actually running the plan, the two destination names must resolve
     /// to the same inode with `nlink == 2`, exactly mirroring the source.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plans_and_executes_an_rsnapshot_style_hardlinked_pair() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"shared content").unwrap();
