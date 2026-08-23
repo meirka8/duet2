@@ -777,6 +777,7 @@ async fn run_batch(
 
 /// The result of one attempt to run a step: either it finished (one way or
 /// another), or the job was cancelled while it was in flight.
+#[derive(Debug)]
 enum StepRun {
     Done(StepOutcome),
     Cancelled,
@@ -1805,11 +1806,67 @@ async fn copy_file_step(
         }
         ctx.control.state() != ControlState::Running
     };
-    match ctx
-        .fs
-        .server_side_copy(source, &partial, &on_progress)
-        .await
-    {
+    // `LocalFs::server_side_copy` (the only production `FileSystem` impl
+    // that does real work here) hands straight off to `accelerated_copy`/
+    // `sparse_buffered_copy` -- plain, synchronous functions with real
+    // blocking syscalls and, critically, *no `.await` yield points at all*
+    // across their whole run (unlike `naive_copy`'s own per-`COPY_BUFFER_
+    // BYTES`-chunk `.await`s). Calling that straight from an `async fn`
+    // with no `spawn_blocking`/`block_in_place` means this call parks
+    // whichever Tokio worker thread happens to poll it for the *entire*
+    // duration of one file's copy -- tens of seconds for a real multi-
+    // gigabyte file on a real disk. With `run_batch`'s `concurrency`
+    // parallel `tokio::spawn`ed copies each doing the same thing, that can
+    // consume every worker thread the app's runtime has (`duet-ui::
+    // workspace::run()` builds one with `worker_threads(min(8,
+    // available_parallelism))`; a lower-core-count machine, or simply
+    // `concurrency` >= that number, saturates it), starving the
+    // *separately-spawned* `spawn_progress_sampler` task (and the queue's
+    // own event-relay task) of any worker thread to run its 100ms
+    // `interval.tick()` on -- confirmed directly via a production-shaped
+    // reproduction (same runtime construction as `workspace::run()`, real
+    // files on a real disk, real `QueueManager::enqueue`): a genuine
+    // 23-second stretch with *zero* `JobEvent::Progress` deliveries,
+    // followed by tokio's default `MissedTickBehavior::Burst` dumping every
+    // missed tick at once. That is the "0 B/s / ETA 0:00, no updates the
+    // whole time" symptom reported live against T-5.2.2 + the byte-
+    // accounting fix (PR #38) -- a distinct, deeper bug than either of
+    // those: the byte accounting was already correct, but the task
+    // reporting it could be starved from running at all.
+    //
+    // `tokio::task::block_in_place` is the targeted fix: it tells the
+    // multi-thread scheduler "this task is about to block the current
+    // thread," so the scheduler hands off any other tasks queued on that
+    // thread (potentially including the sampler) to a freshly spun-up
+    // worker thread before running the closure -- exactly mirroring
+    // `JournalHandle::spawn`'s own existing `spawn_blocking` treatment for
+    // `fsync`, just via `block_in_place` (not `spawn_blocking`) since
+    // `on_progress` borrows `ctx`/`credited_this_attempt` non-`'static`ally
+    // and `block_in_place`'s closure has no `'static` bound (it runs
+    // in-place, never moved to another thread). `server_side_copy` is an
+    // async-trait method, so bridging back into it from a synchronous
+    // closure uses the same `Handle::current().block_on(..)` pattern
+    // `block_in_place`'s own docs show; every real impl (`LocalFs`) has no
+    // actual internal `.await` point, so this resolves on the very first
+    // poll -- it is not "block_on nested inside block_in_place" doing any
+    // real async waiting, just the officially-documented way to call an
+    // async fn from a context that must stay synchronous.
+    //
+    // `block_in_place` panics unconditionally on a `current_thread`
+    // runtime (regardless of whether the specific `FileSystem` impl
+    // reached ever actually blocks) -- every test in this module that
+    // dispatches a `CopyFile`/`Reflink` step, including ones using a
+    // `TestFs`/`SlowFs`/`NullFs`-style double that resolves instantly, was
+    // therefore audited and moved from plain `#[tokio::test]` to
+    // `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`.
+    let outcome = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(ctx.fs.server_side_copy(
+            source,
+            &partial,
+            &on_progress,
+        ))
+    });
+    match outcome {
         Ok(duet_vfs::CopyOutcome::Copied { .. }) => {
             // Top up to `expected_size` for whatever this rung didn't (or
             // structurally can't) report incrementally. This is a no-op
@@ -2604,7 +2661,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transient_error_retries_with_backoff_and_succeeds() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -2641,7 +2698,7 @@ mod tests {
         assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"hello");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_transient_error_gives_up_after_the_retry_bound_and_fails() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -2748,7 +2805,7 @@ mod tests {
         assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"hello");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_permission_failure_is_not_retried_and_hints_at_elevation() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -2789,7 +2846,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copies_a_directory_tree_and_completes_with_no_skips_or_errors() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
@@ -2828,7 +2885,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn journal_records_a_matching_intent_and_completion_for_every_step() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hi").unwrap();
@@ -2860,7 +2917,7 @@ mod tests {
         assert_eq!(reports[0].last_outcome, Some(JobOutcome::Completed));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_into_an_already_populated_destination_skips_rather_than_fails() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"new").unwrap();
@@ -3115,7 +3172,7 @@ mod tests {
     /// `plan_move` -- a `Remove` step must never run if the step it
     /// depends on failed, or a move could delete the only copy of a file
     /// whose destination write never actually succeeded.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_step_with_a_failed_dependency_is_skipped_not_executed() {
         let dst = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -3165,7 +3222,7 @@ mod tests {
 
     /// The companion case: a `Remove` whose dependency step genuinely
     /// succeeded must proceed normally.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_step_with_a_succeeded_dependency_proceeds() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -3290,7 +3347,7 @@ mod tests {
         assert!(report.errors[0].message.contains("content mismatch"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_with_verify_enabled_runs_blake3_and_still_completes() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello, verified world").unwrap();
@@ -3392,7 +3449,7 @@ mod tests {
     /// Copies the same source twice (once with `verify: false`, once with
     /// `verify: true`) and prints the wall-clock overhead BLAKE3 hashing
     /// both sides adds on top of the copy itself.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_throughput_overhead_is_measured_and_documented() {
         if std::env::var("DUET_BENCH_VERIFY_LARGE").as_deref() != Ok("1") {
             eprintln!(
@@ -4214,7 +4271,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_overwrite_replaces_the_destination() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4242,7 +4299,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_overwrite_if_older_replaces_only_when_dest_is_older() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4296,7 +4353,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_overwrite_if_different_size_replaces_only_when_sizes_differ() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4343,7 +4400,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_rename_target_uses_the_resolvers_alternate_destination() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4380,7 +4437,7 @@ mod tests {
         assert_eq!(std::fs::read(&alternate).unwrap(), b"payload");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_rename_target_without_an_alternate_fails_clearly() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4407,7 +4464,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_auto_rename_picks_the_first_free_numbered_name() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4440,7 +4497,7 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conflict_policy_abort_stops_the_job_as_cancelled_not_failed() {
         let dir = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4452,55 +4509,84 @@ mod tests {
         let dest2 = dir.path().join("d2.txt"); // no conflict -- must never even run
         std::fs::write(&source2, b"y").unwrap();
 
+        // Calls `run_step_with_retry` directly, twice, sequentially --
+        // *not* through `execute()`/`run_batch` -- deliberately. `run_batch`
+        // dispatches every step in a copy-class batch via `tokio::spawn` up
+        // front, and its `concurrency` semaphore only ever bounded how many
+        // of those run *concurrently*, never which one starts *first*; step
+        // 1 reliably finishing (and calling `ctx.control.cancel()`) before
+        // step 2 even attempted to acquire the permit was only ever an
+        // accident of `#[tokio::test]`'s old `current_thread` default
+        // (single-threaded cooperative polling processes `tokio::spawn`
+        // calls in submission order because nothing else *can* interleave).
+        // Once this test needed a real multi-thread runtime (`copy_file_
+        // step`'s `server_side_copy` call now goes through `block_in_place`,
+        // which panics on `current_thread` -- see that call site's own doc
+        // comment), that accident stopped holding: step 2 could genuinely
+        // win the race for the first-available permit and complete (source2
+        // has no conflict at all) before step 1 ever ran, intermittently
+        // creating `dest2` and failing this test -- confirmed by direct
+        // observation (flaky, failed roughly 1 run in 6 once both steps
+        // were dispatched through a real 2-worker runtime). Calling `run_
+        // step_with_retry` sequentially instead tests the actual invariant
+        // this test cares about ("once cancelled, a not-yet-started step's
+        // own `wait_out_pause` check bails before doing any real work")
+        // directly and deterministically, with no dependence on scheduling.
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
-        let plan = Plan::new(
-            vec![
-                Step::CopyFile {
-                    source: vpath_for(&source1),
-                    dest: vpath_for(&dest1),
-                    size: 1,
-                    conflict: Some(ConflictPolicy::Abort),
-                },
-                Step::CopyFile {
-                    source: vpath_for(&source2),
-                    dest: vpath_for(&dest2),
-                    size: 1,
-                    conflict: None,
-                },
-            ],
-            PlanOptions::default(),
-        );
-
-        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let journal = JournalHandle::spawn(Journal::open(JobIdT(1), state.path()).unwrap());
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        // concurrency = 1 so the semaphore fully serialises the batch --
-        // the second step cannot even start until the abort step (which
-        // calls `ExecutionControl::cancel()` before returning) has
-        // released its permit.
-        let report = execute(fs, JobIdT(1), plan, journal, 1, tx, control, None).await;
-        let mut events = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            events.push(e);
-        }
+        let ctx = ExecutorContext {
+            fs,
+            job_id: JobIdT(1),
+            journal,
+            control: control.clone(),
+            counters: Arc::new(ProgressCounters::default()),
+            events: events_tx,
+            outcomes: Arc::new(Mutex::new(HashMap::new())),
+            default_conflict: ConflictPolicy::Skip,
+            resolver: None,
+            sticky_conflict: Arc::new(Mutex::new(None)),
+        };
 
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let step1 = Step::CopyFile {
+            source: vpath_for(&source1),
+            dest: vpath_for(&dest1),
+            size: 1,
+            conflict: Some(ConflictPolicy::Abort),
+        };
+        let outcome1 = run_step_with_retry(&ctx, 0, &step1).await;
+        match outcome1 {
+            StepRun::Done(StepOutcome::Skipped { .. }) => {}
+            other => panic!("expected step 1's abort to resolve as a skip, got {other:?}"),
+        }
+        assert_eq!(
+            control.state(),
+            ControlState::Cancelled,
+            "resolving the conflict as Abort must cancel the job"
+        );
         assert_eq!(
             std::fs::read(&dest1).unwrap(),
             b"old",
             "abort itself must not overwrite the conflicting destination"
         );
+
+        let step2 = Step::CopyFile {
+            source: vpath_for(&source2),
+            dest: vpath_for(&dest2),
+            size: 1,
+            conflict: None,
+        };
+        let outcome2 = run_step_with_retry(&ctx, 1, &step2).await;
+        assert!(
+            matches!(outcome2, StepRun::Cancelled),
+            "step 2 must bail out on the job's already-cancelled state instead of running, got \
+             {outcome2:?}"
+        );
         assert!(
             !dest2.exists(),
             "the job must stop at the abort -- the second, non-conflicting CopyFile must never run"
         );
-        assert!(events.iter().any(|e| matches!(
-            e,
-            JobEvent::Finished {
-                outcome: JobOutcome::Cancelled,
-                ..
-            }
-        )));
     }
 
     #[tokio::test]
@@ -4645,6 +4731,63 @@ mod tests {
             .collect()
     }
 
+    /// Runs `steps` one at a time via [`run_step_with_retry`], each against
+    /// a *freshly built* [`ExecutorContext`] (own `sticky_conflict`, same
+    /// shared `resolver`) -- deliberately bypassing `execute()`/`run_batch`
+    /// entirely, unlike this helper's own precedent (`run_with_resolver`,
+    /// used by every other test in this module). `run_batch` dispatches a
+    /// whole batch of copy-class steps via `tokio::spawn` up front, and its
+    /// `concurrency` semaphore only ever bounded how many run *concurrently*
+    /// -- never which one starts, or gets to consult a live [`ConflictResolver`],
+    /// *first*. `sticky_apply_to_all_never_leaks_between_two_separate_jobs`
+    /// (this helper's only caller) needs the resolver consulted in *exact*
+    /// step order across up to 4 steps per job, to match its own pre
+    /// -scripted answer sequence -- a much stronger ordering requirement
+    /// than any other test in this module makes of `run_batch`. That
+    /// ordering held under `#[tokio::test]`'s old `current_thread` default
+    /// purely by accident (single-threaded cooperative polling can't
+    /// interleave `tokio::spawn` calls out of submission order); it doesn't
+    /// hold under any real multi-thread runtime `run_batch` itself now
+    /// requires (`copy_file_step`'s `server_side_copy` call goes through
+    /// `tokio::task::block_in_place`, which panics on `current_thread` --
+    /// see that call site's own doc comment). A `worker_threads(1)`
+    /// multi-thread runtime was tried first and looked sound in isolation,
+    /// but a full-suite stress run (~200 repeats) still turned up one
+    /// unexplained failure -- rather than trust unstated scheduler
+    /// internals for an ordering guarantee this test's own correctness
+    /// depends on, this helper sidesteps the question entirely: a plain
+    /// sequential `.await` loop, with no `tokio::spawn`/semaphore involved
+    /// at all, can't race no matter how many worker threads exist.
+    async fn run_steps_sequentially_with_resolver(
+        job_id: JobIdT,
+        steps: &[Step],
+        state_dir: &Path,
+        resolver: Arc<dyn ConflictResolver>,
+    ) -> JobReport {
+        let journal = JournalHandle::spawn(Journal::open(job_id, state_dir).unwrap());
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let ctx = ExecutorContext {
+            fs: Arc::new(LocalFs),
+            job_id,
+            journal,
+            control: ExecutionControl::new(),
+            counters: Arc::new(ProgressCounters::default()),
+            events: events_tx,
+            outcomes: Arc::new(Mutex::new(HashMap::new())),
+            default_conflict: ConflictPolicy::Skip,
+            resolver: Some(resolver),
+            sticky_conflict: Arc::new(Mutex::new(None)),
+        };
+        let mut report = JobReport::default();
+        for (i, step) in steps.iter().enumerate() {
+            match run_step_with_retry(&ctx, i as u32, step).await {
+                StepRun::Done(outcome) => apply_outcome(&mut report, i as u32, step, outcome),
+                StepRun::Cancelled => panic!("no step in this test cancels the job"),
+            }
+        }
+        report
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
@@ -4668,17 +4811,16 @@ mod tests {
             let trigger1 = raw_trigger1.min(n1);
             let trigger2 = raw_trigger2.min(n2);
 
-            // `current_thread`, matching `#[tokio::test]`'s own default
-            // flavor elsewhere in this file -- `Runtime::new()` builds a
-            // genuinely multi-threaded runtime, under which the three
-            // spawned copy-class tasks could race to acquire the
-            // concurrency=1 semaphore in any order, breaking this test's
-            // assumption that step order matches resolver-consultation
-            // order. Safe here the same way every other plain
-            // `#[tokio::test]` in this file already relies on: the files
-            // are tiny, so `LocalFs`'s inline blocking syscalls never
-            // starve anything long enough to matter.
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // Must be a *multi-thread* runtime -- `copy_file_step`'s
+            // `server_side_copy` call now goes through `tokio::task::
+            // block_in_place` (see that call site's own doc comment for
+            // why), which panics unconditionally on a `current_thread`
+            // runtime. The worker count itself no longer matters for this
+            // test's correctness (see `run_steps_sequentially_with_resolver`'s
+            // own doc comment for why), so this is an arbitrary, ordinary
+            // choice, not a load-bearing one.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .unwrap();
@@ -4714,13 +4856,12 @@ mod tests {
                 let resolver_dyn: Arc<dyn ConflictResolver> = resolver.clone();
 
                 let (job1_sources, job1_dests) = make_conflicting_files(dir.path(), "job1", n1);
-                let plan1 = Plan::new(copy_steps(&job1_sources, &job1_dests), PlanOptions::default());
-                let (report1, _events1) = run_with_resolver(
-                    Arc::new(LocalFs),
-                    plan1,
+                let steps1 = copy_steps(&job1_sources, &job1_dests);
+                let report1 = run_steps_sequentially_with_resolver(
+                    JobIdT(1),
+                    &steps1,
                     state1.path(),
-                    1,
-                    Some(Arc::clone(&resolver_dyn)),
+                    Arc::clone(&resolver_dyn),
                 )
                 .await;
 
@@ -4741,13 +4882,12 @@ mod tests {
                 }
 
                 let (job2_sources, job2_dests) = make_conflicting_files(dir.path(), "job2", n2);
-                let plan2 = Plan::new(copy_steps(&job2_sources, &job2_dests), PlanOptions::default());
-                let (report2, _events2) = run_with_resolver(
-                    Arc::new(LocalFs),
-                    plan2,
+                let steps2 = copy_steps(&job2_sources, &job2_dests);
+                let report2 = run_steps_sequentially_with_resolver(
+                    JobIdT(1),
+                    &steps2,
                     state2.path(),
-                    1,
-                    Some(Arc::clone(&resolver_dyn)),
+                    Arc::clone(&resolver_dyn),
                 )
                 .await;
 
@@ -4776,7 +4916,7 @@ mod tests {
 
     // ---- T-5.1.6: metadata preservation, end to end -----------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_preserves_mode_beyond_the_writers_default() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -4811,7 +4951,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_preserves_mtime_and_xattrs() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -4868,7 +5008,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_a_directory_does_not_disturb_its_restored_mtime() {
         let src = TempDir::new().unwrap();
         let dst = TempDir::new().unwrap();
@@ -4917,7 +5057,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_setmeta_step_is_skipped_not_attempted_when_its_copy_step_failed() {
         let dst = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
@@ -4963,7 +5103,7 @@ mod tests {
         assert!(!dest_path.exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_link_step_is_skipped_not_attempted_when_its_source_copy_step_failed() {
         let dst = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
