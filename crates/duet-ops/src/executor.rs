@@ -338,12 +338,48 @@ struct ExecutorContext {
 /// [`EtaEstimator`]'s dual-regime rate estimate specifically, split by
 /// [`is_small_file`] -- see the module doc comment's "Progress and ETA"
 /// section.
+/// `small_active`/`large_active` (this fix) count how many `copy_file_step`
+/// attempts of each regime are genuinely mid-flight *right now* -- see
+/// [`ActiveGuard`] and [`EtaEstimator::sample`]'s own doc comments for why
+/// this is what lets the estimator tell a real zero-progress tick (a copy
+/// is running but hasn't reported a chunk yet -- decay the rate) apart from
+/// a genuine idle gap between steps or during a pause (hold the rate
+/// steady, T-5.1.11's own original design).
 #[derive(Debug, Default)]
 struct ProgressCounters {
     files_done: AtomicU64,
     bytes_done: AtomicU64,
     small_files_done: AtomicU64,
     large_bytes_done: AtomicU64,
+    small_active: AtomicU64,
+    large_active: AtomicU64,
+}
+
+/// Increments the given regime's `ProgressCounters::{small,large}_active`
+/// counter on construction, decrements it on drop -- regardless of which
+/// exit path `copy_file_step` takes (success, skip, error, or an
+/// interrupted attempt about to retry), since it's an ordinary local
+/// binding whose `Drop` runs at the end of that function's scope. This is
+/// deliberately scoped to exactly one *attempt* (one `server_side_copy`/
+/// `naive_copy` call), not the whole step's retry loop: the moment an
+/// attempt is interrupted by a pause, this guard drops and the counter
+/// goes back to 0 *before* `run_step_with_retry` blocks in
+/// `wait_out_pause` -- so a real pause still reads as "inactive" (hold the
+/// rate steady) exactly as it did before this fix, and only genuine
+/// mid-copy gaps between chunk deliveries read as "active" (decay it).
+struct ActiveGuard<'a>(&'a AtomicU64);
+
+impl<'a> ActiveGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        ActiveGuard(counter)
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The size boundary [`is_small_file`] classifies a `CopyFile`/`Reflink`
@@ -443,7 +479,35 @@ impl EtaEstimator {
     /// (one honest jump), but the value can never climb two ticks running.
     /// Any tick whose estimate is flat or lower clears the pending flag,
     /// so a later, separate slowdown gets its own one free jump again.
-    fn sample(&mut self, small_done: u64, large_done: u64) -> Option<u64> {
+    ///
+    /// `small_active`/`large_active` (added alongside the accelerated-copy
+    /// incremental-progress fix): whether at least one `copy_file_step`
+    /// attempt of that regime is genuinely mid-flight right now (see
+    /// `ActiveGuard`'s own doc comment). Before this fix, a zero-delta tick
+    /// was *always* skipped -- correct for a real barrier pause (no copy of
+    /// this regime is running at all, so freezing the rate instead of
+    /// decaying it towards zero avoids a spurious ETA spike right as the
+    /// job resumes, T-5.1.11's own original AC), but *wrong* once
+    /// `accelerated_copy` started reporting in coarse ~64 MiB bursts
+    /// (T-5.1.4/the incremental-progress fix): most 100ms ticks during an
+    /// otherwise-healthy copy are legitimately zero-delta too, and
+    /// excluding all of them from the average means the EMA is computed
+    /// only over the "burst" instants -- each of which overstates the true
+    /// rate, since it's crediting several real 100ms-widths of transfer to
+    /// one tick. The result was a systematically over-optimistic ETA that
+    /// stayed "stuck" on a too-low number for far longer than that number
+    /// implied. Now: a zero-delta tick while the regime is `_active` feeds
+    /// an honest `0.0` into the same EWMA (a real data point, not an
+    /// exclusion), so the average correctly reflects the gaps between
+    /// bursts, not just the bursts themselves; a zero-delta tick while
+    /// *inactive* still holds the rate steady exactly as before.
+    fn sample(
+        &mut self,
+        small_done: u64,
+        large_done: u64,
+        small_active: bool,
+        large_active: bool,
+    ) -> Option<u64> {
         let small_delta = small_done.saturating_sub(self.last_small_done);
         let large_delta = large_done.saturating_sub(self.last_large_done);
         self.last_small_done = small_done;
@@ -455,6 +519,10 @@ impl EtaEstimator {
                 None => instant_rate,
                 Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
             });
+        } else if small_active {
+            self.small_rate_ema = self
+                .small_rate_ema
+                .map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
         }
         if large_delta > 0 {
             let instant_rate = large_delta as f64 * 10.0;
@@ -462,6 +530,10 @@ impl EtaEstimator {
                 None => instant_rate,
                 Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
             });
+        } else if large_active {
+            self.large_rate_ema = self
+                .large_rate_ema
+                .map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
         }
 
         let remaining_small = self.total_small_files.saturating_sub(small_done);
@@ -498,6 +570,24 @@ impl EtaEstimator {
         let reported = match (raw, self.last_reported) {
             (Some(raw), Some(last)) if raw > last => {
                 if self.backward_pending {
+                    // This suppressed tick itself "pays for" one more
+                    // increase -- reset the flag here, not only on a flat
+                    // -or-lower tick. Without this, a *sustained* climb
+                    // (every raw value strictly higher than the last, which
+                    // this fix's own active-zero-delta decay makes a real,
+                    // common case -- see `ActiveGuard`'s doc comment) would
+                    // set `backward_pending` once and then never see a
+                    // flat-or-lower tick to clear it, freezing the reported
+                    // value forever instead of merely slowing its climb.
+                    // Resetting here instead produces an alternating
+                    // allow/suppress/allow/... pattern for a sustained
+                    // climb -- still never two *reported* increases back to
+                    // back (this arm only ever fires right after an
+                    // allowed increase, so the suppressed tick's own
+                    // neighbor pair is a flat, never a second increase),
+                    // but the real trend keeps surfacing every other tick
+                    // instead of vanishing.
+                    self.backward_pending = false;
                     Some(last)
                 } else {
                     self.backward_pending = true;
@@ -1794,6 +1884,15 @@ async fn copy_file_step(
     // `naive_copy`'s existing invariant, extended to this path).
     let credited_this_attempt = AtomicU64::new(0);
     let is_large = !is_small_file(expected_size);
+    // Held for the rest of this function -- see `ActiveGuard`'s own doc
+    // comment for why its scope (one attempt, not the whole retry loop) is
+    // exactly what makes it a real "is a copy syscall genuinely in flight
+    // right now" signal for `EtaEstimator`.
+    let _active_guard = ActiveGuard::new(if is_large {
+        &ctx.counters.large_active
+    } else {
+        &ctx.counters.small_active
+    });
     let on_progress = |bytes: u64| {
         if bytes > 0 {
             credited_this_attempt.fetch_add(bytes, Ordering::Relaxed);
@@ -2154,9 +2253,16 @@ fn spawn_progress_sampler(
             let files_done = counters.files_done.load(Ordering::Relaxed);
             let small_files_done = counters.small_files_done.load(Ordering::Relaxed);
             let large_bytes_done = counters.large_bytes_done.load(Ordering::Relaxed);
+            let small_active = counters.small_active.load(Ordering::Relaxed) > 0;
+            let large_active = counters.large_active.load(Ordering::Relaxed) > 0;
             let throughput = bytes_done.saturating_sub(last_bytes) * 10; // per-100ms -> per-second
             last_bytes = bytes_done;
-            let eta_secs = eta.sample(small_files_done, large_bytes_done);
+            let eta_secs = eta.sample(
+                small_files_done,
+                large_bytes_done,
+                small_active,
+                large_active,
+            );
             let snapshot = ProgressSnapshot {
                 files_done,
                 bytes_done,
@@ -3521,7 +3627,7 @@ mod tests {
     #[test]
     fn eta_is_none_before_any_regime_has_a_rate() {
         let mut eta = EtaEstimator::new(10, 1_000_000);
-        assert_eq!(eta.sample(0, 0), None);
+        assert_eq!(eta.sample(0, 0, true, true), None);
     }
 
     /// Outstanding work in *both* regimes, but only one has produced a rate
@@ -3531,9 +3637,13 @@ mod tests {
     #[test]
     fn eta_is_none_while_only_one_of_two_regimes_with_outstanding_work_has_a_rate() {
         let mut eta = EtaEstimator::new(1_000, 1_000_000);
-        assert_eq!(eta.sample(0, 100_000), None, "large moved, small hasn't");
+        assert_eq!(
+            eta.sample(0, 100_000, true, true),
+            None,
+            "large moved, small hasn't"
+        );
         assert!(
-            eta.sample(50, 200_000).is_some(),
+            eta.sample(50, 200_000, true, true).is_some(),
             "both regimes have now produced at least one real delta"
         );
     }
@@ -3544,11 +3654,13 @@ mod tests {
     #[test]
     fn eta_ignores_a_regime_with_no_outstanding_work() {
         let mut eta = EtaEstimator::new(1_000, 0);
-        assert_eq!(eta.sample(0, 0), None);
+        // No large-regime work is planned at all, so it can never be
+        // genuinely "active" -- `large_active: false` throughout.
+        assert_eq!(eta.sample(0, 0, true, false), None);
         // 10 files in one 100ms tick -> 100 files/sec instantaneous rate;
         // 990 remaining / 100/s = 9.9s, rounds to 10. The empty large
         // regime contributes a fixed `Some(0.0)` and never blocks this.
-        assert_eq!(eta.sample(10, 0), Some(10));
+        assert_eq!(eta.sample(10, 0, true, false), Some(10));
     }
 
     /// Constant, non-adversarial per-tick progress in both regimes -- the
@@ -3576,7 +3688,7 @@ mod tests {
         for _ in 0..100 {
             small_done += 20;
             large_done += 2_000_000;
-            last = eta.sample(small_done, large_done);
+            last = eta.sample(small_done, large_done, true, true);
         }
 
         let small_rate = 200.0; // files/sec
@@ -3607,15 +3719,19 @@ mod tests {
         let mut large_done = 0u64;
         let mut reported = Vec::new();
 
+        // No small-regime work is planned at all (`EtaEstimator::new(0,
+        // ..)`), so it can never be genuinely "active" -- `small_active:
+        // false` throughout; the large regime is steadily copying the
+        // whole time, hence `large_active: true`.
         // Warm up at a fast, steady rate (10 MiB/tick = 100 MiB/sec).
         for _ in 0..10 {
             large_done += 10_000_000;
-            reported.push(eta.sample(0, large_done));
+            reported.push(eta.sample(0, large_done, false, true));
         }
         // Then a real, sustained slowdown: 1 MiB/tick for many ticks.
         for _ in 0..30 {
             large_done += 1_000_000;
-            reported.push(eta.sample(0, large_done));
+            reported.push(eta.sample(0, large_done, false, true));
         }
 
         let values: Vec<u64> = reported.into_iter().flatten().collect();
@@ -3636,6 +3752,166 @@ mod tests {
         assert!(
             values.windows(2).any(|p| p[1] > p[0]),
             "a genuine sustained slowdown never showed up as a single honest jump: {values:?}"
+        );
+    }
+
+    /// The fix this test exists for: before it, a zero-delta tick was
+    /// *always* skipped, regardless of whether a copy was actually running
+    /// -- correct for a genuine barrier pause, wrong for a coarse-grained
+    /// accelerated copy whose `on_progress` calls land every few ticks
+    /// instead of every tick. Establishes a steady rate, then feeds several
+    /// zero-delta ticks with `large_active: true` (a copy is genuinely
+    /// mid-flight, just hasn't reported a chunk on these particular ticks)
+    /// and checks the reported ETA rises across them -- proof the rate is
+    /// actually decaying, not frozen.
+    #[test]
+    fn eta_decays_towards_zero_across_zero_delta_ticks_while_the_regime_is_active() {
+        let mut eta = EtaEstimator::new(0, 1_000_000_000);
+        let mut large_done = 0u64;
+        // Warm up at 10 MiB/tick (100 MiB/sec) for a stable starting rate.
+        for _ in 0..10 {
+            large_done += 10_000_000;
+            eta.sample(0, large_done, false, true);
+        }
+        let warm = eta
+            .sample(0, large_done, false, true)
+            .expect("a warmed-up steady rate must report a real ETA");
+
+        // Several ticks with no new bytes, but the regime is *active* --
+        // a real copy syscall is in flight, just hasn't landed a chunk yet.
+        let mut last = warm;
+        let mut saw_an_increase = false;
+        for _ in 0..5 {
+            let next = eta
+                .sample(0, large_done, false, true)
+                .expect("an already-established rate must not vanish to None");
+            if next > last {
+                saw_an_increase = true;
+            }
+            last = next;
+        }
+        assert!(
+            saw_an_increase,
+            "ETA never rose across active zero-delta ticks -- the rate looks frozen, not decaying"
+        );
+    }
+
+    /// The regression-test twin of the one above: a zero-delta tick while
+    /// the regime is *inactive* (no copy of this regime is running at all
+    /// -- a genuine barrier pause between steps, e.g. waiting on `SetMeta`/
+    /// `Verify`) must still hold the rate exactly steady, precisely
+    /// T-5.1.11's own original behavior. Without this distinction, the fix
+    /// above would reintroduce the very bug T-5.1.11 was written to avoid:
+    /// an ETA that spikes upward during an ordinary barrier pause and has
+    /// to re-ramp back down once real copying resumes.
+    #[test]
+    fn eta_holds_steady_across_zero_delta_ticks_while_the_regime_is_inactive() {
+        let mut eta = EtaEstimator::new(0, 1_000_000_000);
+        let mut large_done = 0u64;
+        for _ in 0..10 {
+            large_done += 10_000_000;
+            eta.sample(0, large_done, false, true);
+        }
+        let warm = eta
+            .sample(0, large_done, false, true)
+            .expect("a warmed-up steady rate must report a real ETA");
+
+        // Now a real barrier pause: nothing of this regime is running.
+        for _ in 0..10 {
+            let next = eta
+                .sample(0, large_done, false, false)
+                .expect("a held-steady rate must not vanish to None");
+            assert_eq!(
+                next, warm,
+                "ETA moved during a genuine barrier pause (regime inactive) -- it must hold \
+                 exactly steady, matching T-5.1.11's own original AC"
+            );
+        }
+    }
+
+    /// The most direct regression test for the live-UAT report this fix
+    /// addresses: `accelerated_copy`'s coarse ~64 MiB reporting granularity
+    /// means most 100ms ticks during a real copy are legitimately zero
+    /// -delta, with an occasional large burst when a chunk lands. Before
+    /// this fix, the EWMA only ever averaged the *bursts* (zero-delta ticks
+    /// were skipped, not fed in as real zero samples), which systematically
+    /// overstated the rate -- each burst tick claims several real 100ms
+    /// -widths' worth of bytes as if it all arrived in one tick. This
+    /// simulates exactly that shape (1 burst tick, then several zero
+    /// -active ticks, repeating).
+    ///
+    /// Deliberately checks the *average of many reported ETAs across
+    /// several cycles*, not the single last sample: a perfectly periodic
+    /// synthetic burst pattern makes the EMA itself swing between a real
+    /// per-cycle high (right after a burst) and low (right before the
+    /// next one) by construction -- checking one arbitrary point in that
+    /// cycle mostly tests "which phase of the cycle did the test happen to
+    /// stop on," not whether the estimator is unbiased. Averaging over
+    /// several full cycles is what actually verifies the fix's own claim:
+    /// that the estimator converges to the *true average* rate instead of
+    /// systematically overstating it.
+    #[test]
+    fn eta_reflects_the_true_average_rate_not_just_burst_instants() {
+        // 4 zero ticks between each burst -- a 64 MiB chunk arriving every
+        // ~500ms is a realistic accelerated_copy cadence on a real disk
+        // (matches the live-UAT report's own observed pattern).
+        const BURST_BYTES: u64 = 64 * 1024 * 1024;
+        const ZERO_TICKS_PER_BURST: usize = 4;
+        // True average rate: one burst every (1 + ZERO_TICKS_PER_BURST)
+        // ticks, 10 ticks/sec -> bytes/sec = BURST_BYTES * 10 / (1 + 4).
+        let true_rate = BURST_BYTES as f64 * 10.0 / (1 + ZERO_TICKS_PER_BURST) as f64;
+
+        // Large enough that `total_large_bytes - large_done` stays
+        // positive (and the true-remaining-time math stays meaningful)
+        // across every cycle sampled below, including the last one.
+        let total_large_bytes = 10_000_000_000u64; // ~9.3 GiB
+        let mut eta = EtaEstimator::new(0, total_large_bytes);
+        let mut large_done = 0u64;
+
+        // Warm up for 10 cycles so the periodic steady state is reached
+        // before any measurement starts.
+        for _ in 0..10 {
+            large_done += BURST_BYTES;
+            eta.sample(0, large_done, false, true);
+            for _ in 0..ZERO_TICKS_PER_BURST {
+                eta.sample(0, large_done, false, true);
+            }
+        }
+
+        // Now average the reported ETA (converted back to an implied rate,
+        // since ETA itself is nonlinear in remaining bytes -- averaging
+        // rates is the meaningful comparison) across 20 more full cycles.
+        let mut implied_rates = Vec::new();
+        let record = |report: Option<u64>, large_done: u64, implied_rates: &mut Vec<f64>| {
+            if let Some(secs) = report.filter(|&s| s > 0) {
+                let remaining = (total_large_bytes - large_done) as f64;
+                implied_rates.push(remaining / secs as f64);
+            }
+        };
+        for _ in 0..20 {
+            large_done += BURST_BYTES;
+            record(
+                eta.sample(0, large_done, false, true),
+                large_done,
+                &mut implied_rates,
+            );
+            for _ in 0..ZERO_TICKS_PER_BURST {
+                record(
+                    eta.sample(0, large_done, false, true),
+                    large_done,
+                    &mut implied_rates,
+                );
+            }
+        }
+
+        let mean_implied_rate = implied_rates.iter().sum::<f64>() / implied_rates.len() as f64;
+        let error = (mean_implied_rate - true_rate).abs() / true_rate;
+        assert!(
+            error <= 0.20,
+            "mean implied rate across 20 cycles: {mean_implied_rate:.0} B/s, true average: \
+             {true_rate:.0} B/s -- {:.1}% off, expected within 20% (T-5.1.11's own steady-rate \
+             bound)",
+            error * 100.0
         );
     }
 
