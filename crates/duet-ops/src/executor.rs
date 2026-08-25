@@ -418,27 +418,6 @@ fn regime_totals(steps: &[Step]) -> (u64, u64) {
     (total_small_files, total_large_bytes)
 }
 
-/// The pure (no atomics, no I/O, no async) dual-regime EWMA ETA core --
-/// see the module doc comment's "Progress and ETA" section for the full
-/// design rationale. Kept separate from [`spawn_progress_sampler`] so its
-/// tick-by-tick behaviour (convergence speed, the backward-run clamp) is
-/// directly unit-testable against a synthetic sequence of `sample()` calls
-/// instead of needing a real 10-second wall-clock test.
-struct EtaEstimator {
-    total_small_files: u64,
-    total_large_bytes: u64,
-    small_rate_ema: Option<f64>,
-    large_rate_ema: Option<f64>,
-    last_small_done: u64,
-    last_large_done: u64,
-    last_reported: Option<u64>,
-    /// `true` once this tick's report is a same-or-lower-than-`last_reported`
-    /// value has NOT yet happened since the last increase -- i.e. whether
-    /// the *next* increase, if any, must be clamped. See `sample`'s doc
-    /// comment.
-    backward_pending: bool,
-}
-
 /// How heavily each tick's freshly observed instantaneous rate is weighted
 /// against the running EWMA -- large enough to converge well within
 /// T-5.1.11's own "within 20% after the first 10s" AC (10s at 100ms/tick
@@ -449,13 +428,68 @@ struct EtaEstimator {
 /// "documented, deliberately conservative choice" precedent.
 const ETA_EWMA_ALPHA: f64 = 0.3;
 
+/// A single decaying-EMA rate estimate, in units-per-second, folded from
+/// successive 100ms-tick deltas. `update`'s three-way split (fresh
+/// instantaneous rate on a nonzero delta; decay the existing rate on a
+/// zero delta while `active`; hold it exactly steady on a zero delta while
+/// inactive) is the one place this decision is made -- shared by
+/// [`EtaEstimator`]'s two per-regime rates (files/sec and bytes/sec) and
+/// [`spawn_progress_sampler`]'s own combined displayed-throughput rate
+/// (bytes/sec across both regimes), so "what does a zero-delta tick mean"
+/// can never drift between the ETA calculation and what's shown on screen.
+/// See `EtaEstimator::sample`'s own doc comment for the full rationale
+/// behind the active/inactive split.
+#[derive(Debug, Default, Clone, Copy)]
+struct RateEma {
+    ema: Option<f64>,
+}
+
+impl RateEma {
+    fn update(&mut self, delta: u64, active: bool) {
+        if delta > 0 {
+            let instant_rate = delta as f64 * 10.0; // per-100ms -> per-second
+            self.ema = Some(match self.ema {
+                None => instant_rate,
+                Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
+            });
+        } else if active {
+            self.ema = self.ema.map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
+        }
+    }
+
+    fn rate(&self) -> Option<f64> {
+        self.ema
+    }
+}
+
+/// The pure (no atomics, no I/O, no async) dual-regime EWMA ETA core --
+/// see the module doc comment's "Progress and ETA" section for the full
+/// design rationale. Kept separate from [`spawn_progress_sampler`] so its
+/// tick-by-tick behaviour (convergence speed, the backward-run clamp) is
+/// directly unit-testable against a synthetic sequence of `sample()` calls
+/// instead of needing a real 10-second wall-clock test.
+struct EtaEstimator {
+    total_small_files: u64,
+    total_large_bytes: u64,
+    small_rate: RateEma,
+    large_rate: RateEma,
+    last_small_done: u64,
+    last_large_done: u64,
+    last_reported: Option<u64>,
+    /// `true` once this tick's report is a same-or-lower-than-`last_reported`
+    /// value has NOT yet happened since the last increase -- i.e. whether
+    /// the *next* increase, if any, must be clamped. See `sample`'s doc
+    /// comment.
+    backward_pending: bool,
+}
+
 impl EtaEstimator {
     fn new(total_small_files: u64, total_large_bytes: u64) -> Self {
         EtaEstimator {
             total_small_files,
             total_large_bytes,
-            small_rate_ema: None,
-            large_rate_ema: None,
+            small_rate: RateEma::default(),
+            large_rate: RateEma::default(),
             last_small_done: 0,
             last_large_done: 0,
             last_reported: None,
@@ -513,28 +547,8 @@ impl EtaEstimator {
         self.last_small_done = small_done;
         self.last_large_done = large_done;
 
-        if small_delta > 0 {
-            let instant_rate = small_delta as f64 * 10.0; // per-100ms -> per-second
-            self.small_rate_ema = Some(match self.small_rate_ema {
-                None => instant_rate,
-                Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
-            });
-        } else if small_active {
-            self.small_rate_ema = self
-                .small_rate_ema
-                .map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
-        }
-        if large_delta > 0 {
-            let instant_rate = large_delta as f64 * 10.0;
-            self.large_rate_ema = Some(match self.large_rate_ema {
-                None => instant_rate,
-                Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
-            });
-        } else if large_active {
-            self.large_rate_ema = self
-                .large_rate_ema
-                .map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
-        }
+        self.small_rate.update(small_delta, small_active);
+        self.large_rate.update(large_delta, large_active);
 
         let remaining_small = self.total_small_files.saturating_sub(small_done);
         let remaining_large = self.total_large_bytes.saturating_sub(large_done);
@@ -542,14 +556,16 @@ impl EtaEstimator {
         let small_eta = if remaining_small == 0 {
             Some(0.0)
         } else {
-            self.small_rate_ema
+            self.small_rate
+                .rate()
                 .filter(|r| *r > 0.0)
                 .map(|r| remaining_small as f64 / r)
         };
         let large_eta = if remaining_large == 0 {
             Some(0.0)
         } else {
-            self.large_rate_ema
+            self.large_rate
+                .rate()
                 .filter(|r| *r > 0.0)
                 .map(|r| remaining_large as f64 / r)
         };
@@ -2247,6 +2263,16 @@ fn spawn_progress_sampler(
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         let mut last_bytes = 0u64;
         let mut eta = EtaEstimator::new(total_small_files, total_large_bytes);
+        // The *displayed* throughput number, smoothed by the same `RateEma`
+        // `EtaEstimator`'s own two per-regime rates use -- see `RateEma`'s
+        // own doc comment for why sharing it matters. Driven by combined
+        // `bytes_done` (both regimes together, matching what's actually
+        // shown as "bytes done") and "is either regime genuinely active
+        // right now," not by either regime's rate alone: a job with both
+        // small and large files in flight should show one honest combined
+        // speed, not one regime's rate silently standing in for the whole
+        // thing.
+        let mut throughput_rate = RateEma::default();
         loop {
             interval.tick().await;
             let bytes_done = counters.bytes_done.load(Ordering::Relaxed);
@@ -2255,8 +2281,10 @@ fn spawn_progress_sampler(
             let large_bytes_done = counters.large_bytes_done.load(Ordering::Relaxed);
             let small_active = counters.small_active.load(Ordering::Relaxed) > 0;
             let large_active = counters.large_active.load(Ordering::Relaxed) > 0;
-            let throughput = bytes_done.saturating_sub(last_bytes) * 10; // per-100ms -> per-second
+            let bytes_delta = bytes_done.saturating_sub(last_bytes);
             last_bytes = bytes_done;
+            throughput_rate.update(bytes_delta, small_active || large_active);
+            let throughput = throughput_rate.rate().unwrap_or(0.0).round() as u64;
             let eta_secs = eta.sample(
                 small_files_done,
                 large_bytes_done,
@@ -3915,6 +3943,75 @@ mod tests {
         );
     }
 
+    // ---- Displayed-throughput smoothing (follow-up to T-5.1.11's ETA fix) -
+
+    /// The most direct regression test for "the speed number blinks between
+    /// a real value and 0 like crazy," reported live right after the ETA
+    /// -smoothing fix shipped: that fix only touched `EtaEstimator`'s own
+    /// internal rate, never the separately-computed, unsmoothed `bytes_done`
+    /// -delta value the UI actually displays as throughput. Reproduces the
+    /// exact bursty shape directly against [`RateEma`] (no executor, no
+    /// I/O -- deterministic): a burst tick, then several zero-delta ticks
+    /// with the regime genuinely active. Before wiring `RateEma` into
+    /// [`spawn_progress_sampler`]'s own displayed-throughput calculation,
+    /// every one of those zero-delta ticks would have reported a bare `0`;
+    /// now every one of them must report a real, decaying-but-nonzero rate.
+    #[test]
+    fn displayed_throughput_never_drops_to_zero_across_active_gaps() {
+        const BURST_BYTES: u64 = 64 * 1024 * 1024;
+        const ZERO_TICKS_PER_BURST: usize = 4;
+
+        let mut rate = RateEma::default();
+        // Warm up with one burst so there's a real rate to decay from.
+        rate.update(BURST_BYTES, true);
+        let mut last = rate.rate().expect("a real burst must produce a real rate");
+        assert!(last > 0.0);
+
+        let mut saw_a_decrease = false;
+        for tick in 0..ZERO_TICKS_PER_BURST {
+            rate.update(0, true);
+            let displayed = rate.rate().unwrap_or(0.0);
+            assert!(
+                displayed.round() as u64 > 0,
+                "displayed throughput dropped to 0 on active zero-delta tick {tick} -- exactly \
+                 the reported 'blinking between a real number and 0' symptom"
+            );
+            // Not just "still nonzero" (frozen would trivially satisfy that
+            // too) -- must be genuinely decaying, proving this isn't just
+            // holding the last burst's value steady.
+            if displayed < last {
+                saw_a_decrease = true;
+            }
+            last = displayed;
+        }
+        assert!(
+            saw_a_decrease,
+            "displayed throughput never decreased across active zero-delta ticks -- it looks \
+             frozen at the last burst's value, not decaying"
+        );
+    }
+
+    /// The inactive-regime twin: once the copy genuinely stops (job moves
+    /// on to a barrier step, or finishes), the displayed rate must stop
+    /// being fed at all -- neither climbing nor being force-decayed to 0 --
+    /// matching `RateEma::update`'s own documented active/inactive split.
+    #[test]
+    fn displayed_throughput_holds_steady_once_the_regime_goes_inactive() {
+        let mut rate = RateEma::default();
+        rate.update(64 * 1024 * 1024, true);
+        let warm = rate.rate().expect("a real burst must produce a real rate");
+
+        for _ in 0..5 {
+            rate.update(0, false);
+        }
+        assert_eq!(
+            rate.rate(),
+            Some(warm),
+            "displayed throughput moved after the regime went inactive -- it must hold exactly \
+             steady, matching EtaEstimator's own barrier-pause behavior"
+        );
+    }
+
     /// End-to-end sanity through the real `execute()`/sampler pipeline (no
     /// throttling, no env-gate): a small mixed corpus is enough to prove
     /// the wiring is real -- `eta_secs` starts `None` and becomes `Some`
@@ -4483,24 +4580,44 @@ mod tests {
 
         // Find the longest run of *consecutive* samples, all mid-copy
         // (bytes_done < total_size) and all reporting nonzero throughput.
-        // The old bug could produce at most a run of length 1 (one lucky
-        // sample landing right when a whole file's bytes jumped in) --
-        // this asserts a real, sustained run instead.
-        let mut best_run = 0usize;
-        let mut current_run = 0usize;
-        for &(bytes_done, throughput) in &throughput_samples {
-            if bytes_done < total_size && throughput > 0 {
-                current_run += 1;
-                best_run = best_run.max(current_run);
-            } else {
-                current_run = 0;
-            }
-        }
+        // The old raw-delta bug could produce at most a run of length 1
+        // (one lucky sample landing right when a whole file's bytes jumped
+        // in). The follow-up fix (smoothing the *displayed* throughput with
+        // the same `RateEma` `EtaEstimator`'s own per-regime rates use --
+        // see that struct's own doc comment) goes further still: every
+        // mid-copy sample *after real progress has actually started*
+        // should now be nonzero, since a zero-delta tick while a copy is
+        // genuinely active decays the rate instead of ever reporting a
+        // bare `0`. `bytes_done > 0` (not just `< total_size`) excludes
+        // the small handful of samples that can genuinely land before any
+        // `on_progress` call has ever fired at all -- there is no rate to
+        // smooth yet at that point, so `0` there is correct, not the bug
+        // this test exists to catch. So this asserts the strongest true
+        // guarantee -- the run covers *every* such sample, not just
+        // "at least 2 in a row" (the original, weaker bound this test
+        // shipped with before the smoothing fix existed).
+        let mid_copy_samples: Vec<(u64, u64)> = throughput_samples
+            .iter()
+            .copied()
+            .filter(|&(bytes_done, _)| bytes_done > 0 && bytes_done < total_size)
+            .collect();
+        let nonzero_mid_copy_samples = mid_copy_samples
+            .iter()
+            .filter(|&&(_, throughput)| throughput > 0)
+            .count();
         assert!(
-            best_run >= 2,
-            "expected at least 2 consecutive mid-copy samples with nonzero throughput -- \
-             longest run observed was {best_run}. Samples: {throughput_samples:?} (this is \
-             exactly the reported '0 B/s throughout, one spike at most' bug)"
+            mid_copy_samples.len() >= 2,
+            "test setup produced too few mid-copy samples to prove anything: \
+             {throughput_samples:?}"
+        );
+        assert_eq!(
+            nonzero_mid_copy_samples,
+            mid_copy_samples.len(),
+            "expected *every* mid-copy sample (after real progress started) to report nonzero \
+             throughput (the displayed-throughput smoothing fix's whole point) -- only \
+             {nonzero_mid_copy_samples} of {} were nonzero. Samples: {throughput_samples:?} \
+             (this is exactly the reported '0 B/s throughout, one spike at most' bug)",
+            mid_copy_samples.len()
         );
     }
 
