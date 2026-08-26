@@ -15,7 +15,10 @@ use duet_commands::keymap::{self, tc_csv};
 use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
-use duet_ops::{JobEvent, JobId, JobKind, JobOutcome, JobReport, ProgressSnapshot, QueueManager};
+use duet_ops::{
+    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, ProgressSnapshot,
+    QueueManager,
+};
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
@@ -36,6 +39,9 @@ use gpui::{
 };
 
 use crate::command_palette::CommandPaletteDelegate;
+use crate::conflict_dialog::{
+    ConflictDialogState, ConflictRequest, InteractiveConflictResolver, bind_conflict_dialog_keys,
+};
 use crate::copy_move_dialog::{CopyMoveDialogState, bind_copy_move_dialog_keys};
 use crate::file_table::{
     FileTable, FileTableSettings, MouseMode, QuickSearchMode, write_byte_count,
@@ -183,6 +189,7 @@ pub fn run() {
         bind_panel_keys(cx);
         bind_copy_move_dialog_keys(cx);
         bind_operation_manager_keys(cx);
+        bind_conflict_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -508,6 +515,58 @@ pub struct Workspace {
     /// `copy_move_dialog_previous_focus`.
     operation_manager_previous_focus: Option<FocusHandle>,
 
+    /// T-5.2.3's live conflict dialog (FR-OPS-04): `Some` while a real,
+    /// unresolved conflict from any running copy/move job is waiting on a
+    /// human answer. See `crate::conflict_dialog`'s module doc comment for
+    /// the full request/response bridge. Constructed by
+    /// [`Self::spawn_conflict_dialog_entity`] (called either from the
+    /// conflict-request consumer loop below, with no live `Window`, or
+    /// from [`Self::close_conflict_dialog`] itself when advancing to the
+    /// next queued conflict, which does have one), dropped on close.
+    conflict_dialog: Option<Entity<ConflictDialogState>>,
+    /// Captured the moment a conflict dialog first takes over keyboard
+    /// focus -- [`Self::render`]'s `pending_conflict_focus` drain is the
+    /// only place with both a live `Window` and the guarantee that focus
+    /// hasn't moved yet, so *that* is where this is set, not at
+    /// construction time (unlike every other `*_previous_focus` field in
+    /// this struct). Restored once every queued conflict has been
+    /// answered and `conflict_dialog` goes back to `None` with nothing
+    /// left in `pending_conflict_requests`.
+    conflict_dialog_previous_focus: Option<FocusHandle>,
+    /// A `FocusHandle` to focus via `window.focus` on the next render,
+    /// then cleared -- the same "no live `Window`" problem
+    /// `pending_focus_restore` documents (see that field's own doc
+    /// comment), for the one *open* path that hits it: a conflict is
+    /// detected on a background executor thread at an unpredictable
+    /// moment, so `Self::new`'s conflict-request consumer loop (a
+    /// `cx.spawn` async block, no `Window`) is the only place that can
+    /// react to it.
+    pending_conflict_focus: Option<FocusHandle>,
+    /// Every [`ConflictRequest`] that arrived while a conflict dialog was
+    /// already open -- concurrent jobs (up to
+    /// `COPY_MOVE_QUEUE_MAX_CONCURRENT` of them) can each hit their own
+    /// first conflict around the same time, and each is genuinely blocked
+    /// (`InteractiveConflictResolver::resolve`'s `block_in_place`) until
+    /// answered, so none can simply be dropped. Bounded in practice by the
+    /// number of concurrently *running* jobs (a small constant), not by
+    /// conflict count within one job -- T-5.2.3's own AC ("a 10k-conflict
+    /// run is survivable using apply-to-all") is a statement about the
+    /// *existing*, already-tested sticky `ConflictScope::AllRemaining`
+    /// mechanism (`duet_ops::executor::resolve_conflict`'s own
+    /// `sticky_conflict`) answering every conflict after the first
+    /// without ever consulting this resolver -- and therefore this queue
+    /// -- again, not about this field's own size.
+    pending_conflict_requests: std::collections::VecDeque<ConflictRequest>,
+    /// The single, live [`duet_ops::ConflictResolver`] shared by every
+    /// copy/move dialog this workspace opens
+    /// (`CopyMoveDialogState::confirm` passes
+    /// `Some(Arc::clone(&self.conflict_resolver))` instead of T-5.2.1's
+    /// original, always-`None` placeholder) -- constructed once, here,
+    /// alongside `queue`, with its own dedicated request channel
+    /// (`conflict_request_rx`'s consumer loop, in [`Self::new`], is the
+    /// only reader).
+    conflict_resolver: Arc<InteractiveConflictResolver>,
+
     /// Set once, right after construction, by [`run`] (needs a `Window`
     /// and this view's own `Entity` to exist first -- see
     /// `ThemeController::install`'s doc comment). `Option` only to bridge
@@ -721,6 +780,39 @@ impl Workspace {
         ));
         let state_dir = duet_config::paths::duet_state_dir().ok();
 
+        // T-5.2.3: the live conflict dialog's own request channel --
+        // `InteractiveConflictResolver::resolve` (called synchronously
+        // from deep inside a `tokio::spawn`'d executor task, potentially
+        // blocking) sends here; the consumer loop just below is the only
+        // reader, running on GPUI's own executor via `cx.spawn` -- see
+        // `crate::conflict_dialog`'s module doc comment for the full
+        // bridge this implements.
+        let (conflict_request_tx, mut conflict_request_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ConflictRequest>();
+        let conflict_resolver = Arc::new(InteractiveConflictResolver::new(conflict_request_tx));
+
+        // The conflict-request consumer loop: mirrors `queue_events_rx`'s
+        // own loop below in every structural respect (a `cx.spawn` task
+        // with no live `Window`, `this.update` per message, ends when
+        // `Workspace` is dropped) but handles a request/response
+        // exchange rather than a fire-and-forget event --
+        // `Self::open_conflict_dialog_deferred` is the one place that
+        // either opens the dialog immediately (setting
+        // `pending_conflict_focus` for `Self::render` to drain) or, if
+        // one is already open, queues this request in
+        // `pending_conflict_requests` instead.
+        cx.spawn(async move |this, cx| {
+            while let Some(request) = conflict_request_rx.recv().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.open_conflict_dialog_deferred(request, cx);
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         // The queue's event-consumer loop: drains every job's `JobEvent`s
         // in one `this.update` per event (not one per handled variant --
         // see the loop body's own comment) and always ends with
@@ -821,6 +913,11 @@ impl Workspace {
             job_progress: HashMap::new(),
             operation_manager: None,
             operation_manager_previous_focus: None,
+            conflict_dialog: None,
+            conflict_dialog_previous_focus: None,
+            pending_conflict_focus: None,
+            pending_conflict_requests: std::collections::VecDeque::new(),
+            conflict_resolver,
             theme: None,
         }
     }
@@ -1388,6 +1485,18 @@ impl Workspace {
         let tokio_handle = self.tokio_handle.clone();
         let queue = self.queue.clone();
         let state_dir = self.state_dir.clone();
+        // T-5.2.3: the live, interactive resolver replaces T-5.2.1's
+        // original always-`None` placeholder -- every conflict this job
+        // hits that neither a pre-resolved `Step` nor an already-
+        // established "apply to all" answer already covers now gets a
+        // real, live prompt instead of silently falling back to
+        // `default_conflict`. `Arc<InteractiveConflictResolver>` ->
+        // `Arc<dyn ConflictResolver>` is an unsized coercion, not a clone
+        // of the resolver's own state -- every dialog this workspace
+        // opens shares the exact same resolver instance (and therefore
+        // the same request channel back to this workspace's own consumer
+        // loop).
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
         let state = cx.new(|cx| {
             CopyMoveDialogState::new(
                 kind,
@@ -1397,6 +1506,7 @@ impl Workspace {
                 tokio_handle,
                 queue,
                 state_dir,
+                conflict_resolver,
                 window,
                 cx,
             )
@@ -1483,6 +1593,78 @@ impl Workspace {
     pub(crate) fn close_operation_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.operation_manager = None;
         if let Some(handle) = self.operation_manager_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Constructs a fresh [`ConflictDialogState`] entity for `request` and
+    /// stores it as `self.conflict_dialog` -- the one piece of
+    /// construction logic [`Self::open_conflict_dialog_deferred`] (no live
+    /// `Window`) and [`Self::close_conflict_dialog`] (advancing to the
+    /// next queued conflict, which *does* have one) both need. Doesn't
+    /// touch focus itself -- callers differ on whether they can move focus
+    /// immediately (a live `Window`) or must defer it
+    /// (`pending_conflict_focus`), so that's left to them.
+    fn spawn_conflict_dialog_entity(
+        &mut self,
+        request: ConflictRequest,
+        cx: &mut Context<Self>,
+    ) -> Entity<ConflictDialogState> {
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let state = cx.new(|cx| {
+            ConflictDialogState::new(
+                request.prompt,
+                request.response_tx,
+                workspace,
+                tokio_handle,
+                cx,
+            )
+        });
+        self.conflict_dialog = Some(state.clone());
+        state
+    }
+
+    /// T-5.2.3: the sole handler for the conflict-request consumer loop
+    /// (`Self::new`) -- called with no live `Window` (see that field's own
+    /// doc comment on `pending_conflict_focus`). Opens `request`
+    /// immediately if no conflict dialog is already showing (deferring
+    /// the actual `window.focus` call to `Self::render`'s next pass via
+    /// `pending_conflict_focus`), or queues it in
+    /// `pending_conflict_requests` otherwise -- see that field's own doc
+    /// comment for why a second, concurrent conflict can't simply be
+    /// dropped.
+    fn open_conflict_dialog_deferred(&mut self, request: ConflictRequest, cx: &mut Context<Self>) {
+        if self.conflict_dialog.is_some() {
+            self.pending_conflict_requests.push_back(request);
+            cx.notify();
+            return;
+        }
+        let state = self.spawn_conflict_dialog_entity(request, cx);
+        let handle = state.read(cx).focus_handle(cx);
+        self.pending_conflict_focus = Some(handle);
+        cx.notify();
+    }
+
+    /// Closes the conflict dialog (called from [`ConflictDialogState`]
+    /// itself, once it has sent its one answer -- always has a live
+    /// `Window`, unlike the open path above). If another conflict was
+    /// already waiting (`pending_conflict_requests`), immediately opens
+    /// and focuses it -- no need to defer via `pending_conflict_focus`
+    /// here, since this call site already has a `Window`. Otherwise
+    /// restores focus to whatever had it before the *first* conflict
+    /// dialog in this burst took over (`conflict_dialog_previous_focus`,
+    /// captured by `Self::render`'s `pending_conflict_focus` drain -- see
+    /// that field's own doc comment for why capture happens there rather
+    /// than at open time).
+    pub(crate) fn close_conflict_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.conflict_dialog = None;
+        if let Some(request) = self.pending_conflict_requests.pop_front() {
+            let state = self.spawn_conflict_dialog_entity(request, cx);
+            let handle = state.read(cx).focus_handle(cx);
+            window.focus(&handle);
+        } else if let Some(handle) = self.conflict_dialog_previous_focus.take() {
             window.focus(&handle);
         }
         cx.notify();
@@ -1710,6 +1892,23 @@ impl Render for Workspace {
             window.focus(&handle);
         }
 
+        // T-5.2.3: the conflict dialog's own no-live-`Window`-at-open-time
+        // problem -- see `pending_conflict_focus`'s own doc comment. The
+        // capture of `conflict_dialog_previous_focus` happens *here*,
+        // right before focus actually moves, rather than at the original
+        // (`Window`-less) open call -- this is the first point with both
+        // a live `Window` and the guarantee that focus hasn't shifted yet.
+        // Guarded by `is_none()` so a burst of several queued conflicts
+        // (each handled via `Self::close_conflict_dialog`'s own,
+        // `Window`-having path, not this one) never overwrites the
+        // *original* previous focus with a conflict dialog's own handle.
+        if let Some(handle) = self.pending_conflict_focus.take() {
+            if self.conflict_dialog_previous_focus.is_none() {
+                self.conflict_dialog_previous_focus = window.focused(cx);
+            }
+            window.focus(&handle);
+        }
+
         // T-4.3.7 / T-5.2.1: every deferred toast queued since the last
         // render -- see `pending_notice`'s doc comment for why this is a
         // drain-everything loop rather than a single `.take()` (T-4.3.7's
@@ -1787,6 +1986,9 @@ impl Render for Workspace {
             })
             .when_some(self.operation_manager.clone(), |this, state| {
                 this.child(operation_manager_overlay(&state, cx))
+            })
+            .when_some(self.conflict_dialog.clone(), |this, state| {
+                this.child(conflict_dialog_overlay(&state, cx))
             })
     }
 }
@@ -1981,6 +2183,54 @@ fn operation_manager_overlay(
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_operation_manager(window, cx);
                 })),
+        )
+}
+
+/// T-5.2.3's conflict dialog overlay -- same `.occlude()`-backdrop/card
+/// shape as every other overlay in this crate (see
+/// `command_palette_overlay`'s own doc comment for the real regression
+/// this pattern exists to avoid), with one deliberate difference: **no
+/// `.on_mouse_down_out` close handler.** Every other overlay treats an
+/// outside click as "never mind, dismiss this" -- but a conflict dialog
+/// has no "never mind": the executor thread behind it is genuinely
+/// blocked (`InteractiveConflictResolver::resolve`'s `block_in_place`)
+/// waiting for an answer, and there is no non-answer that unblocks it.
+/// Closing without picking a policy isn't a safe no-op the way it is for
+/// every other overlay, so the option isn't offered -- the backdrop's own
+/// `.occlude()` still stops a stray click from falling through to the
+/// panel underneath (`command_palette_overlay`'s own doc comment explains
+/// why that alone matters), it just doesn't also close anything. Wider
+/// than the copy/move dialog's own card (`600px` vs `480px`): a
+/// side-by-side source/destination metadata block needs more horizontal
+/// room than a single destination path. The card sets no `key_context` of
+/// its own here, same reasoning as every sibling overlay function:
+/// `ConflictDialogState::render` already sets `"ConflictDialog"` on its
+/// own root.
+fn conflict_dialog_overlay(
+    state: &Entity<ConflictDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("conflict-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("conflict-dialog-card")
+                .occlude()
+                .w(px(600.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone()),
         )
 }
 
@@ -2522,6 +2772,23 @@ mod tests {
     use duet_widgets::table::TableDelegate as _;
     use gpui::{TestAppContext, VisualTestContext};
 
+    // T-5.2.3's own overlay-internal actions -- same reasoning as the
+    // `operation_manager` import right above: declared in
+    // `crate::conflict_dialog`, not `workspace.rs`, so they need naming
+    // explicitly (unlike `OpenOperationManager`-style actions declared
+    // right in this file).
+    use crate::conflict_dialog::{
+        ConflictAbortAll, ConflictAbortThis, ConflictAutoRenameAll, ConflictAutoRenameThis,
+        ConflictFocusNext, ConflictFocusPrev, ConflictHashDest, ConflictHashSource,
+        ConflictOverwriteAll, ConflictOverwriteIfDifferentSizeAll,
+        ConflictOverwriteIfDifferentSizeThis, ConflictOverwriteIfOlderAll,
+        ConflictOverwriteIfOlderThis, ConflictOverwriteThis, ConflictRename, ConflictSkipAll,
+        ConflictSkipThis,
+    };
+    use duet_ops::{ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope};
+    use duet_types::{EntryKind, Metadata, Timestamp};
+    use duet_widgets::input::IndentInline;
+
     use super::*;
 
     /// Serializes every test that touches `$XDG_CONFIG_HOME`/
@@ -2573,6 +2840,7 @@ mod tests {
             bind_panel_keys(cx);
             bind_copy_move_dialog_keys(cx);
             bind_operation_manager_keys(cx);
+            bind_conflict_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -4148,6 +4416,745 @@ mod tests {
                 dest_files_copied, 3,
                 "pausing and resuming must not have dropped any of the three files"
             );
+        });
+    }
+
+    // ======================================================================
+    // T-5.2.3: the live conflict dialog
+    // ======================================================================
+
+    fn sample_conflict_prompt(
+        source: VPath,
+        dest: VPath,
+        source_size: u64,
+        dest_size: u64,
+    ) -> ConflictPrompt {
+        let mut source_meta = Metadata::minimal(EntryKind::File);
+        source_meta.size = source_size;
+        source_meta.modified = Some(Timestamp::new(1_700_000_000, 0));
+        let mut dest_meta = Metadata::minimal(EntryKind::File);
+        dest_meta.size = dest_size;
+        dest_meta.modified = Some(Timestamp::new(1_600_000_000, 0));
+        ConflictPrompt {
+            step_index: 0,
+            source,
+            dest,
+            source_meta,
+            dest_meta,
+        }
+    }
+
+    /// Opens a [`ConflictDialogState`] directly against `prompt`, bypassing
+    /// the real executor/`InteractiveConflictResolver` round trip --
+    /// exactly the shape [`Workspace::spawn_conflict_dialog_entity`]
+    /// itself builds, just called from a test with a plain
+    /// `std::sync::mpsc` pair standing in for the blocked executor thread
+    /// on the other end. Used by the narrow, per-keybinding tests below,
+    /// which only care "does this key produce this `ConflictResolution`,"
+    /// not the full plan/queue/executor path a real conflict would need
+    /// (that's what the end-to-end test further down is for).
+    fn open_conflict_dialog_directly(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        prompt: ConflictPrompt,
+    ) -> (
+        Entity<ConflictDialogState>,
+        std::sync::mpsc::Receiver<ConflictResolution>,
+    ) {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let state = workspace.update_in(vcx, |ws, window, cx| {
+            let request = ConflictRequest {
+                prompt,
+                response_tx,
+            };
+            let state = ws.spawn_conflict_dialog_entity(request, cx);
+            let handle = state.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            state
+        });
+        let _ = vcx.update(|window, cx| window.draw(cx));
+        (state, response_rx)
+    }
+
+    /// Plans and enqueues a real `JobKind::Copy` job through the
+    /// workspace's own, real `conflict_resolver` (not `None`, unlike
+    /// `enqueue_slow_copy` above) -- `src`'s destination is expected to
+    /// already exist at `dst_dir`, producing a genuine conflict the
+    /// executor must live-resolve. `fs` is caller-supplied so the
+    /// concurrent-conflicts test below can inject `SlowLocalFs` the same
+    /// way `enqueue_slow_copy` does, without duplicating this whole
+    /// function just to swap the `FileSystem` impl.
+    fn enqueue_conflicting_copy(
+        tokio_handle: &tokio::runtime::Handle,
+        queue: Arc<QueueManager>,
+        resolver: Arc<dyn ConflictResolver>,
+        fs: Arc<dyn FileSystem>,
+        src: VPath,
+        dst_dir: VPath,
+        state_dir: PathBuf,
+    ) -> duet_ops::JobId {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fs_for_plan = fs.clone();
+        tokio_handle.spawn(async move {
+            let cancel = duet_ops::CancelToken::new();
+            let plan = duet_ops::plan_copy(
+                fs_for_plan.as_ref(),
+                &[src],
+                &dst_dir,
+                duet_ops::PlanOptions::default(),
+                &cancel,
+            )
+            .await
+            .expect("plan_copy over a real tempdir must succeed");
+            let id = queue.enqueue(
+                JobKind::Copy,
+                plan,
+                0,
+                fs_for_plan,
+                state_dir,
+                1,
+                Some(resolver),
+            );
+            let _ = tx.send(id);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("plan_copy + enqueue must complete quickly")
+    }
+
+    /// End-to-end: a real conflicting copy job, live-resolved through the
+    /// dialog this task built, start to finish -- enqueue -> the dialog
+    /// opens with the right prompt data -> answering `Overwrite`/`ThisOnly`
+    /// unblocks the executor thread -> the job completes with the
+    /// destination actually overwritten. This is the one test in this
+    /// module that exercises `InteractiveConflictResolver::resolve`'s real
+    /// `block_in_place` wait from inside a real executor task, not just
+    /// `conflict_dialog.rs`'s own narrower, resolver-only tests.
+    #[gpui::test]
+    fn f5_copy_with_a_real_conflict_opens_the_dialog_and_completes_via_overwrite(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            focus_left_panel(&workspace, vcx);
+
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            let source_content = b"NEW CONTENT FROM SOURCE".to_vec();
+            let dest_content = b"stale, different, older content".to_vec();
+            std::fs::write(source_dir.path().join("a.bin"), &source_content).unwrap();
+            std::fs::write(dest_dir.path().join("a.bin"), &dest_content).unwrap();
+
+            let (queue, state_dir, tokio_handle, resolver) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                    Arc::clone(&ws.conflict_resolver) as Arc<dyn ConflictResolver>,
+                )
+            });
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            let src = crate::file_table::local_vpath(&source_dir.path().join("a.bin")).unwrap();
+            let dst_dir = crate::file_table::local_vpath(dest_dir.path()).unwrap();
+            let job_id = enqueue_conflicting_copy(
+                &tokio_handle,
+                queue.clone(),
+                resolver,
+                fs,
+                src.clone(),
+                dst_dir,
+                state_dir,
+            );
+
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.conflict_dialog.is_some())
+            });
+
+            let dst = crate::file_table::local_vpath(&dest_dir.path().join("a.bin")).unwrap();
+            workspace.read_with(vcx, |ws, cx| {
+                let dialog = ws.conflict_dialog.as_ref().unwrap().read(cx);
+                let prompt = dialog.prompt();
+                assert_eq!(
+                    prompt.source, src,
+                    "the dialog must show the real source path"
+                );
+                assert_eq!(prompt.dest, dst, "the dialog must show the real dest path");
+                assert_eq!(
+                    prompt.source_meta.size,
+                    source_content.len() as u64,
+                    "the dialog must show the real source size"
+                );
+                assert_eq!(
+                    prompt.dest_meta.size,
+                    dest_content.len() as u64,
+                    "the dialog must show the real dest size"
+                );
+            });
+
+            vcx.dispatch_action(ConflictOverwriteThis);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.conflict_dialog.is_none(),
+                    "answering must close the dialog"
+                );
+            });
+
+            wait_until(vcx, |_vcx| {
+                matches!(
+                    queue.job(job_id).map(|j| j.state),
+                    Some(JobState::Terminal { .. })
+                )
+            });
+            let final_state = queue.job(job_id).map(|j| j.state.clone());
+            assert!(
+                matches!(
+                    final_state,
+                    Some(JobState::Terminal {
+                        outcome: JobOutcome::Completed,
+                        ..
+                    })
+                ),
+                "the job must complete cleanly once the conflict is answered: {final_state:?}"
+            );
+            assert_eq!(
+                std::fs::read(dest_dir.path().join("a.bin")).unwrap(),
+                source_content,
+                "Overwrite must have replaced the stale destination with the source's content"
+            );
+
+            // Focus must return to whatever had it before the dialog took
+            // over -- the left panel, per `focus_left_panel` above.
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "closing the conflict dialog must restore the previously-focused panel"
+                );
+            });
+        });
+    }
+
+    /// Two real, concurrently-running conflicting copy jobs
+    /// (`COPY_MOVE_QUEUE_MAX_CONCURRENT` allows both to run at once):
+    /// proves `pending_conflict_requests` genuinely holds the second
+    /// conflict while the first dialog is still open, and that answering
+    /// the first immediately opens and focuses the second (via
+    /// `Self::close_conflict_dialog`'s own reopen path) rather than
+    /// dropping it -- the concrete mechanism T-5.2.3's "10k-conflict run
+    /// is survivable using apply-to-all" AC depends on not being
+    /// undermined by.
+    #[gpui::test]
+    fn two_concurrent_conflicts_are_both_served_not_dropped(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            focus_left_panel(&workspace, vcx);
+
+            let mut sources = Vec::new();
+            let mut dest_dirs = Vec::new();
+            let mut expected_content = Vec::new();
+            for i in 0..2 {
+                let source_dir = tempfile::tempdir().unwrap();
+                let dest_dir = tempfile::tempdir().unwrap();
+                let content = format!("source content {i}").into_bytes();
+                std::fs::write(source_dir.path().join("a.bin"), &content).unwrap();
+                std::fs::write(
+                    dest_dir.path().join("a.bin"),
+                    format!("stale dest content {i}"),
+                )
+                .unwrap();
+                sources.push((source_dir, dest_dir.path().join("a.bin")));
+                dest_dirs.push(dest_dir);
+                expected_content.push(content);
+            }
+
+            let (queue, state_dir, tokio_handle, resolver) = workspace.read_with(vcx, |ws, _| {
+                (
+                    ws.queue.clone(),
+                    ws.state_dir
+                        .clone()
+                        .expect("test env always resolves a state dir"),
+                    ws.tokio_handle.clone(),
+                    Arc::clone(&ws.conflict_resolver) as Arc<dyn ConflictResolver>,
+                )
+            });
+
+            // A generous, fixed delay on every `open_read` -- staggers
+            // both jobs' publish-time conflict detection widely enough
+            // apart from "instant" that the test can reliably observe
+            // both dialogs (open, then queued) rather than racing a
+            // conflict that resolves before the test ever gets to look.
+            let mut job_ids = Vec::new();
+            for (i, (source_dir, dest_path)) in sources.iter().enumerate() {
+                let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
+                    inner: LocalFs,
+                    delay: Duration::from_millis(400),
+                });
+                let src = crate::file_table::local_vpath(&source_dir.path().join("a.bin")).unwrap();
+                let dst_dir = crate::file_table::local_vpath(dest_dirs[i].path()).unwrap();
+                let _ = dest_path;
+                job_ids.push(enqueue_conflicting_copy(
+                    &tokio_handle,
+                    queue.clone(),
+                    resolver.clone(),
+                    fs,
+                    src,
+                    dst_dir,
+                    state_dir.clone(),
+                ));
+            }
+
+            // The first dialog opens...
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.conflict_dialog.is_some())
+            });
+            // ...and the second conflict lands in the pending queue while
+            // it's still open, rather than being dropped or silently
+            // stalling its own job forever.
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| !ws.pending_conflict_requests.is_empty())
+            });
+
+            // Answer whichever conflict is currently showing.
+            vcx.dispatch_action(ConflictOverwriteThis);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            // The queued one must now be open (and focused) too -- not
+            // still sitting unopened.
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.conflict_dialog.is_some())
+            });
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.pending_conflict_requests.is_empty(),
+                    "the second conflict must have been dequeued into `conflict_dialog`"
+                );
+            });
+            vcx.dispatch_action(ConflictOverwriteThis);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.conflict_dialog.is_none(),
+                    "both conflicts must be answered by now"
+                );
+            });
+
+            for id in &job_ids {
+                wait_until(vcx, |_vcx| {
+                    matches!(
+                        queue.job(*id).map(|j| j.state),
+                        Some(JobState::Terminal { .. })
+                    )
+                });
+            }
+            for (i, dest_dir) in dest_dirs.iter().enumerate() {
+                assert_eq!(
+                    std::fs::read(dest_dir.path().join("a.bin")).unwrap(),
+                    expected_content[i],
+                    "job {i}'s destination must have been overwritten with its own source"
+                );
+            }
+        });
+    }
+
+    // -- Keyboard-completeness: every policy, both scopes -------------------
+
+    #[gpui::test]
+    fn overwrite_key_resolves_this_only_and_all_remaining(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictOverwriteThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Overwrite);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictOverwriteAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Overwrite);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    #[gpui::test]
+    fn skip_key_resolves_this_only_and_all_remaining(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictSkipThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Skip);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictSkipAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Skip);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    /// Escape's *bubbled* path: while the rename field has focus,
+    /// `InputState`'s own "escape" binding fires its internal `Escape`
+    /// action first (its `clean_on_escape` default is `false`, so it
+    /// propagates rather than clearing the field -- see the module doc
+    /// comment's "Keybindings" section), which this dialog's root then
+    /// catches via `.on_action::<Escape>()`. Distinct code path from the
+    /// root-focused case (`KeyBinding::new("escape", ConflictSkipThis,
+    /// ...)`, already covered by `skip_key_resolves_this_only_and_all_
+    /// remaining` above) -- deserves its own test since `dispatch_action`
+    /// bypasses keystroke-to-action resolution entirely (delivering the
+    /// given action instance straight to `on_action` handlers, the same
+    /// way every other keybinding test in this module already works), so
+    /// only dispatching the actual bubbled action type exercises this
+    /// handler.
+    #[gpui::test]
+    fn escape_while_the_rename_field_has_focus_still_resolves_skip_this_only(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictRename);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |s, _| assert!(s.renaming()));
+
+            vcx.dispatch_action(duet_widgets::input::Escape);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Skip);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+            workspace.read_with(vcx, |ws, _| assert!(ws.conflict_dialog.is_none()));
+        });
+    }
+
+    #[gpui::test]
+    fn overwrite_if_older_key_resolves_this_only_and_all_remaining(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictOverwriteIfOlderThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::OverwriteIfOlder);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictOverwriteIfOlderAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::OverwriteIfOlder);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    #[gpui::test]
+    fn overwrite_if_different_size_key_resolves_this_only_and_all_remaining(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictOverwriteIfDifferentSizeThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::OverwriteIfDifferentSize);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictOverwriteIfDifferentSizeAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::OverwriteIfDifferentSize);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    #[gpui::test]
+    fn auto_rename_key_resolves_this_only_and_all_remaining(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictAutoRenameThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::AutoRename);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictAutoRenameAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::AutoRename);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    #[gpui::test]
+    fn abort_key_resolves_this_only_and_all_remaining(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt.clone());
+            vcx.dispatch_action(ConflictAbortThis);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Abort);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+
+            let (_state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictAbortAll);
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::Abort);
+            assert_eq!(resolution.scope, ConflictScope::AllRemaining);
+        });
+    }
+
+    // -- RenameTarget + Tab/Shift+Tab focus cycling --------------------------
+
+    #[gpui::test]
+    fn alt_r_shows_and_focuses_the_rename_field_defaulted_to_the_dest_name(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (state, _rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+
+            state.read_with(vcx, |s, _| assert!(!s.renaming()));
+            vcx.dispatch_action(ConflictRename);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            state.read_with(vcx, |s, _| assert!(s.renaming()));
+            let input = state.read_with(vcx, |s, _| s.rename_input().cloned().unwrap());
+            let default_value = input.read_with(vcx, |s, _| s.value().to_string());
+            assert_eq!(default_value, "a.txt");
+
+            let input_handle = input.read_with(vcx, |s, cx| s.focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    input_handle.is_focused(window),
+                    "Alt+R must focus the rename field, not just show it"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn tab_and_shift_tab_toggle_focus_between_the_root_and_the_rename_field(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (state, _rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictRename);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            let root_handle = state.read_with(vcx, |s, cx| s.focus_handle(cx));
+            let input = state.read_with(vcx, |s, _| s.rename_input().cloned().unwrap());
+            let input_handle = input.read_with(vcx, |s, cx| s.focus_handle(cx));
+
+            vcx.update(|window, _cx| assert!(input_handle.is_focused(window)));
+
+            // Tab, while the rename field has focus, bubbles as
+            // `IndentInline` (see the module doc comment's "Keybindings"
+            // section) -- dispatch that action directly rather than the
+            // dialog's own `ConflictFocusNext`, matching what a real
+            // keypress with the field focused would actually produce.
+            vcx.dispatch_action(IndentInline);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    root_handle.is_focused(window),
+                    "Tab must move focus back to the dialog root"
+                );
+            });
+
+            // From the root, `ConflictFocusNext`/`ConflictFocusPrev` (the
+            // direct bindings) move focus back onto the rename field.
+            vcx.dispatch_action(ConflictFocusPrev);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.update(|window, _cx| {
+                assert!(input_handle.is_focused(window));
+            });
+
+            vcx.dispatch_action(ConflictFocusNext);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.update(|window, _cx| {
+                assert!(root_handle.is_focused(window));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn enter_in_the_rename_field_confirms_rename_target_with_the_typed_name(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dest = VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap());
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                dest.clone(),
+                10,
+                20,
+            );
+            let (state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictRename);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            let input = state.read_with(vcx, |s, _| s.rename_input().cloned().unwrap());
+            input.update_in(vcx, |input_state, window, cx| {
+                input_state.set_value("renamed.txt", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            let resolution = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(resolution.policy, ConflictPolicy::RenameTarget);
+            assert_eq!(resolution.scope, ConflictScope::ThisOnly);
+            assert_eq!(
+                resolution.alternate,
+                Some(VPath::local(
+                    UnixPathBuf::new("/tmp/dst/renamed.txt").unwrap()
+                ))
+            );
+            workspace.read_with(vcx, |ws, _| assert!(ws.conflict_dialog.is_none()));
+        });
+    }
+
+    #[gpui::test]
+    fn enter_in_the_rename_field_with_an_invalid_name_shows_an_error_and_stays_open(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let prompt = sample_conflict_prompt(
+                VPath::local(UnixPathBuf::new("/tmp/src/a.txt").unwrap()),
+                VPath::local(UnixPathBuf::new("/tmp/dst/a.txt").unwrap()),
+                10,
+                20,
+            );
+            let (state, rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+            vcx.dispatch_action(ConflictRename);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            let input = state.read_with(vcx, |s, _| s.rename_input().cloned().unwrap());
+            input.update_in(vcx, |input_state, window, cx| {
+                input_state.set_value("", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            assert!(
+                rx.try_recv().is_err(),
+                "an invalid name must not send any resolution"
+            );
+            state.read_with(vcx, |s, _| assert!(s.rename_error().is_some()));
+            workspace.read_with(vcx, |ws, _| assert!(ws.conflict_dialog.is_some()));
+        });
+    }
+
+    // -- On-demand hashing ----------------------------------------------------
+
+    #[gpui::test]
+    fn hashing_each_side_shows_a_spinner_then_the_correct_blake3_digest(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            let source_content = b"source side content for hashing".repeat(100);
+            let dest_content = b"destination side content, different".repeat(100);
+            let source_path = source_dir.path().join("a.bin");
+            let dest_path = dest_dir.path().join("a.bin");
+            std::fs::write(&source_path, &source_content).unwrap();
+            std::fs::write(&dest_path, &dest_content).unwrap();
+
+            let source_vpath = crate::file_table::local_vpath(&source_path).unwrap();
+            let dest_vpath = crate::file_table::local_vpath(&dest_path).unwrap();
+            let prompt = sample_conflict_prompt(
+                source_vpath,
+                dest_vpath,
+                source_content.len() as u64,
+                dest_content.len() as u64,
+            );
+            let (state, _rx) = open_conflict_dialog_directly(&workspace, vcx, prompt);
+
+            state.read_with(vcx, |s, _| {
+                assert!(s.source_hash_digest().is_none());
+            });
+
+            // `TestAppContext::dispatch_action` (what `vcx.dispatch_action`
+            // calls) runs a `background_executor.run_until_parked()` of
+            // its own right after dispatching -- for a file this small,
+            // that's enough to let the whole hash round trip finish before
+            // this call even returns, so checking for "still pending"
+            // afterward would be asserting on a race that's already lost.
+            // `window.dispatch_action` directly (the raw, `Window`-level
+            // call `vcx.dispatch_action` itself wraps) queues the action
+            // as a deferred effect that flushes when *this* `vcx.update`
+            // call returns -- `start_hash`'s synchronous `HashState::
+            // Hashing` write happens then, but nothing has forced the
+            // background executor to make progress yet, so the spinner
+            // state is genuinely observable right here.
+            vcx.update(|window, cx| {
+                window.dispatch_action(Box::new(ConflictHashSource), cx);
+            });
+            state.read_with(vcx, |s, _| assert!(s.source_hash_is_pending()));
+
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| s.source_hash_digest().is_some())
+            });
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.source_hash_digest(), Some(blake3::hash(&source_content)));
+            });
+
+            vcx.dispatch_action(ConflictHashDest);
+            wait_until(vcx, |vcx| {
+                state.read_with(vcx, |s, _| s.dest_hash_digest().is_some())
+            });
+            state.read_with(vcx, |s, _| {
+                assert_eq!(s.dest_hash_digest(), Some(blake3::hash(&dest_content)));
+            });
         });
     }
 }

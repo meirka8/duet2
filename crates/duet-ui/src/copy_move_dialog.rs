@@ -89,24 +89,29 @@
 //!
 //! # What this dialog deliberately does not do
 //!
-//! No live per-conflict prompt (T-5.2.3) -- `resolver: None` is always
-//! passed to `enqueue`, so any conflict the dialog's own
-//! `default_conflict` choice doesn't already answer falls through to that
-//! default rather than ever pausing to ask. Only three of
-//! `ConflictPolicy`'s seven variants are reachable from this dialog's own
-//! keyboard shortcuts (`Skip`/`Overwrite`/`AutoRename`) -- the other four
-//! (`OverwriteIfOlder`, `OverwriteIfDifferentSize`, `RenameTarget`,
-//! `Abort`) aren't meaningfully choosable as a single blanket default from
-//! this dialog without a live per-conflict prompt to fall back on, which
-//! is exactly what T-5.2.3 is for.
+//! Live per-conflict prompting is *not* this dialog's own job (T-5.2.3
+//! built it as `crate::conflict_dialog::ConflictDialogState`, a separate
+//! overlay `Workspace` opens on demand) -- but as of T-5.2.3, `resolver`
+//! is no longer always `None`: `Workspace::open_copy_move_dialog` passes
+//! `Some(Arc::clone(&self.conflict_resolver))`, the one, live,
+//! UI-backed `ConflictResolver` shared by every copy/move job this
+//! workspace enqueues. This dialog's own `conflict_policy` field is still
+//! only ever set via its own three keyboard shortcuts
+//! (`Skip`/`Overwrite`/`AutoRename`, `Ctrl+1/2/3`) -- it becomes
+//! `PlanOptions::default_conflict`, the *lowest*-precedence tier
+//! (`duet_ops::executor::resolve_conflict`'s own tiering) -- but every
+//! conflict that default doesn't already resolve now reaches a real,
+//! live prompt instead of silently falling back to it. All seven
+//! `ConflictPolicy` variants are reachable this way, just not as this
+//! dialog's own blanket default.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use duet_index::DirectoryModel;
 use duet_ops::{
-    CancelToken, ConflictPolicy, JobKind, PlanOptions, PlannerError, QueueManager, plan_copy,
-    plan_move,
+    CancelToken, ConflictPolicy, ConflictResolver, JobKind, PlanOptions, PlannerError,
+    QueueManager, plan_copy, plan_move,
 };
 use duet_types::{EntryKind, VPath};
 use duet_vfs::{FileSystem, LocalFs};
@@ -202,6 +207,14 @@ pub(crate) struct CopyMoveDialogState {
     /// refuses to enqueue (with a toast, dialog left open) rather than
     /// guessing a fallback location for a job's crash-safety journal.
     state_dir: Option<PathBuf>,
+    /// T-5.2.3: the live, interactive `ConflictResolver` `Workspace`
+    /// itself owns one instance of (see that struct's own
+    /// `conflict_resolver` field) -- handed to `QueueManager::enqueue` by
+    /// `Self::confirm` so any conflict `conflict_policy` doesn't already
+    /// resolve reaches a real per-conflict prompt instead of silently
+    /// falling back to that default. See the module doc comment's "What
+    /// this dialog deliberately does not do" section.
+    conflict_resolver: Arc<dyn ConflictResolver>,
     /// Keeps `destination`'s `PressEnter` subscription alive for as long
     /// as this view exists -- dropped (and the subscription cancelled)
     /// when `Workspace` sets `copy_move_dialog` back to `None`.
@@ -218,6 +231,7 @@ impl CopyMoveDialogState {
         tokio_handle: tokio::runtime::Handle,
         queue: Arc<QueueManager>,
         state_dir: Option<PathBuf>,
+        conflict_resolver: Arc<dyn ConflictResolver>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -242,6 +256,7 @@ impl CopyMoveDialogState {
             tokio_handle,
             queue,
             state_dir,
+            conflict_resolver,
             _subscriptions,
         }
     }
@@ -395,6 +410,7 @@ impl CopyMoveDialogState {
         let queue = self.queue.clone();
         let workspace = self.workspace.clone();
         let this_entity = cx.entity();
+        let conflict_resolver = self.conflict_resolver.clone();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tokio_handle.spawn(async move {
@@ -411,9 +427,15 @@ impl CopyMoveDialogState {
                 ),
             };
             let outcome = match plan_result {
-                Ok(plan) => {
-                    Ok(queue.enqueue(kind, plan, priority, fs, state_dir, JOB_CONCURRENCY, None))
-                }
+                Ok(plan) => Ok(queue.enqueue(
+                    kind,
+                    plan,
+                    priority,
+                    fs,
+                    state_dir,
+                    JOB_CONCURRENCY,
+                    Some(conflict_resolver),
+                )),
                 Err(err) => Err(describe_planner_error(&err)),
             };
             let _ = tx.send(outcome);
