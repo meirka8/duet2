@@ -4454,6 +4454,9 @@ mod tests {
         async fn link(&self, source: &VPath, dest: &VPath) -> duet_types::Result<()> {
             self.inner.link(source, dest).await
         }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> duet_types::Result<()> {
+            self.inner.symlink(target, link_path).await
+        }
         async fn set_meta(&self, p: &VPath, m: &duet_types::MetaPatch) -> duet_types::Result<()> {
             self.inner.set_meta(p, m).await
         }

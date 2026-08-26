@@ -519,6 +519,9 @@ mod tests {
         async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
             self.inner.link(source, dest).await
         }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+            self.inner.symlink(target, link_path).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }

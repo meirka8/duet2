@@ -98,6 +98,34 @@ pub enum Step {
         dest: VPath,
         depends_on: Option<u32>,
     },
+    /// Create a symbolic link at `link_path` whose stored target is
+    /// `target` (T-5.2.7's "create symlink" user operation — see
+    /// [`crate::plan_symlink`]).
+    ///
+    /// The source/target distinction that separates this from
+    /// [`Step::Link`] directly above is worth restating at this layer,
+    /// because the field types differ and the difference is load-bearing:
+    /// `Link`'s `source` is a real [`VPath`] that must already exist,
+    /// since a hardlink is a second directory entry for one existing
+    /// inode. `Symlink`'s `target` is a plain `String` stored verbatim
+    /// inside the link, never resolved and never required to exist — a
+    /// dangling link, a relative `../sibling`, or a target outside this
+    /// backend's own path space are all ordinary things to create. See
+    /// `duet_vfs::FileSystem::symlink`'s own doc comment for the full
+    /// rationale; nothing between here and that call reinterprets
+    /// `target`.
+    ///
+    /// `depends_on`: same dependency-gating mechanism `Link`'s own field
+    /// documents — the `step_index` this creation is contingent on, so a
+    /// symlink is never created inside a directory whose `CreateDir`
+    /// failed. `None` for a standalone user-invoked "create a symlink
+    /// here" (what [`crate::plan_symlink`] emits), which has no
+    /// prerequisite step.
+    Symlink {
+        target: String,
+        link_path: VPath,
+        depends_on: Option<u32>,
+    },
     /// Apply a metadata patch to `target`. The *order* fields within `patch`
     /// are applied in (mode → xattrs/ACL/SELinux label → timestamps →
     /// ownership last, per design.md §9.3 — writing xattrs perturbs ctime,
@@ -171,6 +199,7 @@ impl Step {
             Step::Reflink { .. } => StepKind::Reflink,
             Step::Rename { .. } => StepKind::Rename,
             Step::Link { .. } => StepKind::Link,
+            Step::Symlink { .. } => StepKind::Symlink,
             Step::SetMeta { .. } => StepKind::SetMeta,
             Step::Remove { .. } => StepKind::Remove,
             Step::Verify { .. } => StepKind::Verify,
@@ -198,6 +227,7 @@ pub enum StepKind {
     Reflink,
     Rename,
     Link,
+    Symlink,
     SetMeta,
     Remove,
     Verify,

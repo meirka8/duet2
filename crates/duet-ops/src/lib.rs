@@ -29,6 +29,14 @@
 //!   [`mover::plan_move`] reused wholesale, targeting a caller-supplied
 //!   trash directory — the full freedesktop trash spec itself is
 //!   T-5.3.1/T-5.3.2's later, separate scope.
+//! - [`creators`] — T-5.2.7's four "create one thing" planners
+//!   ([`creators::plan_mkdir`], [`creators::plan_rename_in_place`],
+//!   [`creators::plan_symlink`], [`creators::plan_hardlink`]): the
+//!   backing jobs for F7, Shift+F6, and the symlink/hardlink dialogs.
+//!   Deliberately the smallest planners here — no walk, no totals worth
+//!   computing — but still real journaled jobs, so a `mkdir` gets the same
+//!   off-UI-thread execution, crash evidence, and conflict engine a copy
+//!   does. See its own module doc comment.
 //! - [`executor`] — T-5.1.3: runs a `Plan`'s steps against a `FileSystem`,
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
@@ -60,6 +68,7 @@
 //!   of that proof this task covers versus leaves to T-10.2.1.
 
 mod conflict;
+mod creators;
 mod deleter;
 mod event;
 mod executor;
@@ -74,6 +83,7 @@ mod step;
 pub use conflict::{
     ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
 };
+pub use creators::{plan_hardlink, plan_mkdir, plan_rename_in_place, plan_symlink};
 pub use deleter::{DeleteMode, plan_delete};
 pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
