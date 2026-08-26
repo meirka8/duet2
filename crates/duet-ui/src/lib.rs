@@ -20,6 +20,7 @@
 mod command_palette;
 mod conflict_dialog;
 mod copy_move_dialog;
+mod delete_dialog;
 pub mod file_table;
 mod function_bar;
 mod hotlist;

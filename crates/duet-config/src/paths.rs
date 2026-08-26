@@ -51,6 +51,42 @@ pub fn duet_state_dir() -> Result<PathBuf> {
     Ok(xdg_state_home()?.join("duet"))
 }
 
+/// Resolves `$XDG_DATA_HOME`, falling back to `$HOME/.local/share` per the
+/// XDG Base Directory Specification. Data (the trash, per the freedesktop
+/// trash spec) is neither user-editable config nor throwaway state, so it
+/// lives in its own tree alongside [`xdg_config_home`]/[`xdg_state_home`].
+pub fn xdg_data_home() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join(".local").join("share"));
+    }
+    Err(ConfigError::NoDataDir)
+}
+
+/// `~/.local/share/Trash/files` (or `$XDG_DATA_HOME/Trash/files`) -- where
+/// T-5.2.6's trash-mode delete moves its targets.
+///
+/// **A deliberately minimal placeholder, not the freedesktop trash spec.**
+/// design.md §9.10/FR-CFG-07's full implementation -- `.trashinfo` sidecars
+/// recording each item's original path and deletion time, `$topdir/
+/// .Trash-$uid` for targets on other mounts, and a browsable/restorable
+/// trash view -- is T-5.3.1's own, later scope. This function does none of
+/// that; it only answers "which directory does a trashed file move into,"
+/// which is all `duet_ops::DeleteMode::Trash` needs (see
+/// `duet_ops::deleter`'s own module doc comment for why "trash" is just
+/// `plan_move` into a directory at that layer).
+///
+/// Nothing built on this needs undoing or migrating when T-5.3.1 lands:
+/// this is the *same* final location the real spec-compliant
+/// implementation uses for a home-filesystem delete. T-5.3.1 layers the
+/// sidecar metadata and the other-mount cases on top of this destination
+/// rather than replacing it.
+pub fn trash_files_dir() -> Result<PathBuf> {
+    Ok(xdg_data_home()?.join("Trash").join("files"))
+}
+
 /// `~/.local/state/duet/session.json` -- panes, tabs, cwds (design.md §10).
 pub fn session_path() -> Result<PathBuf> {
     Ok(duet_state_dir()?.join("session.json"))
@@ -159,6 +195,61 @@ mod tests {
                 assert_eq!(
                     xdg_state_home().unwrap(),
                     PathBuf::from("/tmp/home-fallback/.local/state")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xdg_data_home_prefers_explicit_var() {
+        temp_env(
+            &[
+                ("XDG_DATA_HOME", Some("/tmp/xdg-data-explicit")),
+                ("HOME", Some("/tmp/home-fallback")),
+            ],
+            || {
+                assert_eq!(
+                    xdg_data_home().unwrap(),
+                    PathBuf::from("/tmp/xdg-data-explicit")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xdg_data_home_falls_back_to_home_dot_local_share() {
+        temp_env(
+            &[
+                ("XDG_DATA_HOME", None),
+                ("HOME", Some("/tmp/home-fallback")),
+            ],
+            || {
+                assert_eq!(
+                    xdg_data_home().unwrap(),
+                    PathBuf::from("/tmp/home-fallback/.local/share")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn xdg_data_home_errors_when_neither_var_is_set() {
+        temp_env(&[("XDG_DATA_HOME", None), ("HOME", None)], || {
+            assert!(matches!(xdg_data_home(), Err(ConfigError::NoDataDir)));
+        });
+    }
+
+    #[test]
+    fn trash_files_dir_is_under_xdg_data_home() {
+        temp_env(
+            &[
+                ("XDG_DATA_HOME", Some("/tmp/xdg-data-explicit")),
+                ("HOME", None),
+            ],
+            || {
+                assert_eq!(
+                    trash_files_dir().unwrap(),
+                    PathBuf::from("/tmp/xdg-data-explicit/Trash/files")
                 );
             },
         );
