@@ -431,28 +431,50 @@ const ETA_EWMA_ALPHA: f64 = 0.3;
 /// A single decaying-EMA rate estimate, in units-per-second, folded from
 /// successive 100ms-tick deltas. `update`'s three-way split (fresh
 /// instantaneous rate on a nonzero delta; decay the existing rate on a
-/// zero delta while `active`; hold it exactly steady on a zero delta while
-/// inactive) is the one place this decision is made -- shared by
+/// zero delta when `decay_when_idle`; hold it exactly steady on a zero
+/// delta otherwise) is the one place this decision is made -- shared by
 /// [`EtaEstimator`]'s two per-regime rates (files/sec and bytes/sec) and
 /// [`spawn_progress_sampler`]'s own combined displayed-throughput rate
-/// (bytes/sec across both regimes), so "what does a zero-delta tick mean"
-/// can never drift between the ETA calculation and what's shown on screen.
-/// See `EtaEstimator::sample`'s own doc comment for the full rationale
-/// behind the active/inactive split.
+/// (bytes/sec across both regimes), so the *mechanism* (an EWMA that can
+/// decay or hold) never drifts between the ETA calculation and what's
+/// shown on screen -- but the two callers deliberately choose opposite
+/// policies for what a zero-delta tick means while genuinely idle:
+///
+/// - `EtaEstimator::sample` passes `small_active`/`large_active` --
+///   decay only while a copy of that regime is actually mid-flight,
+///   hold steady during a real barrier pause (no copy of that regime
+///   running at all). See that function's own doc comment for why: an
+///   ETA that decayed to near-zero during an ordinary `SetMeta`/
+///   `Verify` pause would spike back up the instant real copying
+///   resumes, which is worse than a frozen number for a moment.
+/// - [`spawn_progress_sampler`]'s own `throughput_rate` passes a bare
+///   `true`, unconditionally -- a zero-delta tick always decays the
+///   *displayed speed*, active or not. Confirmed via a real
+///   reproduction (a genuine multi-gigabyte multi-file copy, real
+///   disk): once every `CopyFile`/`Reflink` step in a job finishes and
+///   it moves into barrier steps, the previous `small_active ||
+///   large_active`-gated version held the last real rate frozen for
+///   the *entire* barrier phase -- 15+ real seconds in that
+///   reproduction -- displaying e.g. "195 MB/s" while zero bytes were
+///   moving. Unlike the ETA (a single number that's fine to leave
+///   momentarily stale), a speed reading that says "actively
+///   transferring at X MB/s" while nothing is transferring is simply
+///   wrong, not just imprecise -- so this rate always trends towards
+///   zero once real progress stops, regardless of why.
 #[derive(Debug, Default, Clone, Copy)]
 struct RateEma {
     ema: Option<f64>,
 }
 
 impl RateEma {
-    fn update(&mut self, delta: u64, active: bool) {
+    fn update(&mut self, delta: u64, decay_when_idle: bool) {
         if delta > 0 {
             let instant_rate = delta as f64 * 10.0; // per-100ms -> per-second
             self.ema = Some(match self.ema {
                 None => instant_rate,
                 Some(prev) => ETA_EWMA_ALPHA * instant_rate + (1.0 - ETA_EWMA_ALPHA) * prev,
             });
-        } else if active {
+        } else if decay_when_idle {
             self.ema = self.ema.map(|prev| (1.0 - ETA_EWMA_ALPHA) * prev);
         }
     }
@@ -2265,13 +2287,14 @@ fn spawn_progress_sampler(
         let mut eta = EtaEstimator::new(total_small_files, total_large_bytes);
         // The *displayed* throughput number, smoothed by the same `RateEma`
         // `EtaEstimator`'s own two per-regime rates use -- see `RateEma`'s
-        // own doc comment for why sharing it matters. Driven by combined
-        // `bytes_done` (both regimes together, matching what's actually
-        // shown as "bytes done") and "is either regime genuinely active
-        // right now," not by either regime's rate alone: a job with both
-        // small and large files in flight should show one honest combined
-        // speed, not one regime's rate silently standing in for the whole
-        // thing.
+        // own doc comment for why sharing the mechanism matters, and for
+        // why this call site always passes `decay_when_idle = true`
+        // (unlike `EtaEstimator`'s own per-regime rates): driven by
+        // combined `bytes_done` (both regimes together, matching what's
+        // actually shown as "bytes done"), this rate must trend towards
+        // zero the moment real progress stops, for any reason, so the
+        // speed reading never claims an idle job is still transferring
+        // data.
         let mut throughput_rate = RateEma::default();
         loop {
             interval.tick().await;
@@ -2283,7 +2306,9 @@ fn spawn_progress_sampler(
             let large_active = counters.large_active.load(Ordering::Relaxed) > 0;
             let bytes_delta = bytes_done.saturating_sub(last_bytes);
             last_bytes = bytes_done;
-            throughput_rate.update(bytes_delta, small_active || large_active);
+            // Always decay on a zero-delta tick, active or not -- see
+            // `throughput_rate`'s own doc comment above and `RateEma`'s.
+            throughput_rate.update(bytes_delta, true);
             let throughput = throughput_rate.rate().unwrap_or(0.0).round() as u64;
             let eta_secs = eta.sample(
                 small_files_done,
@@ -3991,24 +4016,188 @@ mod tests {
         );
     }
 
-    /// The inactive-regime twin: once the copy genuinely stops (job moves
-    /// on to a barrier step, or finishes), the displayed rate must stop
-    /// being fed at all -- neither climbing nor being force-decayed to 0 --
-    /// matching `RateEma::update`'s own documented active/inactive split.
+    /// Regression test for a live-UAT report found testing T-5.2.3: once a
+    /// job's last `CopyFile`/`Reflink` step finished and it moved into
+    /// barrier steps (`SetMeta` et al.), the displayed throughput stayed
+    /// frozen at the last real rate -- 15+ real seconds, in the
+    /// reproduction that found this -- instead of trending toward zero,
+    /// showing e.g. "195 MB/s" while nothing was transferring. This is
+    /// deliberately the *opposite* assertion of the old (now-wrong) test
+    /// this replaced, which checked that the displayed rate held exactly
+    /// steady once inactive -- correct for `EtaEstimator`'s own per-regime
+    /// rates (see `eta_holds_steady_across_zero_delta_ticks_while_the_
+    /// regime_is_inactive`, unaffected by this fix), wrong for what's
+    /// shown on screen as "current speed." `spawn_progress_sampler`'s own
+    /// `throughput_rate.update(bytes_delta, true)` call is the fix --
+    /// `decay_when_idle` is always `true` there, so this test exercises
+    /// exactly that call shape directly against `RateEma`.
     #[test]
-    fn displayed_throughput_holds_steady_once_the_regime_goes_inactive() {
+    fn displayed_throughput_decays_towards_zero_once_the_copy_goes_idle() {
         let mut rate = RateEma::default();
         rate.update(64 * 1024 * 1024, true);
         let warm = rate.rate().expect("a real burst must produce a real rate");
 
-        for _ in 0..5 {
-            rate.update(0, false);
+        let mut last = warm;
+        let mut saw_a_decrease = false;
+        for _ in 0..20 {
+            rate.update(0, true);
+            let current = rate.rate().unwrap_or(0.0);
+            if current < last {
+                saw_a_decrease = true;
+            }
+            last = current;
         }
-        assert_eq!(
-            rate.rate(),
-            Some(warm),
-            "displayed throughput moved after the regime went inactive -- it must hold exactly \
-             steady, matching EtaEstimator's own barrier-pause behavior"
+        assert!(
+            saw_a_decrease,
+            "displayed throughput never decreased across 20 idle ticks -- it looks frozen at \
+             the last real rate ({warm}), exactly the reported 'stuck at a stale nonzero speed \
+             during a barrier pause' bug"
+        );
+        // After 20 ticks of continuous 0.7x decay from a real rate, the
+        // value must have become negligible, not just "a little lower."
+        assert!(
+            last < warm * 0.01,
+            "displayed throughput only decayed to {last} after 20 idle ticks (started at \
+             {warm}) -- expected it to have trended to near zero by now"
+        );
+    }
+
+    /// The real, end-to-end shape of the bug above: a genuine `execute()`
+    /// run (not a synthetic `RateEma` sequence) where the one `CopyFile`
+    /// step finishes quickly, then a deliberately slow `set_meta` (a
+    /// small `LocalFs`-delegating wrapper, real I/O otherwise) holds the
+    /// job in its `SetMeta` barrier step for several real sampler ticks
+    /// with zero bytes moving. Asserts the *last* `Progress` sample
+    /// observed before the job finishes reports a throughput close to
+    /// zero, not the real mid-copy rate frozen in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn throughput_trends_to_zero_during_a_slow_barrier_step_not_stuck_at_the_last_rate() {
+        struct SlowSetMetaFs {
+            inner: LocalFs,
+            delay: Duration,
+        }
+        #[async_trait::async_trait]
+        impl FileSystem for SlowSetMetaFs {
+            fn scheme(&self) -> &'static str {
+                self.inner.scheme()
+            }
+            fn caps(&self) -> duet_types::Caps {
+                self.inner.caps()
+            }
+            fn read_dir(
+                &self,
+                p: &VPath,
+                opts: duet_vfs::ListOpts,
+            ) -> futures_util::stream::BoxStream<'_, Result<Vec<duet_vfs::DirEntry>>> {
+                self.inner.read_dir(p, opts)
+            }
+            async fn stat(&self, p: &VPath, follow: bool) -> Result<duet_types::Metadata> {
+                self.inner.stat(p, follow).await
+            }
+            async fn volume_stats(&self, p: &VPath) -> Result<duet_vfs::VolumeStats> {
+                self.inner.volume_stats(p).await
+            }
+            async fn open_read(&self, p: &VPath) -> Result<Box<dyn duet_vfs::AsyncReadSeek>> {
+                self.inner.open_read(p).await
+            }
+            async fn open_write(
+                &self,
+                p: &VPath,
+                o: WriteOpts,
+            ) -> Result<Box<dyn duet_vfs::AsyncWriteCommit>> {
+                self.inner.open_write(p, o).await
+            }
+            async fn create_dir(&self, p: &VPath, mode: Option<Mode>) -> Result<()> {
+                self.inner.create_dir(p, mode).await
+            }
+            async fn remove(&self, p: &VPath, kind: RemoveKind) -> Result<()> {
+                self.inner.remove(p, kind).await
+            }
+            async fn rename(&self, from: &VPath, to: &VPath, flags: RenameFlags) -> Result<()> {
+                self.inner.rename(from, to, flags).await
+            }
+            async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
+                self.inner.link(source, dest).await
+            }
+            async fn set_meta(&self, p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
+                tokio::time::sleep(self.delay).await;
+                self.inner.set_meta(p, m).await
+            }
+            fn watch(
+                &self,
+                p: &VPath,
+            ) -> Result<futures_util::stream::BoxStream<'_, duet_vfs::ChangeEvent>> {
+                self.inner.watch(p)
+            }
+            async fn server_side_copy(
+                &self,
+                from: &VPath,
+                to: &VPath,
+                on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
+            ) -> Result<duet_vfs::CopyOutcome> {
+                self.inner.server_side_copy(from, to, on_progress).await
+            }
+        }
+
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        // 48 MiB: real accelerated-copy time on tmpfs is well under 100ms,
+        // so essentially all the observed samples fall inside the
+        // deliberately slow `set_meta` window below, not the copy itself.
+        std::fs::write(src.path().join("f.bin"), vec![9u8; 48 * 1024 * 1024]).unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(SlowSetMetaFs {
+            inner: LocalFs,
+            delay: Duration::from_millis(900),
+        });
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        let journal = Journal::open(JobIdT(1), state.path()).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let control = ExecutionControl::new();
+        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 1, tx, control, None));
+
+        let mut throughput_samples: Vec<u64> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                JobEvent::Progress { snapshot, .. } => {
+                    throughput_samples.push(snapshot.throughput_bytes_per_sec);
+                }
+                JobEvent::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        let report = handle.await.expect("executor task panicked");
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        eprintln!(
+            "throughput_trends_to_zero_during_a_slow_barrier_step_not_stuck_at_the_last_rate: \
+             {throughput_samples:?}"
+        );
+        let peak = throughput_samples.iter().copied().max().unwrap_or(0);
+        assert!(
+            peak > 0,
+            "test setup bug: never observed any real throughput at all: {throughput_samples:?}"
+        );
+        let last = *throughput_samples
+            .last()
+            .expect("at least one Progress sample must have landed during a 900ms barrier step");
+        assert!(
+            last < peak / 10,
+            "the last observed sample ({last} B/s) is still within 10% of the peak rate \
+             observed during the copy itself ({peak} B/s) -- looks stuck at the old rate \
+             instead of trending to zero during the slow set_meta barrier step. Samples: \
+             {throughput_samples:?}"
         );
     }
 
