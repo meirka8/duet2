@@ -100,6 +100,13 @@ impl Plan {
                     totals.files += 1;
                     totals.hardlinks_preserved += 1;
                 }
+                // A `Symlink` step does produce a new file-shaped
+                // destination entry, so it counts toward `files` exactly
+                // as `Link` does -- but never toward
+                // `hardlinks_preserved`, which specifically counts
+                // T-5.1.7's inode-dedup wins and has nothing to do with
+                // symbolic links.
+                StepKind::Symlink => totals.files += 1,
                 StepKind::Rename | StepKind::SetMeta | StepKind::Remove | StepKind::Verify => {}
             }
             totals.bytes += step.planned_bytes();

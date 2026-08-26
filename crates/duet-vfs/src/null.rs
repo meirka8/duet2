@@ -77,6 +77,15 @@ impl FileSystem for NullFs {
         Err(not_found(source))
     }
 
+    /// Overridden rather than left to the trait's own default body (which
+    /// would report `Fatal`), because this type's whole purpose is to
+    /// demonstrate the trait is implementable method-by-method — and
+    /// `NotFound` at `link_path` is the answer consistent with every other
+    /// method here.
+    async fn symlink(&self, _target: &str, link_path: &VPath) -> Result<()> {
+        Err(not_found(link_path))
+    }
+
     async fn set_meta(&self, p: &VPath, _m: &MetaPatch) -> Result<()> {
         Err(not_found(p))
     }

@@ -39,7 +39,8 @@
 //! `plan.steps` is walked in order. Consecutive `CopyFile`/`Reflink` steps
 //! are batched and drained through a [`tokio::sync::Semaphore`]-bounded
 //! pool of up to `concurrency` concurrently spawned tasks; any other step
-//! kind (`CreateDir`, `Rename`, `Link`, `SetMeta`, `Remove`) acts as a
+//! kind (`CreateDir`, `Rename`, `Link`, `Symlink`, `SetMeta`, `Remove`)
+//! acts as a
 //! barrier — it always runs alone, after every step before it (including
 //! the rest of its own batch) has fully completed, and nothing after it
 //! starts until it has. This is deliberately simpler than a full
@@ -67,10 +68,11 @@
 //!
 //! # Conflict resolution (T-5.1.9)
 //!
-//! `CreateDir`, `CopyFile`/`Reflink`, and `Rename` are the three step kinds
-//! that ever produce or replace a destination path — the only ones a real
-//! conflict (`ErrorKind::Conflict` from the relevant mutating call) can
-//! happen to. [`resolve_conflict`] implements design.md §9.3's tiering,
+//! `CreateDir`, `CopyFile`/`Reflink`, `Rename`, `Link`, and `Symlink` are
+//! the step kinds that ever produce or replace a destination path — the
+//! only ones a real conflict (`ErrorKind::Conflict` from the relevant
+//! mutating call) can happen to. [`resolve_conflict`] implements
+//! design.md §9.3's tiering,
 //! highest precedence first: a `Step`'s own pre-resolved `conflict` field →
 //! an already-established per-job "apply to all" answer
 //! (`ExecutorContext::sticky_conflict`, constructed fresh inside every
@@ -1078,6 +1080,7 @@ fn step_primary_path(step: &Step) -> Option<VPath> {
         | Step::Reflink { dest, .. }
         | Step::Rename { dest, .. }
         | Step::Link { dest, .. } => Some(dest.clone()),
+        Step::Symlink { link_path, .. } => Some(link_path.clone()),
         Step::SetMeta { target, .. } | Step::Remove { target, .. } => Some(target.clone()),
         Step::Verify { dest, .. } => Some(dest.clone()),
     }
@@ -1093,7 +1096,8 @@ fn step_depends_on(step: &Step) -> Option<u32> {
         Step::Remove { depends_on, .. }
         | Step::Verify { depends_on, .. }
         | Step::SetMeta { depends_on, .. }
-        | Step::Link { depends_on, .. } => *depends_on,
+        | Step::Link { depends_on, .. }
+        | Step::Symlink { depends_on, .. } => *depends_on,
         _ => None,
     }
 }
@@ -1273,6 +1277,9 @@ async fn dispatch(
         Step::SetMeta { target, patch, .. } => set_meta_step(&*ctx.fs, target, patch).await,
         Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
         Step::Link { source, dest, .. } => link_step(ctx, step_index, source, dest).await,
+        Step::Symlink {
+            target, link_path, ..
+        } => symlink_step(ctx, step_index, target, link_path).await,
         Step::Verify {
             source,
             dest,
@@ -1678,6 +1685,143 @@ async fn link_to_alternate(
     alt: &VPath,
 ) -> Result<StepAttempt> {
     match ctx.fs.link(source, alt).await {
+        Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+                step_index: 0, // overwritten by the caller
+                path: Some(alt.clone()),
+                kind: ErrorKind::Conflict,
+                message: format!("{alt} also already exists; refusing to guess another name"),
+            })))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `Step::Symlink` dispatch (T-5.2.7): `fs.symlink(target, link_path)`,
+/// going through the same seven-policy conflict engine as `CreateDir`/
+/// `Link` on a real conflict -- `Step::Symlink` carries no `conflict`
+/// field of its own (like both of those), so `pre_resolved` is always
+/// `None` here.
+///
+/// # This codebase's own judgment call: a conflict with no stat-able source
+///
+/// [`resolve_conflict`] wants a `source: &VPath` so it can build a
+/// [`ConflictPrompt`] with metadata for both sides. A symlink has no such
+/// thing: its "source" is a target *string* that is never resolved,
+/// frequently names something that doesn't exist, and may not even belong
+/// to this backend's path space (see
+/// `duet_vfs::FileSystem::symlink`'s doc comment). Stat-ing it is not
+/// merely uninformative here, it is often impossible.
+///
+/// The choice made, mirroring [`create_dir_step`]'s existing precedent for
+/// the same problem (`CreateDir` also has no source path, and already
+/// passes its `dest` in both positions): pass `link_path` as both sides.
+/// A live resolver therefore gets a real, accurate `dest_meta` and a
+/// `source_meta` that is a duplicate of it rather than a fabricated or
+/// misleading one, and [`apply_symlink_conflict_resolution`] never
+/// consults `source_meta` for a decision. Concretely, of the seven
+/// policies:
+///
+/// - `Skip`, `Overwrite`, `RenameTarget`, `AutoRename`, and `Abort` need
+///   no comparison between the two sides and work exactly as they do for
+///   every other step kind.
+/// - `OverwriteIfOlder` and `OverwriteIfDifferentSize` have nothing
+///   meaningful to compare (there is no source mtime or size — a symlink's
+///   own "size" is the length of its target string, which answers a
+///   question nobody asked), so they conservatively degrade to `Skip` with
+///   an explanatory reason rather than guessing. This is the same
+///   degradation, for the same reason, that
+///   [`apply_create_dir_conflict_resolution`] already applies, and it
+///   errs toward this crate's "never clobber silently" default.
+///
+/// The rejected alternative was synthesising a `Metadata` for the target
+/// string; it would make the two comparison policies *appear* to work
+/// while comparing a fiction, which is worse than plainly declining.
+async fn symlink_step(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    target: &str,
+    link_path: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.symlink(target, link_path).await {
+        Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
+        Err(e) if e.kind() == ErrorKind::Conflict => {
+            let resolution = resolve_conflict(ctx, step_index, None, link_path, link_path).await?;
+            apply_symlink_conflict_resolution(ctx, resolution, target, link_path).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn apply_symlink_conflict_resolution(
+    ctx: &ExecutorContext,
+    resolution: ConflictResolution,
+    target: &str,
+    link_path: &VPath,
+) -> Result<StepAttempt> {
+    match resolution.policy {
+        ConflictPolicy::Skip => Ok(skip_attempt(link_path, "skip")),
+        ConflictPolicy::Abort => {
+            ctx.control.cancel();
+            Ok(skip_attempt(
+                link_path,
+                "abort -- user chose to stop the job at this conflict",
+            ))
+        }
+        ConflictPolicy::Overwrite => replace_symlink(ctx, target, link_path).await,
+        // See this function's caller's doc comment for why these two
+        // degrade instead of comparing.
+        ConflictPolicy::OverwriteIfOlder | ConflictPolicy::OverwriteIfDifferentSize => {
+            Ok(skip_attempt(
+                link_path,
+                "a symlink's target is a string, not a stat-able source to compare mtime/size against",
+            ))
+        }
+        ConflictPolicy::RenameTarget => match resolution.alternate {
+            Some(alt) => symlink_to_alternate(ctx, target, &alt).await,
+            None => Ok(rename_target_needs_a_name(link_path)),
+        },
+        ConflictPolicy::AutoRename => {
+            let alt = auto_rename_target(ctx, link_path).await?;
+            symlink_to_alternate(ctx, target, &alt).await
+        }
+    }
+}
+
+/// Forces `link_path` to be replaced with a symlink to `target`. Like
+/// [`replace_link`], there is no atomic "symlink-over-destination"
+/// primitive, so the existing entry is necessarily removed first,
+/// non-atomically.
+///
+/// `RemoveKind::File` covers the realistic cases -- a regular file, or an
+/// existing symlink (which `unlinkat` removes as the link itself, never
+/// following it, per `duet_vfs::local`'s own `unlinkat` contract). A
+/// *directory* occupying `link_path` fails with `ErrorKind::Conflict` from
+/// `remove`, which is the honest answer: silently recursing into and
+/// deleting a directory tree to make room for a symlink is not something
+/// an `Overwrite` answer to a symlink-creation prompt can reasonably be
+/// read as authorising.
+async fn replace_symlink(
+    ctx: &ExecutorContext,
+    target: &str,
+    link_path: &VPath,
+) -> Result<StepAttempt> {
+    ctx.fs.remove(link_path, RemoveKind::File).await?;
+    ctx.fs.symlink(target, link_path).await?;
+    Ok(StepAttempt::Done(StepOutcome::Succeeded))
+}
+
+/// Creates the symlink at `alt` (an alternate, expected-to-be-free path
+/// chosen by `RenameTarget`'s resolver answer or [`auto_rename_target`]) --
+/// a second conflict here is reported as a failure rather than looped on
+/// indefinitely, mirroring [`link_to_alternate`]/[`rename_to_alternate`].
+async fn symlink_to_alternate(
+    ctx: &ExecutorContext,
+    target: &str,
+    alt: &VPath,
+) -> Result<StepAttempt> {
+    match ctx.fs.symlink(target, alt).await {
         Ok(()) => Ok(StepAttempt::Done(StepOutcome::Succeeded)),
         Err(e) if e.kind() == ErrorKind::Conflict => {
             Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
@@ -2462,6 +2606,9 @@ mod tests {
         async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
             self.inner.link(source, dest).await
         }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+            self.inner.symlink(target, link_path).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -2601,6 +2748,9 @@ mod tests {
         async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
             self.inner.link(source, dest).await
         }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+            self.inner.symlink(target, link_path).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -2703,6 +2853,9 @@ mod tests {
         async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
             self.inner.link(source, dest).await
         }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+            self.inner.symlink(target, link_path).await
+        }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
         }
@@ -2800,6 +2953,9 @@ mod tests {
         }
         async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
             self.inner.link(source, dest).await
+        }
+        async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+            self.inner.symlink(target, link_path).await
         }
         async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
             self.inner.set_meta(p, m).await
@@ -4118,6 +4274,9 @@ mod tests {
             }
             async fn link(&self, source: &VPath, dest: &VPath) -> Result<()> {
                 self.inner.link(source, dest).await
+            }
+            async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+                self.inner.symlink(target, link_path).await
             }
             async fn set_meta(&self, p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
                 tokio::time::sleep(self.delay).await;

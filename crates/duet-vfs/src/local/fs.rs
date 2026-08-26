@@ -163,6 +163,23 @@ impl FileSystem for LocalFs {
         .map_err(|e| super::pathutil::rustix_err("linkat", source, e))
     }
 
+    async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()> {
+        super::guard::assert_not_ui_thread();
+        // Only `link_path` gets resolved: `target` is stored verbatim in
+        // the link and is never a path this backend resolves (see the
+        // trait method's own doc comment). `real_path` on it would be
+        // meaningless for a relative target and actively wrong for a
+        // dangling one.
+        let link = real_path(link_path);
+        rustix::fs::symlinkat(target, CWD, &link)
+            // `link_path`, not `target`, is what the error is *about*: the
+            // creation that failed happened at `link_path`, and every
+            // errno this can produce (EEXIST/ENOENT/EACCES/ENOSPC) refers
+            // to it or its parent. Same attribution `create_dir`'s
+            // `mkdirat` mapping above uses for the path it creates.
+            .map_err(|e| super::pathutil::rustix_err("symlinkat", link_path, e))
+    }
+
     async fn set_meta(&self, p: &VPath, m: &MetaPatch) -> Result<()> {
         super::meta::set_meta(p, m)
     }
@@ -340,6 +357,79 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Conflict);
+    }
+
+    /// The defining property of `symlink` versus `link`: the target is
+    /// stored verbatim and never validated, so a *relative*, *nonexistent*
+    /// target must succeed and must round-trip byte-for-byte.
+    #[tokio::test]
+    async fn symlink_creates_a_link_pointing_at_the_given_target() {
+        let dir = TempDir::new().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+
+        fs.symlink("../nonexistent-sibling", &vp(&dir, "dangling"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dir.path().join("dangling")).unwrap(),
+            std::path::Path::new("../nonexistent-sibling"),
+            "the target must be stored exactly as given, not resolved or rewritten"
+        );
+        assert!(
+            !dir.path().join("dangling").exists(),
+            "`exists()` follows the link -- a deliberately dangling symlink is still a success"
+        );
+        assert!(dir.path().join("dangling").symlink_metadata().is_ok());
+    }
+
+    /// `lstat` semantics (`follow: false`) must report the link itself, not
+    /// whatever it points at -- the property directory listings and
+    /// `nav.follow_symlink` already depend on everywhere.
+    #[tokio::test]
+    async fn symlink_stats_as_a_symlink_without_following_it() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"target content").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let link_path = vp(&dir, "alias.txt");
+
+        fs.symlink("real.txt", &link_path).await.unwrap();
+
+        let lstat = fs.stat(&link_path, false).await.unwrap();
+        assert_eq!(lstat.kind, duet_types::EntryKind::Symlink);
+        // Sanity check the other direction: with `follow: true` the very
+        // same path resolves through to the regular file it names.
+        let stat = fs.stat(&link_path, true).await.unwrap();
+        assert_eq!(stat.kind, duet_types::EntryKind::File);
+        assert_eq!(stat.size, 14);
+    }
+
+    #[tokio::test]
+    async fn symlink_reports_conflict_for_an_existing_link_path() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("taken"), b"x").unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let err = fs
+            .symlink("whatever", &vp(&dir, "taken"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Conflict);
+    }
+
+    #[tokio::test]
+    async fn symlink_reports_not_found_when_the_parent_directory_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let err = fs
+            .symlink("whatever", &vp(&dir, "no-such-dir/link"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            err.path(),
+            Some(&vp(&dir, "no-such-dir/link")),
+            "the error must be attributed to the link path being created, not the target"
+        );
     }
 
     #[tokio::test]

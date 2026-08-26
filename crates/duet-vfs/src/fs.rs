@@ -206,6 +206,53 @@ pub trait FileSystem: Send + Sync {
     /// - `Retryable` — transient I/O.
     async fn link(&self, source: &VPath, dest: &VPath) -> Result<()>;
 
+    /// Creates a symbolic link at `link_path` whose stored target is
+    /// `target` (T-5.2.7's "create symlink" operation, `Step::Symlink`'s
+    /// only real backend). Only meaningful when `caps()` includes
+    /// `Caps::SYMLINK`.
+    ///
+    /// # `target` is a raw string, not a [`VPath`] — and deliberately so
+    ///
+    /// This is the one place in this trait where a "what does it point at"
+    /// operand is *not* a `VPath`, and the difference from
+    /// [`FileSystem::link`] directly above is the reason. `link(source,
+    /// dest)` takes two real, already-resolved paths because a hardlink is
+    /// definitionally two directory entries for one existing inode —
+    /// `source` must exist, within this backend, right now. A symlink's
+    /// target is the opposite: an arbitrary byte string stored verbatim
+    /// inside the link itself, never resolved, dereferenced, or required to
+    /// exist at creation time (`symlinkat`'s own contract). Deliberately
+    /// dangling links, relative targets like `../sibling`, and targets
+    /// naming a path that doesn't belong to this backend's path space at
+    /// all are all ordinary, valid symlinks a file manager must be able to
+    /// create. Typing `target` as `VPath` would assert a resolvability
+    /// this operation never has, so it stays `&str` and is passed through
+    /// untouched. `link_path` — the new link's own location — *is* a real
+    /// `VPath`, like every other "where do I create this" operand here.
+    ///
+    /// A backend without any symlink concept (most archive/remote backends)
+    /// should return `Err(ErrorKind::Fatal)` rather than approximating one,
+    /// mirroring [`FileSystem::link`]'s own precedent for the equivalent
+    /// case: `caps()` stays the authority a caller consults before ever
+    /// calling this, so this error path exists for a caller that skipped
+    /// that check, not as a real fallback. No default body is provided
+    /// (matching `link`, and every other capability-gated method on this
+    /// trait) precisely so each implementor is forced to make that choice
+    /// explicitly rather than `Caps::SYMLINK` and this method being able to
+    /// silently drift out of agreement with each other.
+    ///
+    /// # Errors
+    /// - `NotFound` — `link_path`'s parent directory does not exist. Note
+    ///   there is deliberately no `NotFound` for `target`: it is never
+    ///   checked, and a target that doesn't exist is a normal (dangling)
+    ///   symlink, not a failure.
+    /// - `Conflict` — `link_path` already exists.
+    /// - `Permission` — `link_path`'s parent is not writable.
+    /// - `Fatal` — `Caps::SYMLINK` absent, or any other unclassified
+    ///   failure.
+    /// - `Retryable` — transient I/O.
+    async fn symlink(&self, target: &str, link_path: &VPath) -> Result<()>;
+
     /// Applies a metadata patch to `p`. Only fields set in `m` are changed
     /// (see [`MetaPatch`]'s own doc comment); an empty patch
     /// (`MetaPatch::is_empty()`) is a valid no-op call, not an error.
