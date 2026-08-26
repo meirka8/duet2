@@ -856,6 +856,18 @@ impl Render for ConflictDialogState {
                     .flex_col()
                     .gap_px()
                     .flex_1()
+                    // Flexbox's own default (`min-width: auto`, i.e. "never
+                    // shrink below my content's intrinsic width") is what
+                    // was actually causing the overflow a long, unbroken
+                    // filename (no spaces, so no natural break point)
+                    // produced -- `WhiteSpace::Normal` (GPUI's own default,
+                    // confirmed in `gpui-0.2.2/src/style.rs`) already wraps
+                    // text, but only once the *container* is allowed to be
+                    // narrower than its content's natural width in the
+                    // first place. `min_w(0)` is that permission -- the
+                    // standard fix for this exact, common flex-child
+                    // overflow gotcha.
+                    .min_w(px(0.))
                     .child(div().font_weight(FontWeight::BOLD).child("Source"))
                     .child(div().child(source_path))
                     .child(div().child(format!("Size: {source_size}")))
@@ -874,6 +886,7 @@ impl Render for ConflictDialogState {
                     .flex_col()
                     .gap_px()
                     .flex_1()
+                    .min_w(px(0.)) // see the source column's own comment above
                     .child(div().font_weight(FontWeight::BOLD).child("Destination"))
                     .child(div().child(dest_path))
                     .child(div().child(format!("Size: {dest_size}")))
