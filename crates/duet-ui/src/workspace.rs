@@ -43,6 +43,7 @@ use crate::conflict_dialog::{
     ConflictDialogState, ConflictRequest, InteractiveConflictResolver, bind_conflict_dialog_keys,
 };
 use crate::copy_move_dialog::{CopyMoveDialogState, bind_copy_move_dialog_keys};
+use crate::delete_dialog::{DeleteDialogState, bind_delete_dialog_keys};
 use crate::file_table::{
     FileTable, FileTableSettings, MouseMode, QuickSearchMode, write_byte_count,
 };
@@ -127,6 +128,19 @@ actions!(
 // doesn't do.
 actions!(duet_workspace, [CopyDialog, MoveDialog]);
 
+// T-5.2.6's F8/Shift+F8 delete confirmation (FR-OPS-01).
+// `docs/keymap-tc.csv` rows 10-13 (`ops.delete` on both `F8` and `Delete`,
+// `ops.delete_permanent` on both `Shift+F8` and `Shift+Delete`) are all
+// "known" TC bindings, not this codebase's own defaults -- so all four are
+// bound, each pair to the same action. The `"Workspace"` scope matches
+// `CopyDialog`/`MoveDialog`'s: these open an overlay that isn't a panel's
+// or a table's concern. `Delete` is also bound (to `HotlistRemoveEntry`)
+// in the deeper `"HotlistOverlay"` context, which therefore wins whenever
+// that overlay actually holds focus -- exactly the context-scoping
+// `docs/keymap-tc.csv`'s own row 143 comment calls out as the point of
+// design.md §9.4.
+actions!(duet_workspace, [DeleteDialog, DeletePermanentDialog]);
+
 // T-5.2.2's expandable operation manager (FR-OPS-02/03, design.md §9.3).
 // `OpenOperationManager` is this codebase's own reasonable-default choice
 // -- TC itself has no single canonical keystroke for "open the background
@@ -163,6 +177,10 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("f5", CopyDialog, Some("Workspace")),
         KeyBinding::new("f6", MoveDialog, Some("Workspace")),
         KeyBinding::new("ctrl-o", OpenOperationManager, Some("Workspace")),
+        KeyBinding::new("f8", DeleteDialog, Some("Workspace")),
+        KeyBinding::new("delete", DeleteDialog, Some("Workspace")),
+        KeyBinding::new("shift-f8", DeletePermanentDialog, Some("Workspace")),
+        KeyBinding::new("shift-delete", DeletePermanentDialog, Some("Workspace")),
     ]);
 }
 
@@ -188,6 +206,7 @@ pub fn run() {
         crate::file_table::bind_file_table_keys(cx);
         bind_panel_keys(cx);
         bind_copy_move_dialog_keys(cx);
+        bind_delete_dialog_keys(cx);
         bind_operation_manager_keys(cx);
         bind_conflict_dialog_keys(cx);
 
@@ -457,6 +476,38 @@ pub struct Workspace {
     /// `close_copy_move_dialog`/`close_copy_move_dialog_deferred` -- same
     /// reasoning as `hotlist_previous_focus`.
     copy_move_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while the F8/Shift+F8 delete confirmation (T-5.2.6,
+    /// FR-OPS-01) is open -- constructed fresh on every
+    /// `open_delete_dialog` that actually decides to confirm, dropped on
+    /// close. Mirrors `copy_move_dialog`'s own field exactly; see
+    /// `crate::delete_dialog`'s module doc comment for the overlay's own
+    /// architecture. Stays `None` for the whole life of a delete run under
+    /// `confirm_delete = "never"` (and under `"non_empty_dirs"` when
+    /// nothing warned about was found) -- those paths enqueue directly.
+    delete_dialog: Option<Entity<DeleteDialogState>>,
+    /// Saved by `open_delete_dialog`, restored and cleared by
+    /// `close_delete_dialog`/`close_delete_dialog_deferred` -- same
+    /// reasoning as `copy_move_dialog_previous_focus`. Only ever set on the
+    /// path that actually shows the dialog: there is no previous focus to
+    /// restore when nothing took focus away in the first place.
+    delete_dialog_previous_focus: Option<FocusHandle>,
+    /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
+    /// `"never"`), read once at startup the same way every other
+    /// `settings.toml`-derived field in this struct is (see
+    /// `load_confirm_delete_policy`). Kept as the raw string, matching
+    /// `duet_config::Operations`'s own representation -- there is no
+    /// `duet-ui`-side enum for it and one value's worth of `match` doesn't
+    /// earn one.
+    confirm_delete: String,
+    /// The effective default for a plain F8's trash-versus-permanent
+    /// choice: `operations.delete_default == "permanent"`, *or*
+    /// `!trash.enabled` (`docs/config-schema.md`: "when `trash.enabled ==
+    /// false`, `delete_default` cannot be `trash`" -- treated here as a
+    /// defensive fallback to permanent, not an error). Irrelevant to
+    /// Shift+F8, which forces permanent regardless.
+    delete_default_permanent: bool,
+
     /// The core's Tokio runtime handle, threaded down from [`run`] into
     /// `Panel`/`FileTable` (each keeps its own clone for directory
     /// listings) -- retained here too, as of T-5.2.1, since the copy/move
@@ -640,6 +691,16 @@ impl Workspace {
                 .map(load_quick_search_idle_timeout)
                 .unwrap_or(Duration::from_millis(1200)),
         };
+        // T-5.2.6: the two `[operations]`/`[trash]` values F8 needs, read
+        // once here alongside every other `settings.toml`-derived default.
+        let confirm_delete = settings_path
+            .as_deref()
+            .map(load_confirm_delete_policy)
+            .unwrap_or_else(|| duet_config::Settings::default().operations.confirm_delete);
+        let delete_default_permanent = settings_path
+            .as_deref()
+            .map(load_delete_default_permanent)
+            .unwrap_or(false);
 
         let command_line = cx.new(|cx| {
             InputState::new(window, cx)
@@ -907,6 +968,10 @@ impl Workspace {
             hotlist_target_panel: PanelSide::Left,
             copy_move_dialog: None,
             copy_move_dialog_previous_focus: None,
+            delete_dialog: None,
+            delete_dialog_previous_focus: None,
+            confirm_delete,
+            delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
             queue,
             state_dir,
@@ -1536,6 +1601,248 @@ impl Workspace {
         cx.notify();
     }
 
+    /// F8 (`DeleteDialog`) / Shift+F8 (`DeletePermanentDialog`), T-5.2.6:
+    /// resolves what to delete from whichever panel has focus (the same
+    /// `resolve_source_names` selection-or-cursor-fallback F5/F6 use), then
+    /// applies `operations.confirm_delete`:
+    ///
+    /// - `"never"` -- no dialog at all; the job starts immediately.
+    /// - `"non_empty_dirs"` -- a dialog only if at least one directory
+    ///   target turns out to be non-empty; otherwise the job starts
+    ///   immediately, exactly like `"never"`. Empty directories and plain
+    ///   files therefore need no confirmation under this policy, which is
+    ///   the whole point of it.
+    /// - anything else (`"always"`, the shipped default) -- always a
+    ///   dialog.
+    ///
+    /// **Judgment call, disclosed:** `"always"` *also* runs the non-empty
+    /// check when there's at least one directory target, purely to
+    /// populate the warning line. It doesn't need the answer to decide
+    /// whether to show the dialog, but this task's own AC asks for a
+    /// "non-empty directory warning," and gating that on the
+    /// `"non_empty_dirs"` policy alone would leave it dead code under the
+    /// default configuration. The cost is one `getdents64` per directory
+    /// target (`delete_dialog::non_empty_directory_names` stops at the
+    /// first entry), off the UI thread.
+    ///
+    /// Unlike [`Self::open_copy_move_dialog`], which is synchronous top to
+    /// bottom, that check makes this method's tail asynchronous
+    /// (`tokio_handle.spawn` + a `oneshot`, bridged back through
+    /// `Window::spawn` so the continuation still has a live `Window` to
+    /// take focus with -- the same `window.spawn`/`update_in` dance
+    /// `crate::panel::Panel::apply_lock_state` documents). A no-op (with
+    /// an explanatory toast) if there is nothing to delete, and silently
+    /// if a dialog is already open.
+    fn open_delete_dialog(
+        &mut self,
+        permanent_forced: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_dialog.is_some() {
+            return;
+        }
+
+        let source_panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let source_table = source_panel.read(cx).active_table().clone();
+        let current_dir = source_table.read(cx).current_dir().to_path_buf();
+        let (names, dir_names) = {
+            let table_state = source_table.read(cx).state().read(cx);
+            let delegate = table_state.delegate();
+            let names = crate::copy_move_dialog::resolve_source_names(delegate);
+            // Every directory in the *already-loaded* model -- no I/O:
+            // `EntryKind` is part of the listing this panel is already
+            // showing, the same data `resolve_source_names` itself reads.
+            let model = delegate.model();
+            let dir_names: std::collections::HashSet<String> = model
+                .ordered_names()
+                .filter(|(id, _)| model.entries().kind(*id) == duet_types::EntryKind::Directory)
+                .map(|(_, name)| name.to_string())
+                .collect();
+            (names, dir_names)
+        };
+        if names.is_empty() {
+            window.push_notification(Notification::info("Nothing selected."), cx);
+            return;
+        }
+
+        let mut targets: Vec<VPath> = Vec::with_capacity(names.len());
+        let mut dir_targets: Vec<(String, VPath)> = Vec::new();
+        for name in &names {
+            let Ok(vpath) = crate::file_table::local_vpath(&current_dir.join(name)) else {
+                continue;
+            };
+            if dir_names.contains(name) {
+                dir_targets.push((name.clone(), vpath.clone()));
+            }
+            targets.push(vpath);
+        }
+        if targets.is_empty() {
+            window.push_notification(
+                Notification::warning("The selected item(s) don't have a valid path."),
+                cx,
+            );
+            return;
+        }
+
+        let permanent = permanent_forced || self.delete_default_permanent;
+        let policy = self.confirm_delete.clone();
+
+        if policy == "never" {
+            self.start_delete_job(targets, permanent, cx);
+            return;
+        }
+        if dir_targets.is_empty() {
+            if policy == "non_empty_dirs" {
+                self.start_delete_job(targets, permanent, cx);
+            } else {
+                self.show_delete_dialog(
+                    targets,
+                    permanent,
+                    permanent_forced,
+                    Vec::new(),
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tokio_handle.spawn(async move {
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            let found =
+                crate::delete_dialog::non_empty_directory_names(fs.as_ref(), &dir_targets).await;
+            let _ = tx.send(found);
+        });
+        let weak_workspace = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                // A dropped sender (the runtime shutting down mid-check)
+                // degrades to "nothing found," which under `"always"` still
+                // confirms and under `"non_empty_dirs"` still deletes --
+                // the same outcome as a genuinely empty set, and never a
+                // silently swallowed delete request.
+                let non_empty = rx.await.unwrap_or_default();
+                let _ = weak_workspace.update_in(cx, |this: &mut Workspace, window, cx| {
+                    if non_empty.is_empty() && policy == "non_empty_dirs" {
+                        this.start_delete_job(targets, permanent, cx);
+                    } else {
+                        this.show_delete_dialog(
+                            targets,
+                            permanent,
+                            permanent_forced,
+                            non_empty,
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            })
+            .detach();
+    }
+
+    /// Constructs, stores, and focuses the delete confirmation --
+    /// [`Self::open_delete_dialog`]'s one "actually show it" path,
+    /// reachable both synchronously (no directory targets to check) and
+    /// from its spawned continuation. Captures the focus to restore here
+    /// rather than in `open_delete_dialog` itself: the paths that never
+    /// show a dialog never take focus away, so they have nothing to
+    /// restore.
+    fn show_delete_dialog(
+        &mut self,
+        targets: Vec<VPath>,
+        permanent: bool,
+        permanent_forced: bool,
+        non_empty_dir_names: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.delete_dialog.is_some() {
+            return;
+        }
+        self.delete_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let state = cx.new(|cx| {
+            DeleteDialogState::new(
+                targets,
+                permanent,
+                permanent_forced,
+                non_empty_dir_names,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                window,
+                cx,
+            )
+        });
+        self.delete_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// The no-confirmation delete path (`confirm_delete = "never"`, and
+    /// `"non_empty_dirs"` with nothing to warn about): the exact same
+    /// off-UI-thread plan-and-enqueue `DeleteDialogState::confirm` runs,
+    /// through the same shared [`crate::delete_dialog::spawn_delete_job`],
+    /// just with no dialog to close afterward. Deliberately silent on
+    /// success -- `CopyMoveDialogState` doesn't toast when a job starts
+    /// either, and the status-bar tray (T-5.2.2) already shows a running
+    /// job; a failure still surfaces as a toast.
+    fn start_delete_job(&mut self, targets: Vec<VPath>, permanent: bool, cx: &mut Context<Self>) {
+        let Some(state_dir) = self.state_dir.clone() else {
+            self.push_pending_notice(
+                NoticeLevel::Error,
+                "Can't run the operation: no writable state directory found \
+                 (is $HOME/$XDG_STATE_HOME set?).",
+                cx,
+            );
+            return;
+        };
+        let rx = crate::delete_dialog::spawn_delete_job(
+            &self.tokio_handle,
+            targets,
+            permanent,
+            self.queue.clone(),
+            state_dir,
+        );
+        let workspace = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            let outcome = rx.await;
+            let _ = crate::delete_dialog::report_delete_job_outcome(outcome, &workspace, cx);
+        })
+        .detach();
+    }
+
+    /// Closes the delete confirmation (Escape, or a click outside it) and
+    /// restores keyboard focus to whatever had it before it opened.
+    /// Mirrors `close_copy_move_dialog` exactly -- always has a live
+    /// `Window`.
+    pub(crate) fn close_delete_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_dialog = None;
+        if let Some(handle) = self.delete_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// The one close path with no live `Window` --
+    /// `DeleteDialogState::confirm`'s async plan/enqueue success callback.
+    /// Mirrors `close_copy_move_dialog_deferred` exactly; see
+    /// `pending_focus_restore`'s doc comment for why the actual
+    /// `window.focus` call happens on `Self::render`'s next pass instead.
+    pub(crate) fn close_delete_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.delete_dialog = None;
+        self.pending_focus_restore = self.delete_dialog_previous_focus.take();
+        cx.notify();
+    }
+
     /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
     /// "does `parent` match either panel's already-loaded directory" half
     /// -- see that method's own doc comment for the full picture (T-5.2.1's
@@ -1968,6 +2275,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &MoveDialog, window, cx| {
                 this.open_copy_move_dialog(JobKind::Move, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DeleteDialog, window, cx| {
+                this.open_delete_dialog(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeletePermanentDialog, window, cx| {
+                this.open_delete_dialog(true, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenOperationManager, window, cx| {
                 this.open_operation_manager(window, cx);
             }))
@@ -1983,6 +2296,9 @@ impl Render for Workspace {
             })
             .when_some(self.copy_move_dialog.clone(), |this, state| {
                 this.child(copy_move_dialog_overlay(&state, cx))
+            })
+            .when_some(self.delete_dialog.clone(), |this, state| {
+                this.child(delete_dialog_overlay(&state, cx))
             })
             .when_some(self.operation_manager.clone(), |this, state| {
                 this.child(operation_manager_overlay(&state, cx))
@@ -2142,6 +2458,49 @@ fn copy_move_dialog_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_copy_move_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.6's delete confirmation overlay -- same `.occlude()`-backdrop/card
+/// shape as `copy_move_dialog_overlay` (see `command_palette_overlay`'s own
+/// doc comment for the full reasoning, including the real regression this
+/// pattern exists to avoid), including its `.on_mouse_down_out` close: an
+/// outside click is a safe "never mind" here, since nothing has been
+/// enqueued yet (unlike `conflict_dialog_overlay`, which deliberately omits
+/// it because a blocked executor thread is waiting on an answer).
+/// Narrower than the copy/move dialog's own card (`420px` vs `480px`):
+/// there's no destination path field to fit, only a title, a mode line, and
+/// at most one warning. The card sets no `key_context` of its own, same
+/// reasoning as every sibling overlay function: `DeleteDialogState::render`
+/// already sets `"DeleteDialog"` on its own root.
+fn delete_dialog_overlay(
+    state: &Entity<DeleteDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("delete-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("delete-dialog-card")
+                .occlude()
+                .w(px(420.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_delete_dialog(window, cx);
                 })),
         )
 }
@@ -2552,6 +2911,48 @@ fn load_quick_search_idle_timeout(path: &std::path::Path) -> Duration {
     Duration::from_millis(ms.clamp(200, 5000) as u64)
 }
 
+/// Reads `operations.confirm_delete` (T-5.2.6, FR-OPS-01) from
+/// `settings.toml` at `path`, same fallback tolerance as
+/// [`load_mouse_mode`]. Returned as the raw string; an unrecognized value
+/// is *not* rejected here -- `Workspace::open_delete_dialog`'s own `match`
+/// treats anything that isn't `"never"`/`"non_empty_dirs"` as `"always"`,
+/// the safest of the three (confirm rather than silently delete).
+fn load_confirm_delete_policy(path: &std::path::Path) -> String {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| settings.operations.confirm_delete)
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using the default delete-confirmation policy (settings.toml not loaded yet: {err})"
+            );
+            duet_config::Settings::default().operations.confirm_delete
+        })
+}
+
+/// Reads `operations.delete_default` (T-5.2.6, FR-OPS-01/FR-CFG-07) from
+/// `settings.toml` at `path` and folds in `trash.enabled`, same fallback
+/// tolerance as [`load_mouse_mode`]. `docs/config-schema.md` documents that
+/// "when `trash.enabled == false`, `delete_default` cannot be `trash`" --
+/// honored defensively here (that combination degrades to permanent)
+/// rather than treated as a config error: a delete must still work when
+/// someone hand-edits the two keys into disagreement.
+fn load_delete_default_permanent(path: &std::path::Path) -> bool {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| {
+            settings.operations.delete_default == "permanent" || !settings.trash.enabled
+        })
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using the default delete target (settings.toml not loaded yet: {err})"
+            );
+            let defaults = duet_config::Settings::default();
+            defaults.operations.delete_default == "permanent" || !defaults.trash.enabled
+        })
+}
+
 /// Reads `hotlist.toml`'s `entries` from `path` (T-4.3.5, FR-NAV-08).
 /// Same fallback tolerance as [`load_mouse_mode`] -- a missing file (no
 /// bookmarks saved yet, the ordinary case on first launch) or a malformed
@@ -2785,6 +3186,9 @@ mod tests {
         ConflictOverwriteIfOlderThis, ConflictOverwriteThis, ConflictRename, ConflictSkipAll,
         ConflictSkipThis,
     };
+    // T-5.2.6's own overlay-internal actions -- same reasoning as the two
+    // imports above: declared in `crate::delete_dialog`, not here.
+    use crate::delete_dialog::{CancelDelete, ConfirmDelete, ToggleTrashPermanent};
     use duet_ops::{ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope};
     use duet_types::{EntryKind, Metadata, Timestamp};
     use duet_widgets::input::IndentInline;
@@ -2812,16 +3216,44 @@ mod tests {
         cx: &mut TestAppContext,
         f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext),
     ) {
+        with_configured_workspace(cx, None, |workspace, vcx, _data_dir| f(workspace, vcx));
+    }
+
+    /// [`with_workspace`] plus two things only T-5.2.6's own tests need:
+    /// a `settings.toml` written into the temporary `$XDG_CONFIG_HOME`
+    /// *before* `Workspace::new` reads it (the delete policy/default are
+    /// loaded exactly once, at construction), and the temporary
+    /// `$XDG_DATA_HOME` handed to the closure so a trash-mode test can
+    /// assert against `duet_config::paths::trash_files_dir()`'s real
+    /// result without ever touching the machine's own
+    /// `~/.local/share/Trash`. `$XDG_DATA_HOME` is redirected for *every*
+    /// test through this helper, not just the trash ones, for the same
+    /// reason `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` already are: a test
+    /// must not be able to write into the real user's data directory even
+    /// by accident.
+    fn with_configured_workspace(
+        cx: &mut TestAppContext,
+        settings_toml: Option<&str>,
+        f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext, &Path),
+    ) {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config_dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
         // SAFETY: serialized by ENV_LOCK above; no other thread in this
         // test binary reads these specific vars concurrently.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
             std::env::set_var("XDG_STATE_HOME", state_dir.path());
+            std::env::set_var("XDG_DATA_HOME", data_dir.path());
+        }
+        if let Some(body) = settings_toml {
+            let dir = config_dir.path().join("duet");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("settings.toml"), body).unwrap();
         }
 
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
@@ -2839,6 +3271,7 @@ mod tests {
             crate::file_table::bind_file_table_keys(cx);
             bind_panel_keys(cx);
             bind_copy_move_dialog_keys(cx);
+            bind_delete_dialog_keys(cx);
             bind_operation_manager_keys(cx);
             bind_conflict_dialog_keys(cx);
         });
@@ -2851,7 +3284,7 @@ mod tests {
         });
         let workspace = workspace_cell.expect("the window-build closure always constructs one");
 
-        f(workspace, vcx);
+        f(workspace, vcx, data_dir.path());
 
         // SAFETY: still serialized by ENV_LOCK.
         unsafe {
@@ -2862,6 +3295,10 @@ mod tests {
             match prev_state {
                 Some(v) => std::env::set_var("XDG_STATE_HOME", v),
                 None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
             }
         }
     }
@@ -5156,5 +5593,483 @@ mod tests {
                 assert_eq!(s.dest_hash_digest(), Some(blake3::hash(&dest_content)));
             });
         });
+    }
+
+    // -- T-5.2.6 delete confirmation ---------------------------------------
+
+    /// A `settings.toml` body pinning exactly the three keys T-5.2.6 reads
+    /// (`operations.delete_default`, `operations.confirm_delete`,
+    /// `trash.enabled`). Every other key stays absent and therefore at its
+    /// documented default -- `duet_config::Settings`'s own
+    /// `#[serde(default)]` shape, so a partial file is a real, supported
+    /// input, not a test-only shortcut.
+    fn delete_settings(delete_default: &str, confirm_delete: &str, trash_enabled: bool) -> String {
+        format!(
+            "schema_version = 1\n\n[operations]\ndelete_default = \"{delete_default}\"\n\
+             confirm_delete = \"{confirm_delete}\"\n\n[trash]\nenabled = {trash_enabled}\n"
+        )
+    }
+
+    /// Points the left panel at `dir`, focuses it, and draws -- the shared
+    /// preamble of every delete test below (each of which then dispatches
+    /// `DeleteDialog`/`DeletePermanentDialog` with the cursor on `dir`'s
+    /// sole entry, exercising `resolve_source_names`' cursor fallback).
+    fn focus_left_panel_at(workspace: &Entity<Workspace>, vcx: &mut VisualTestContext, dir: &Path) {
+        let left_table =
+            workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+        navigate_panel_to(vcx, &left_table, dir.to_path_buf());
+        focus_left_panel(workspace, vcx);
+    }
+
+    fn open_delete_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<DeleteDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.delete_dialog.clone())
+            .expect("the delete dialog must be open by now")
+    }
+
+    #[gpui::test]
+    fn f8_opens_the_delete_dialog_in_trash_mode_by_default(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("doomed.txt"), b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+
+                state.read_with(vcx, |state, _| {
+                    assert!(
+                        !state.permanent(),
+                        "delete_default = trash with the trash enabled must start in trash mode"
+                    );
+                    assert_eq!(state.title_text(), "Move 1 item to trash?");
+                    assert_eq!(
+                        state.targets(),
+                        &[crate::file_table::local_vpath(&dir.path().join("doomed.txt")).unwrap()],
+                        "with nothing explicitly selected, the sole cursor-row entry is the target"
+                    );
+                    assert!(
+                        state.non_empty_dir_names().is_empty(),
+                        "a plain file target has no directory to warn about"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn f8_opens_the_delete_dialog_in_permanent_mode_when_configured(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("doomed.txt"), b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+
+                state.read_with(vcx, |state, _| {
+                    assert!(state.permanent());
+                    assert_eq!(state.title_text(), "Delete 1 item permanently?");
+                });
+            },
+        );
+    }
+
+    /// The most valuable delete test: real tempdirs, the real `LocalFs`,
+    /// F8 to confirm, and -- through the real off-thread `plan_delete` ->
+    /// `QueueManager::enqueue` -> `execute()` path, no shortcuts -- the
+    /// file genuinely gone from disk.
+    #[gpui::test]
+    fn confirming_a_permanent_delete_actually_removes_the_file(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("doomed.txt");
+                std::fs::write(&victim, b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let _state = open_delete_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(ConfirmDelete);
+                wait_until(vcx, |vcx| {
+                    !victim.exists() && workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_none())
+                });
+            },
+        );
+    }
+
+    /// The trash half of the same end-to-end path: the file must be gone
+    /// from where it was *and* really present under
+    /// `duet_config::paths::trash_files_dir()` -- resolved against the
+    /// temporary `$XDG_DATA_HOME` `with_configured_workspace` installs, so
+    /// this never touches the machine's own `~/.local/share/Trash`.
+    #[gpui::test]
+    fn confirming_a_trash_delete_moves_the_file_into_the_trash_directory(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("doomed.txt");
+                std::fs::write(&victim, b"trash me").unwrap();
+                let trashed = data_dir.join("Trash").join("files").join("doomed.txt");
+                assert_eq!(
+                    duet_config::paths::trash_files_dir().unwrap(),
+                    data_dir.join("Trash").join("files"),
+                    "the test's own expectation must match what the app resolves"
+                );
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let _state = open_delete_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(ConfirmDelete);
+                wait_until(vcx, |_vcx| trashed.is_file());
+                assert!(!victim.exists(), "the original must be gone, not copied");
+                assert_eq!(std::fs::read(&trashed).unwrap(), b"trash me");
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn escaping_the_delete_dialog_leaves_the_file_alone_and_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let survivor = dir.path().join("keep.txt");
+                std::fs::write(&survivor, b"still here").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let _state = open_delete_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(CancelDelete);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+
+                workspace.read_with(vcx, |ws, _| assert!(ws.delete_dialog.is_none()));
+                assert_eq!(std::fs::read(&survivor).unwrap(), b"still here");
+
+                let left_handle = workspace
+                    .read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+                vcx.update(|window, _cx| {
+                    assert!(
+                        left_handle.is_focused(window),
+                        "cancelling must restore focus to the panel the delete started from"
+                    );
+                });
+            },
+        );
+    }
+
+    /// This task's own AC clause: "Shift+Del bypasses trash with an
+    /// explicit confirmation" -- forced permanent even though
+    /// `delete_default = "trash"`, and with no way back to trash from
+    /// inside the dialog.
+    #[gpui::test]
+    fn shift_f8_forces_permanent_and_ctrl_t_cannot_undo_it(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("doomed.txt"), b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeletePermanentDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |state, _| {
+                    assert!(
+                        state.permanent(),
+                        "Shift+F8 must force permanent regardless of delete_default"
+                    );
+                });
+
+                vcx.dispatch_action(ToggleTrashPermanent);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                state.read_with(vcx, |state, _| {
+                    assert!(
+                        state.permanent(),
+                        "Ctrl+T must be a no-op once permanent was explicitly forced"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_t_toggles_trash_and_permanent_in_the_ordinary_case(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("doomed.txt"), b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |s, _| assert!(!s.permanent()));
+
+                vcx.dispatch_action(ToggleTrashPermanent);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                state.read_with(vcx, |s, _| {
+                    assert!(s.permanent());
+                    assert_eq!(s.title_text(), "Delete 1 item permanently?");
+                });
+
+                vcx.dispatch_action(ToggleTrashPermanent);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                state.read_with(vcx, |s, _| {
+                    assert!(!s.permanent());
+                    assert_eq!(s.title_text(), "Move 1 item to trash?");
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn confirm_delete_never_deletes_immediately_without_any_dialog(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "never", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("doomed.txt");
+                std::fs::write(&victim, b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                wait_until(vcx, |vcx| {
+                    assert!(
+                        workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_none()),
+                        "confirm_delete = never must never construct a dialog"
+                    );
+                    !victim.exists()
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn non_empty_dirs_policy_deletes_a_plain_file_without_confirming(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "non_empty_dirs", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("doomed.txt");
+                std::fs::write(&victim, b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                wait_until(vcx, |vcx| {
+                    assert!(
+                        workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_none()),
+                        "a plain file needs no confirmation under the non_empty_dirs policy"
+                    );
+                    !victim.exists()
+                });
+            },
+        );
+    }
+
+    /// The edge case that makes the `non_empty_dirs` policy meaningful at
+    /// all: a genuinely *empty* directory must read as empty (no false
+    /// positive) and go straight through with no dialog.
+    #[gpui::test]
+    fn non_empty_dirs_policy_deletes_an_empty_directory_without_confirming(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "non_empty_dirs", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("hollow");
+                std::fs::create_dir(&victim).unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                wait_until(vcx, |vcx| {
+                    assert!(
+                        workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_none()),
+                        "an empty directory needs no confirmation under the non_empty_dirs policy"
+                    );
+                    !victim.exists()
+                });
+            },
+        );
+    }
+
+    /// The other half of the same policy, and this task's own
+    /// "non-empty directory warning" AC clause: a directory with something
+    /// in it *does* confirm, and the warning names it.
+    #[gpui::test]
+    fn non_empty_dirs_policy_confirms_and_names_a_non_empty_directory(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("permanent", "non_empty_dirs", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("photos");
+                std::fs::create_dir(&victim).unwrap();
+                std::fs::write(victim.join("holiday.jpg"), b"jpeg").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+
+                state.read_with(vcx, |state, _| {
+                    assert_eq!(state.non_empty_dir_names(), &["photos".to_string()]);
+                    let warning = state
+                        .warning_text()
+                        .expect("a non-empty directory target must render a warning");
+                    assert!(warning.contains("photos"), "{warning}");
+                });
+                assert!(
+                    victim.exists(),
+                    "nothing may be deleted while the confirmation is still open"
+                );
+            },
+        );
+    }
+
+    /// The `"always"` policy's own disclosed behaviour (see
+    /// `Workspace::open_delete_dialog`'s doc comment): it doesn't need the
+    /// non-empty answer to decide whether to confirm, but it still
+    /// computes it so the warning isn't dead code under the shipped
+    /// default configuration.
+    #[gpui::test]
+    fn the_always_policy_still_warns_about_a_non_empty_directory(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = dir.path().join("photos");
+                std::fs::create_dir(&victim).unwrap();
+                std::fs::write(victim.join("holiday.jpg"), b"jpeg").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.dispatch_action(DeleteDialog);
+                let state = open_delete_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |state, _| {
+                    assert_eq!(state.non_empty_dir_names(), &["photos".to_string()]);
+                });
+            },
+        );
+    }
+
+    /// The one delete test driven by real keystrokes rather than
+    /// `dispatch_action`: proves `bind_workspace_keys`' own `"f8"`/
+    /// `"shift-f8"` bindings actually resolve from a focused panel (the
+    /// `"Workspace"` key context really is in the dispatch path), which a
+    /// direct action dispatch would bypass entirely. Safe to simulate here
+    /// -- the panel, not an `InputState`, holds focus, so this doesn't hit
+    /// the upstream `shape_line` debug-assert `f5_copy_end_to_end`'s own
+    /// comment documents.
+    #[gpui::test]
+    fn the_f8_and_shift_f8_keystrokes_really_open_the_dialog(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join("doomed.txt"), b"bye").unwrap();
+                focus_left_panel_at(&workspace, vcx, dir.path());
+
+                vcx.simulate_keystrokes("f8");
+                let state = open_delete_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |s, _| assert!(!s.permanent()));
+
+                vcx.dispatch_action(CancelDelete);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                workspace.read_with(vcx, |ws, _| assert!(ws.delete_dialog.is_none()));
+
+                vcx.simulate_keystrokes("shift-f8");
+                let state = open_delete_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |s, _| {
+                    assert!(
+                        s.permanent(),
+                        "Shift+F8 must reach the forced-permanent action, not plain F8's"
+                    );
+                });
+            },
+        );
+    }
+
+    // -- the two T-5.2.6 settings loaders ----------------------------------
+
+    fn write_settings(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_delete_default_permanent_reads_the_configured_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = write_settings(dir.path(), &delete_settings("trash", "always", true));
+        assert!(!load_delete_default_permanent(&trash));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let permanent = write_settings(dir2.path(), &delete_settings("permanent", "always", true));
+        assert!(load_delete_default_permanent(&permanent));
+    }
+
+    /// `docs/config-schema.md`: "when `trash.enabled == false`,
+    /// `delete_default` cannot be `trash`" -- honored as a fallback to
+    /// permanent, not as a hard error that would break deleting entirely.
+    #[test]
+    fn load_delete_default_permanent_falls_back_when_the_trash_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(dir.path(), &delete_settings("trash", "always", false));
+        assert!(load_delete_default_permanent(&path));
+    }
+
+    #[test]
+    fn load_delete_default_permanent_defaults_to_trash_with_no_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!load_delete_default_permanent(
+            &dir.path().join("absent.toml")
+        ));
+    }
+
+    #[test]
+    fn load_confirm_delete_policy_reads_the_configured_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            &delete_settings("trash", "non_empty_dirs", true),
+        );
+        assert_eq!(load_confirm_delete_policy(&path), "non_empty_dirs");
+    }
+
+    #[test]
+    fn load_confirm_delete_policy_defaults_to_always_with_no_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_confirm_delete_policy(&dir.path().join("absent.toml")),
+            "always"
+        );
     }
 }

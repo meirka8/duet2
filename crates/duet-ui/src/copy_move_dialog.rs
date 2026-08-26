@@ -172,7 +172,9 @@ pub(crate) fn bind_copy_move_dialog_keys(cx: &mut App) {
 /// this dialog has no reason to perform just to open -- `4` matches that
 /// function's own non-rotational default, a reasonable, documented
 /// placeholder pending real device detection at this call site.
-const JOB_CONCURRENCY: usize = 4;
+/// `pub(crate)` because `crate::delete_dialog` (T-5.2.6) enqueues its own
+/// jobs with the identical, identically-justified value.
+pub(crate) const JOB_CONCURRENCY: usize = 4;
 
 /// F5/F6's dialog (T-5.2.1): destination field, a narrow set of
 /// TC-standard options, and the confirm/cancel actions that hand off to
@@ -618,9 +620,11 @@ pub(crate) fn complete_against_model(
 
 /// Renders a [`PlannerError`] for a user-facing toast -- `PlannerError`
 /// itself only derives `Debug` (there's no reason for `duet-ops` to carry
-/// a `Display` impl purely for this one caller), so this is the one place
-/// that needs a readable message.
-fn describe_planner_error(err: &PlannerError) -> String {
+/// a `Display` impl purely for these callers), so this is the one place
+/// that turns one into a readable message. `pub(crate)` because
+/// `crate::delete_dialog` (T-5.2.6) surfaces `plan_delete`'s failures the
+/// same way rather than duplicating this match.
+pub(crate) fn describe_planner_error(err: &PlannerError) -> String {
     match err {
         PlannerError::Cancelled => "cancelled".to_string(),
         PlannerError::Vfs(e) => e.to_string(),

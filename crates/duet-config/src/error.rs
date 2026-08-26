@@ -105,6 +105,11 @@ pub enum ConfigError {
     #[error("could not resolve the XDG state directory: neither $XDG_STATE_HOME nor $HOME is set")]
     NoStateDir,
 
+    /// The XDG data directory could not be resolved (no `$HOME` and no
+    /// `$XDG_DATA_HOME`) -- see [`crate::paths::xdg_data_home`].
+    #[error("could not resolve the XDG data directory: neither $XDG_DATA_HOME nor $HOME is set")]
+    NoDataDir,
+
     /// `session.json`'s bytes are not valid JSON, or parsed JSON that
     /// doesn't match [`crate::session::Session`]'s shape.
     #[error("failed to parse {path} as session JSON: {source}")]
