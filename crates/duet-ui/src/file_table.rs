@@ -1466,7 +1466,7 @@ pub(crate) fn write_byte_count(out: &mut String, bytes: u64) {
 /// algorithm -- the same one S-1's spike used
 /// (`spikes/s1-virtualised-table/src/store.rs`), reused here rather than
 /// pulling in a date/time crate dependency for one display format.
-fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
+pub(crate) fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let time_of_day = secs.rem_euclid(86_400);
     let hour = (time_of_day / 3600) as u32;
@@ -1486,7 +1486,11 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
     (y, m, d, hour, minute)
 }
 
-fn write_date(out: &mut String, mtime_secs: i64) {
+/// The `YYYY-MM-DD HH:MM` formatter itself -- `pub(crate)` (T-5.2.3) so
+/// `crate::conflict_dialog`'s side-by-side metadata block can format a
+/// `Metadata::modified` timestamp the same way this table's own Date
+/// column does, rather than duplicating the format string.
+pub(crate) fn write_date(out: &mut String, mtime_secs: i64) {
     if mtime_secs == 0 {
         out.push('-');
         return;

@@ -18,6 +18,7 @@
 //! `themes/*.toml` loading with hot reload (`theme_controller`).
 
 mod command_palette;
+mod conflict_dialog;
 mod copy_move_dialog;
 pub mod file_table;
 mod function_bar;
