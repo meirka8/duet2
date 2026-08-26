@@ -1905,6 +1905,102 @@ mod tests {
     }
 
     #[gpui::test]
+    fn idle_timeout_does_not_exit_filter_mode(cx: &mut TestAppContext) {
+        // UAT: `Filter` mode is meant to be browsed once narrowed --
+        // unlike `Jump` (the previous test), it must survive indefinitely
+        // and only exit on `Escape`.
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_keystrokes("ctrl-p");
+                vcx.simulate_input("ga");
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter)
+                    );
+                });
+
+                // Far past the 1200ms default idle timeout -- several
+                // times over, to also rule out the timer firing late
+                // rather than not at all.
+                vcx.executor().advance_clock(Duration::from_millis(5000));
+                vcx.run_until_parked();
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter),
+                        "filter mode must not auto-cancel on idle timeout"
+                    );
+                });
+
+                vcx.simulate_keystrokes("escape");
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.state().read(cx).delegate().quick_search_mode(), None);
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn toggling_to_filter_mode_survives_the_jump_sessions_own_pending_timer(
+        cx: &mut TestAppContext,
+    ) {
+        // The idle timer scheduled for the *jump*-mode keystroke that
+        // started the session must not exit it once `Ctrl+P` has since
+        // flipped it to filter mode -- `schedule_quick_search_idle_timeout`
+        // reads the *current* mode when it actually fires, not whatever
+        // mode was active when it was scheduled.
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g"); // starts in Jump (the settings default)
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Jump)
+                    );
+                });
+
+                vcx.simulate_keystrokes("ctrl-p"); // flips this session to Filter
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter)
+                    );
+                });
+
+                vcx.executor().advance_clock(Duration::from_millis(5000));
+                vcx.run_until_parked();
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        Some(QuickSearchMode::Filter),
+                        "neither the jump keystroke's own stale timer nor the ctrl-p \
+                         toggle's fresh one may exit a session now in filter mode"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
     fn a_new_keystroke_resets_the_idle_timer(cx: &mut TestAppContext) {
         let dir = three_named_files_dir();
         with_panel_ext(

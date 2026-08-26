@@ -595,6 +595,15 @@ impl FileTableDelegate {
     /// format, deliberately different from `Jump`'s ordinal (design.md:
     /// filter mode "keeps its own match-count indicator... unaffected"
     /// by the ordinal-position requirement, which is specific to `Jump`).
+    ///
+    /// UAT: `Filter` mode's idle timeout is disabled (see
+    /// `FileTable::schedule_quick_search_idle_timeout`'s doc comment) --
+    /// unlike `Jump`, it now stays open until `Escape` however long the
+    /// user leaves it, which is silently surprising without something
+    /// saying so. Appending "(Esc to exit)" is that hint, and doubles as
+    /// this codebase's answer to "nothing indicates the [regime]": it's
+    /// visible for the entire time the filtered view sits there, not just
+    /// the moment a keystroke lands.
     pub(crate) fn quick_search_indicator_text(&self) -> Option<String> {
         let session = self.quick_search.as_ref()?;
         Some(match session.mode {
@@ -605,7 +614,7 @@ impl FileTableDelegate {
             QuickSearchMode::Filter => {
                 let count = session.filter_match_count.unwrap_or(0);
                 let noun = if count == 1 { "match" } else { "matches" };
-                format!("filter: {} ({count} {noun})", session.query)
+                format!("filter: {} ({count} {noun}) (Esc to exit)", session.query)
             }
         })
     }
@@ -1280,31 +1289,51 @@ impl TableDelegate for FileTableDelegate {
             cell = cell.text_right();
         }
 
-        // T-4.3.3: bold the characters `Jump` mode's fuzzy matcher
-        // actually matched, on whichever row is currently the best match
-        // -- the same "show your work" convention every mainstream fuzzy
-        // finder (fzf, VS Code's Quick Open, ...) uses. Plain `BOLD`
-        // weight only, deliberately no color change: this row is also
-        // always the cursor row (`Jump` mode moves the cursor to its own
-        // match), so a highlight color would have to work against both
-        // `cursor_bg`'s light background *and* an ordinary row's dark
-        // one -- the exact contrast trap `duet-widgets::theme`'s
-        // `table_hover` mapping already got wrong once this same task
-        // (see that fix's own commit); weight alone sidesteps it
-        // entirely.
+        // T-4.3.3: bold the characters the active quick-search/quick-filter
+        // session actually matched -- the same "show your work" convention
+        // every mainstream fuzzy finder (fzf, VS Code's Quick Open, ...)
+        // uses. Plain `BOLD` weight only, deliberately no color change: a
+        // `Jump`-mode match row is also always the cursor row (`Jump`
+        // moves the cursor to its own match), so a highlight color would
+        // have to work against both `cursor_bg`'s light background *and*
+        // an ordinary row's dark one -- the exact contrast trap
+        // `duet-widgets::theme`'s `table_hover` mapping already got wrong
+        // once this same task (see that fix's own commit); weight alone
+        // sidesteps it entirely, and reusing it for `Filter` mode keeps
+        // both regimes visually consistent.
+        //
+        // `Jump` only ever highlights its single winner row (the one the
+        // cursor sits on -- every other row wasn't the best match, so
+        // there's nothing to "show the work" of there). `Filter` mode is
+        // different: every *visible* row passed the filter by containing
+        // `query` somewhere (barring directories, exempt from the filter
+        // itself -- see `quick_filter_highlight_range`'s doc comment), so
+        // every row gets its own match highlighted, not just one --
+        // UAT: this was also explicitly requested as a second, ambient
+        // signal that the panel is currently in quick-filter regime,
+        // visible for as long as the (now no-longer-timing-out) filtered
+        // view stays up, not just on the keystroke that produced it.
         if col_ix == COL_NAME {
             let model_row =
                 (!self.has_parent_row || row_ix != 0).then(|| row_ix - self.parent_offset());
-            let indices = model_row.and_then(|model_row| {
-                let jump_match = self.quick_search.as_ref()?.jump_match.as_ref()?;
-                (jump_match.model_row == model_row).then(|| jump_match.indices.clone())
+            let ranges: Option<Vec<std::ops::Range<usize>>> = model_row.and_then(|model_row| {
+                let session = self.quick_search.as_ref()?;
+                match session.mode {
+                    QuickSearchMode::Jump => {
+                        let jump_match = session.jump_match.as_ref()?;
+                        (jump_match.model_row == model_row)
+                            .then(|| char_indices_to_byte_ranges(&text, &jump_match.indices))
+                    }
+                    QuickSearchMode::Filter => {
+                        quick_filter_highlight_range(&text, &session.query).map(|r| vec![r])
+                    }
+                }
             });
-            if let Some(indices) = indices {
+            if let Some(ranges) = ranges {
                 let highlight = HighlightStyle {
                     font_weight: Some(FontWeight::BOLD),
                     ..Default::default()
                 };
-                let ranges = char_indices_to_byte_ranges(&text, &indices);
                 return cell.child(
                     StyledText::new(text)
                         .with_highlights(ranges.into_iter().map(|range| (range, highlight))),
@@ -1397,6 +1426,38 @@ impl TableDelegate for FileTableDelegate {
             move |_, _, cx| with_delegate(cx, FileTableDelegate::select_same_extension)
         }))
     }
+}
+
+/// `Filter` mode's equivalent of `Jump`'s per-character highlight (UAT: no
+/// visual indication of *why* a row passed the filter, and this doubles as
+/// an at-a-glance "this panel is in quick-filter regime" signal on every
+/// visible row, not just whichever one the cursor happens to sit on).
+/// Returns the byte range of `query`'s first case-insensitive match in
+/// `name`, or `None` if it doesn't actually occur there -- directories
+/// pass `FilterSpec::matches` unconditionally regardless of whether their
+/// name contains the query (see that method's own doc comment), so a miss
+/// here is expected and just means "don't highlight anything," not a bug.
+///
+/// Deliberately ASCII-only case-folding, mirroring `duet_index::filter`'s
+/// own private `ascii_icontains` byte-for-byte (that function isn't
+/// exported at a visibility this crate can reach, and re-deriving its
+/// exact semantics here -- rather than reaching for `str::to_lowercase`,
+/// whose Unicode case-folding can change a match's byte length, e.g. the
+/// Turkish dotted capital 'İ' -- keeps the highlighted range provably
+/// aligned with what the model actually matched).
+fn quick_filter_highlight_range(name: &str, query: &str) -> Option<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+    let h = name.as_bytes();
+    let n = query.as_bytes();
+    if n.len() > h.len() {
+        return None;
+    }
+    let start = h
+        .windows(n.len())
+        .position(|w| w.iter().zip(n).all(|(&a, &b)| a.eq_ignore_ascii_case(&b)))?;
+    Some(start..start + n.len())
 }
 
 /// Converts `nucleo_matcher`'s per-*character* match indices (positions
@@ -2417,14 +2478,31 @@ impl FileTable {
     /// so comparing generations after the timer fires is what makes an
     /// earlier keystroke's stale timer a no-op once a newer one has kept
     /// the session alive.
+    ///
+    /// UAT: `Filter` mode is meant to be *browsed* -- the whole point of
+    /// narrowing the listing is to then stop and look at what's left, and
+    /// this timer used to cancel the regime out from under the user for
+    /// doing exactly that. `Jump` mode has no equivalent "stop and look"
+    /// use (it's a one-shot "land on this row" gesture, and a stale
+    /// highlighted match left up indefinitely would be confusing), so it
+    /// keeps the original auto-cancel. The check reads the *current* mode
+    /// when the timer actually fires, not the mode at schedule time --
+    /// `Ctrl+P` (`toggle_quick_filter`) can flip a session between the two
+    /// mid-session, and this way a Jump session that gets toggled to
+    /// Filter before its own timer fires correctly survives, while one
+    /// toggled back to Jump correctly doesn't (the toggle itself
+    /// reschedules a fresh timer either way, so there's always a
+    /// currently-live timer whose fire-time mode check is the one that
+    /// matters).
     fn schedule_quick_search_idle_timeout(&mut self, generation: u64, cx: &mut Context<Self>) {
         let timeout = self.quick_search_idle_timeout;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(timeout).await;
             let _ = this.update(cx, |this, cx| {
-                let still_current =
-                    this.state.read(cx).delegate().quick_search_generation() == Some(generation);
-                if still_current {
+                let delegate = this.state.read(cx).delegate();
+                let still_current = delegate.quick_search_generation() == Some(generation);
+                let is_filter = delegate.quick_search_mode() == Some(QuickSearchMode::Filter);
+                if still_current && !is_filter {
                     this.exit_quick_search(cx);
                 }
             });
@@ -3160,6 +3238,29 @@ mod tests {
         assert_eq!(ranges, vec![0..3]);
     }
 
+    #[test]
+    fn quick_filter_highlight_range_finds_a_case_insensitive_match() {
+        assert_eq!(quick_filter_highlight_range("gamma.txt", "AMM"), Some(1..4));
+    }
+
+    #[test]
+    fn quick_filter_highlight_range_is_none_when_the_query_does_not_occur() {
+        assert_eq!(quick_filter_highlight_range("gamma.txt", "zzz"), None);
+    }
+
+    #[test]
+    fn quick_filter_highlight_range_is_none_for_an_empty_query() {
+        assert_eq!(quick_filter_highlight_range("gamma.txt", ""), None);
+    }
+
+    #[test]
+    fn quick_filter_highlight_range_finds_the_first_occurrence() {
+        // "aa.txt" contains "a" twice -- the highlight should land on the
+        // first one, matching `ascii_icontains`'s own leftmost-match
+        // semantics (a `str::windows` scan in occurrence order).
+        assert_eq!(quick_filter_highlight_range("aa.txt", "a"), Some(0..1));
+    }
+
     fn meta(kind: EntryKind, size: u64, mtime_secs: i64) -> Metadata {
         let mut m = Metadata::minimal(kind);
         m.size = size;
@@ -3634,7 +3735,7 @@ mod tests {
         });
         assert_eq!(
             delegate.quick_search_indicator_text(),
-            Some("filter: f (3 matches)".to_string())
+            Some("filter: f (3 matches) (Esc to exit)".to_string())
         );
     }
 
