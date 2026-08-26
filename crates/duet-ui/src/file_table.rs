@@ -1639,6 +1639,11 @@ actions!(
     [
         EnterDirectory,
         NavigateParent,
+        // Backspace's own action, distinct from `NavigateParent` (bound to
+        // Ctrl+PgUp/Alt+Up) -- see `FileTable::handle_backspace`'s doc
+        // comment for why Backspace specifically needs to check for an
+        // active quick-search session first, and the other two don't.
+        NavigateParentBackspace,
         NavigateRoot,
         NavigateHome,
         HistoryBack,
@@ -1695,7 +1700,7 @@ pub fn bind_file_table_keys(cx: &mut App) {
         KeyBinding::new("shift-pagedown", ExtendSelectionPageDown, Some("FileTable")),
         KeyBinding::new("enter", EnterDirectory, Some("FileTable")),
         KeyBinding::new("ctrl-pagedown", EnterDirectory, Some("FileTable")),
-        KeyBinding::new("backspace", NavigateParent, Some("FileTable")),
+        KeyBinding::new("backspace", NavigateParentBackspace, Some("FileTable")),
         KeyBinding::new("ctrl-pageup", NavigateParent, Some("FileTable")),
         // Not from docs/keymap-tc.csv (no row binds Alt+Up to anything) --
         // added on request as a third, common-convention way to go up,
@@ -2413,6 +2418,61 @@ impl FileTable {
         self.schedule_quick_search_idle_timeout(generation, cx);
     }
 
+    /// UAT: Backspace is `nav.open_parent_and_select`'s own binding (see
+    /// `navigate_to_parent`'s doc comment), and GPUI's bubble-phase
+    /// `on_key_down` listener that feeds `push_quick_search_char` only
+    /// ever sees a keystroke nothing else already claimed (again, see
+    /// that listener's own doc comment in [`Self::render`]) -- so a bound
+    /// action always wins over raw capture, and Backspace mid-query was
+    /// silently navigating away instead of editing the typed text. Routed
+    /// through its own `NavigateParentBackspace` action/handler
+    /// (`handle_backspace`, below) rather than added to the raw listener,
+    /// since the raw listener never gets a chance to run for a bound key
+    /// at all.
+    ///
+    /// This codebase's own judgment call, same footing as
+    /// `QuickSearchMode`'s Ctrl+P behavior (design.md doesn't specify
+    /// quick-search text editing at all): removes the last character:
+    /// if that empties the query, the whole session exits outright
+    /// (nothing left to search/filter for -- same end state as never
+    /// having started one) rather than sitting at an empty, no-op query.
+    fn pop_quick_search_char(&mut self, cx: &mut Context<Self>) {
+        let generation = self.state.update(cx, |state, _cx| {
+            let session = state.delegate_mut().quick_search.as_mut()?;
+            session.query.pop();
+            if session.query.is_empty() {
+                None
+            } else {
+                session.generation += 1;
+                Some(session.generation)
+            }
+        });
+        match generation {
+            Some(generation) => {
+                self.apply_quick_search(cx);
+                self.schedule_quick_search_idle_timeout(generation, cx);
+            }
+            None => self.exit_quick_search(cx),
+        }
+    }
+
+    /// `NavigateParentBackspace`'s handler -- Backspace does double duty:
+    /// edits the active quick-search/quick-filter session's query if one
+    /// is active (see [`Self::pop_quick_search_char`]'s doc comment for
+    /// why this needs its own action rather than reusing `NavigateParent`
+    /// directly), or goes up to the parent directory exactly like
+    /// Ctrl+PgUp/Alt+Up otherwise. Deliberately *not* extended to those
+    /// two -- they're deliberate chorded gestures, not something typed by
+    /// accident mid-query the way a bare Backspace is, so they keep
+    /// navigating up unconditionally even while a session is active.
+    fn handle_backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).delegate().quick_search_mode().is_some() {
+            self.pop_quick_search_char(cx);
+        } else {
+            self.navigate_to_parent(window, cx);
+        }
+    }
+
     /// `Ctrl+P` (`QuickFilterToggle`): starts a fresh session in `Filter`
     /// mode if none is active (this codebase's own choice -- Ctrl+P
     /// always means "filter," regardless of `quick_search_default_mode`,
@@ -2667,11 +2727,12 @@ impl FileTable {
         }
     }
 
-    /// Backspace/Ctrl+PgUp (`nav.open_parent_and_select`): goes up one
-    /// level, then -- once the parent's listing loads -- moves the
-    /// cursor onto the directory just left ("the detail that makes
-    /// navigation feel right" per this task's own AC). A no-op already
-    /// at the root (`Path::parent()` returns `None`).
+    /// Ctrl+PgUp/Alt+Up, and Backspace via [`Self::handle_backspace`]
+    /// (`nav.open_parent_and_select`): goes up one level, then -- once
+    /// the parent's listing loads -- moves the cursor onto the directory
+    /// just left ("the detail that makes navigation feel right" per this
+    /// task's own AC). A no-op already at the root (`Path::parent()`
+    /// returns `None`).
     fn navigate_to_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(parent) = self.current_dir.parent().map(PathBuf::from) else {
             return;
@@ -2906,6 +2967,11 @@ impl Render for FileTable {
             .on_action(cx.listener(|this, _: &NavigateParent, window, cx| {
                 this.navigate_to_parent(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &NavigateParentBackspace, window, cx| {
+                    this.handle_backspace(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &NavigateRoot, window, cx| {
                 this.navigate_to_root(window, cx);
             }))

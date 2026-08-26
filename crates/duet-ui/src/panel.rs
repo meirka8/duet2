@@ -2125,6 +2125,166 @@ mod tests {
     }
 
     #[gpui::test]
+    fn backspace_edits_the_query_instead_of_navigating_up_while_a_session_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        // UAT: Backspace mid-query was being swallowed by
+        // `nav.open_parent_and_select`, immediately navigating away
+        // instead of editing the typed text.
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_keystrokes("ctrl-p");
+                vcx.simulate_input("gax"); // "gax" matches nothing
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(table.state().read(cx).delegate().model().order().len(), 0);
+                });
+
+                vcx.simulate_keystrokes("backspace"); // back to "ga"
+                table.read_with(vcx, |table, cx| {
+                    let delegate = table.state().read(cx).delegate();
+                    assert_eq!(
+                        delegate.model().order().len(),
+                        1,
+                        "backspace must edit the query (back to \"ga\", matching gamma.txt), \
+                         not navigate up"
+                    );
+                    assert_eq!(delegate.quick_search_mode(), Some(QuickSearchMode::Filter));
+                    assert_eq!(
+                        table.current_dir(),
+                        dir.path(),
+                        "must not have navigated up"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn backspacing_the_last_character_of_the_query_exits_the_quick_search_regime(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = three_named_files_dir();
+        with_panel_ext(
+            cx,
+            vec![session_tab(dir.path().to_path_buf(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                table.read_with(vcx, |table, cx| {
+                    assert!(
+                        table
+                            .state()
+                            .read(cx)
+                            .delegate()
+                            .quick_search_mode()
+                            .is_some()
+                    );
+                });
+
+                vcx.simulate_keystrokes("backspace"); // empties the query
+                table.read_with(vcx, |table, cx| {
+                    assert_eq!(
+                        table.state().read(cx).delegate().quick_search_mode(),
+                        None,
+                        "an emptied query has nothing left to search for -- same end state as \
+                         never having started a session"
+                    );
+                    assert_eq!(
+                        table.current_dir(),
+                        dir.path(),
+                        "must not have navigated up"
+                    );
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn backspace_navigates_to_parent_when_no_quick_search_session_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child_dir");
+        std::fs::create_dir(&child).unwrap();
+
+        with_panel_ext(
+            cx,
+            vec![session_tab(child.clone(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_keystrokes("backspace");
+
+                let parent = dir.path().to_path_buf();
+                wait_until(vcx, |vcx| {
+                    table.read_with(vcx, |table, _| table.current_dir() == parent)
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn ctrl_pageup_and_alt_up_still_navigate_to_parent_even_during_a_quick_search_session(
+        cx: &mut TestAppContext,
+    ) {
+        // Deliberately asymmetric with Backspace -- these are chorded
+        // gestures a user wouldn't hit by accident mid-query, so they keep
+        // navigating up unconditionally (see `FileTable::handle_backspace`'s
+        // doc comment).
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child_dir");
+        std::fs::create_dir(&child).unwrap();
+
+        with_panel_ext(
+            cx,
+            vec![session_tab(child.clone(), false, false)],
+            0,
+            MouseMode::Windows,
+            |panel, vcx| {
+                let table = panel.read_with(vcx, |panel, _| panel.tabs[0].table.clone());
+                wait_until(vcx, |vcx| table.read_with(vcx, listing_loaded));
+
+                focus_active_table(&panel, vcx);
+                vcx.simulate_input("g");
+                table.read_with(vcx, |table, cx| {
+                    assert!(
+                        table
+                            .state()
+                            .read(cx)
+                            .delegate()
+                            .quick_search_mode()
+                            .is_some()
+                    );
+                });
+
+                vcx.simulate_keystrokes("ctrl-pageup");
+                let parent = dir.path().to_path_buf();
+                wait_until(vcx, |vcx| {
+                    table.read_with(vcx, |table, _| table.current_dir() == parent)
+                });
+            },
+        );
+    }
+
+    #[gpui::test]
     fn mouse_click_exits_the_quick_search_regime(cx: &mut TestAppContext) {
         let dir = three_named_files_dir();
         with_panel_ext(
