@@ -60,12 +60,12 @@ use duet_widgets::theme::TokenPalette;
 use futures_util::StreamExt as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AsyncApp, Context, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, Render, Styled as _, WeakEntity, Window, actions,
-    div, px,
+    App, Context, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
+    KeyBinding, ParentElement as _, Render, Styled as _, WeakEntity, Window, actions, div, px,
 };
 
 use crate::copy_move_dialog::{JOB_CONCURRENCY, describe_planner_error};
+use crate::dialog_job::report_job_outcome;
 use crate::workspace::{NoticeLevel, Workspace};
 
 // This dialog's own three actions. Enter/Escape are the same
@@ -269,7 +269,7 @@ impl DeleteDialogState {
                 this.planning_in_progress = false;
                 cx.notify();
             });
-            if report_delete_job_outcome(outcome, &workspace, cx) {
+            if report_job_outcome(outcome, &workspace, cx) {
                 let _ = workspace.update(cx, |workspace, cx| {
                     workspace.close_delete_dialog_deferred(cx);
                 });
@@ -440,41 +440,6 @@ async fn resolve_delete_mode(permanent: bool) -> Result<DeleteMode, String> {
         .map_err(|e| format!("couldn't create the trash directory {}: {e}", dir.display()))?;
     let trash_dir = crate::file_table::local_vpath(&dir)?;
     Ok(DeleteMode::Trash { trash_dir })
-}
-
-/// Surfaces [`spawn_delete_job`]'s outcome as a toast when it failed, and
-/// reports whether the job was actually enqueued -- the other half both
-/// call sites share (see that function's own doc comment). The same
-/// three-way match `CopyMoveDialogState::confirm`'s own `cx.spawn` block
-/// performs.
-pub(crate) fn report_delete_job_outcome(
-    outcome: Result<Result<JobId, String>, tokio::sync::oneshot::error::RecvError>,
-    workspace: &WeakEntity<Workspace>,
-    cx: &mut AsyncApp,
-) -> bool {
-    match outcome {
-        Ok(Ok(_job_id)) => true,
-        Ok(Err(message)) => {
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.push_pending_notice(
-                    NoticeLevel::Error,
-                    format!("Couldn't plan the operation: {message}"),
-                    cx,
-                );
-            });
-            false
-        }
-        Err(_) => {
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.push_pending_notice(
-                    NoticeLevel::Error,
-                    "The planning task was dropped before completing.".to_string(),
-                    cx,
-                );
-            });
-            false
-        }
-    }
 }
 
 /// Which of `dirs` (name plus already-resolved path) actually have at
