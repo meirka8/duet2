@@ -31,16 +31,55 @@
 //! mean adding two parameters that five of the six callers would pass a
 //! constant to. Its *reporting* half is shared here, though -- the
 //! three-arm match below is byte-for-byte what it already did inline.
+//!
+//! [`focus_at_end`] is unrelated to the plan/enqueue half above but lives
+//! here anyway rather than starting a third shared-dialog-helpers module:
+//! `InputState::default_value` (used by every `InputState` these dialogs
+//! construct) sets the field's *text* but never touches its cursor, which
+//! stays at whatever `InputState::new` itself defaults to -- position
+//! zero, i.e. the very start of a pre-filled string. That is the wrong
+//! place for every one of this crate's own pre-filled fields (F7's
+//! destination, Shift+F6's stem, both link dialogs' link path): each one
+//! is pre-filled with something the user is expected to *extend*
+//! (`.../newdir` -> type the new segment; the source's basename -> tweak
+//! it), not retype from scratch, so the cursor belongs at the end, ready
+//! to keep typing or backspace. UAT (T-5.2.7, post-merge): F7 shipped with
+//! the cursor sitting at the very start of the pre-filled directory path,
+//! forcing an End keypress (or a mouse click) before typing the new
+//! folder name would land in the right place at all.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use duet_ops::{ConflictResolver, JobId, JobKind, Plan, PlannerError, QueueManager};
 use duet_vfs::{FileSystem, LocalFs};
-use gpui::{AsyncApp, WeakEntity};
+use duet_widgets::input::{InputState, Position};
+use gpui::{AsyncApp, Context, WeakEntity, Window};
 
 use crate::copy_move_dialog::{JOB_CONCURRENCY, describe_planner_error};
 use crate::workspace::{NoticeLevel, Workspace};
+
+/// Moves `state`'s cursor to the end of its current text and focuses it --
+/// see the module doc comment for why every pre-filled `InputState` in
+/// this crate's dialogs wants this instead of `InputState::focus` alone.
+///
+/// `character: u32::MAX` rather than the text's own length: `RopeExt::
+/// position_to_offset`'s implementation (`gpui-component-0.5.1/src/input/
+/// rope_ext.rs`) computes the offset via `line.chars().take(pos.character
+/// as usize)...sum()`, which harmlessly clamps to "every character on the
+/// line" once `character` exceeds the line's own length -- so this always
+/// lands at the true end of a single-line field's text without this crate
+/// needing to count characters itself (and UTF-8 multi-byte names, where
+/// "byte length" and "character count" differ, make counting worth
+/// avoiding). `set_cursor_position` already calls `InputState::focus`
+/// itself, so this replaces that call rather than following it.
+pub(crate) fn focus_at_end(
+    state: &mut InputState,
+    window: &mut Window,
+    cx: &mut Context<InputState>,
+) {
+    state.set_cursor_position(Position::new(0, u32::MAX), window, cx);
+}
 
 /// Runs `plan` on the ops runtime and, if it succeeds, enqueues the
 /// resulting [`Plan`] as a `kind` job -- both off the UI thread, in one

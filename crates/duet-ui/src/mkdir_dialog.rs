@@ -55,7 +55,7 @@ use gpui::{
     ParentElement as _, Render, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 
-use crate::dialog_job::{report_job_outcome, spawn_plan_and_enqueue};
+use crate::dialog_job::{focus_at_end, report_job_outcome, spawn_plan_and_enqueue};
 use crate::file_table::local_vpath;
 use crate::workspace::{NoticeLevel, Workspace};
 
@@ -107,7 +107,7 @@ impl MkdirDialogState {
         });
         let _subscriptions =
             vec![cx.subscribe_in(&destination, window, Self::on_destination_event)];
-        destination.update(cx, |state, cx| state.focus(window, cx));
+        destination.update(cx, |state, cx| focus_at_end(state, window, cx));
 
         Self {
             destination,
@@ -127,6 +127,15 @@ impl MkdirDialogState {
     #[cfg(test)]
     pub(crate) fn destination_value(&self, cx: &gpui::App) -> String {
         self.destination.read(cx).value().to_string()
+    }
+
+    /// Test-only: UAT regression check -- `true` when the cursor sits at
+    /// the end of the pre-filled text, per `crate::dialog_job::
+    /// focus_at_end`'s own doc comment.
+    #[cfg(test)]
+    pub(crate) fn destination_cursor_at_end(&self, cx: &gpui::App) -> bool {
+        let state = self.destination.read(cx);
+        state.cursor() == state.value().len()
     }
 
     /// Test-only: types into the field the way a user would, without
