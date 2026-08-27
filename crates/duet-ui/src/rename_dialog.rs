@@ -85,7 +85,7 @@ use gpui::{
     ParentElement as _, Render, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 
-use crate::dialog_job::{report_job_outcome, spawn_plan_and_enqueue};
+use crate::dialog_job::{focus_at_end, report_job_outcome, spawn_plan_and_enqueue};
 use crate::workspace::{NoticeLevel, Workspace};
 
 /// Splits an entry name into the editable stem and the fixed extension --
@@ -169,7 +169,7 @@ impl RenameDialogState {
                 .placeholder("New name")
         });
         let _subscriptions = vec![cx.subscribe_in(&stem_input, window, Self::on_stem_event)];
-        stem_input.update(cx, |state, cx| state.focus(window, cx));
+        stem_input.update(cx, |state, cx| focus_at_end(state, window, cx));
 
         Self {
             source,
@@ -191,6 +191,14 @@ impl RenameDialogState {
     #[cfg(test)]
     pub(crate) fn stem_value(&self, cx: &gpui::App) -> String {
         self.stem_input.read(cx).value().to_string()
+    }
+
+    /// Test-only: UAT regression check -- see
+    /// `MkdirDialogState::destination_cursor_at_end`'s own doc comment.
+    #[cfg(test)]
+    pub(crate) fn stem_cursor_at_end(&self, cx: &gpui::App) -> bool {
+        let state = self.stem_input.read(cx);
+        state.cursor() == state.value().len()
     }
 
     #[cfg(test)]

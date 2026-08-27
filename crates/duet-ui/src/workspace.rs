@@ -6585,6 +6585,11 @@ mod tests {
                     "F7 pre-fills the focused panel's own directory plus a trailing slash, so \
                      the user types only the new segment(s)"
                 );
+                assert!(
+                    state.destination_cursor_at_end(cx),
+                    "UAT: the cursor must start at the end of the pre-filled path, ready to \
+                     type the new folder name, not at the very beginning"
+                );
             });
         });
     }
@@ -6704,6 +6709,11 @@ mod tests {
                     state.source(),
                     &crate::file_table::local_vpath(&dir.path().join("photo.jpg")).unwrap(),
                     "Shift+F6 renames the cursor entry, resolved once at open time"
+                );
+                assert!(
+                    state.stem_cursor_at_end(cx),
+                    "UAT: the cursor must start at the end of the stem, ready to keep typing \
+                     or backspace, not at the very beginning"
                 );
             });
         });
@@ -6855,6 +6865,11 @@ mod tests {
                         .into_owned(),
                     "the new link defaults into the other panel's directory under the same name, \
                      matching F5/F6's own destination convention"
+                );
+                assert!(
+                    state.link_path_cursor_at_end(cx),
+                    "UAT: the cursor must start at the end of the pre-filled link path, not at \
+                     the very beginning"
                 );
             });
         });

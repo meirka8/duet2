@@ -69,7 +69,7 @@ use gpui::{
     ParentElement as _, Render, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 
-use crate::dialog_job::{report_job_outcome, spawn_plan_and_enqueue};
+use crate::dialog_job::{focus_at_end, report_job_outcome, spawn_plan_and_enqueue};
 use crate::file_table::local_vpath;
 use crate::workspace::{NoticeLevel, Workspace};
 
@@ -146,7 +146,7 @@ impl LinkDialogState {
                 .placeholder("Path of the new link")
         });
         let _subscriptions = vec![cx.subscribe_in(&link_path, window, Self::on_link_path_event)];
-        link_path.update(cx, |state, cx| state.focus(window, cx));
+        link_path.update(cx, |state, cx| focus_at_end(state, window, cx));
 
         Self {
             kind,
@@ -178,6 +178,14 @@ impl LinkDialogState {
     #[cfg(test)]
     pub(crate) fn link_path_value(&self, cx: &gpui::App) -> String {
         self.link_path.read(cx).value().to_string()
+    }
+
+    /// Test-only: UAT regression check -- see
+    /// `MkdirDialogState::destination_cursor_at_end`'s own doc comment.
+    #[cfg(test)]
+    pub(crate) fn link_path_cursor_at_end(&self, cx: &gpui::App) -> bool {
+        let state = self.link_path.read(cx);
+        state.cursor() == state.value().len()
     }
 
     /// Test-only: see `MkdirDialogState::set_destination_value`'s doc
