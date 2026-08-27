@@ -21,11 +21,15 @@ mod command_palette;
 mod conflict_dialog;
 mod copy_move_dialog;
 mod delete_dialog;
+mod dialog_job;
 pub mod file_table;
 mod function_bar;
 mod hotlist;
+mod link_dialog;
+mod mkdir_dialog;
 mod operation_manager;
 pub mod panel;
+mod rename_dialog;
 mod theme_controller;
 mod workspace;
 

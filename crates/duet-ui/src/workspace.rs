@@ -49,8 +49,11 @@ use crate::file_table::{
 };
 use crate::function_bar::{self, FKeySlot};
 use crate::hotlist::HotlistDelegate;
+use crate::link_dialog::{LinkDialogState, LinkKind};
+use crate::mkdir_dialog::MkdirDialogState;
 use crate::operation_manager::{OperationManagerState, bind_operation_manager_keys};
 use crate::panel::{Panel, bind_panel_keys};
+use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
@@ -156,6 +159,37 @@ actions!(duet_workspace, [DeleteDialog, DeletePermanentDialog]);
 // already establishes.
 actions!(duet_workspace, [OpenOperationManager]);
 
+// T-5.2.7's four "create one thing" dialogs (FR-OPS-01). Two of the four
+// chords are verified TC bindings from `docs/keymap-tc.csv`: row 9
+// (`ops.mkdir`, `F7`) and row 8 (`ops.rename_in_place`, `Shift+F6`), both
+// "known" confidence.
+//
+// The other two are **this codebase's own reasonable defaults, not
+// verified TC chords** -- `docs/commands.md` catalogues
+// `ops.create_symlink`/`ops.create_hardlink`, but `docs/keymap-tc.csv`
+// (the TC survey, and the only source of "known" bindings here) has no row
+// for either, so there is no Total Commander binding to match.
+// `Ctrl+Shift+S` (Symlink) / `Ctrl+Shift+H` (Hardlink) are chosen for the
+// obvious mnemonic and confirmed unclaimed against every other
+// `KeyBinding::new` call site in this crate -- the same disclosed-default
+// situation `OpenCommandPalette`'s `Ctrl+Shift+P`, `NavigateHome`'s
+// `Alt+Home` and the hotlist's `Ctrl+D`/`Ctrl+Shift+D` are already in. See
+// `crate::link_dialog`'s module doc comment for the rest of that
+// reasoning, including the disclosed "cursor entry only, not a
+// multi-selection" scope boundary both link dialogs sit inside.
+//
+// The `"Workspace"` scope matches `CopyDialog`/`DeleteDialog`'s: all four
+// open an overlay that is neither a panel's nor a table's concern.
+// Everything the overlays need once open (Enter, Escape) needs no binding
+// from this crate at all -- see `crate::mkdir_dialog`'s module doc comment
+// for why, which is also why there is no `bind_mkdir_dialog_keys`/
+// `bind_rename_dialog_keys`/`bind_link_dialog_keys` alongside
+// `bind_copy_move_dialog_keys`/`bind_delete_dialog_keys` below.
+actions!(
+    duet_workspace,
+    [MkdirDialog, RenameDialog, SymlinkDialog, HardlinkDialog]
+);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -181,6 +215,10 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteDialog, Some("Workspace")),
         KeyBinding::new("shift-f8", DeletePermanentDialog, Some("Workspace")),
         KeyBinding::new("shift-delete", DeletePermanentDialog, Some("Workspace")),
+        KeyBinding::new("f7", MkdirDialog, Some("Workspace")),
+        KeyBinding::new("shift-f6", RenameDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-s", SymlinkDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-shift-h", HardlinkDialog, Some("Workspace")),
     ]);
 }
 
@@ -492,6 +530,33 @@ pub struct Workspace {
     /// path that actually shows the dialog: there is no previous focus to
     /// restore when nothing took focus away in the first place.
     delete_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.7's F7 "create directory" dialog is open.
+    /// Mirrors `copy_move_dialog`'s own field exactly; see
+    /// `crate::mkdir_dialog`'s module doc comment.
+    mkdir_dialog: Option<Entity<MkdirDialogState>>,
+    /// Saved by `open_mkdir_dialog`, restored and cleared by
+    /// `close_mkdir_dialog`/`close_mkdir_dialog_deferred` -- same reasoning
+    /// as `copy_move_dialog_previous_focus`.
+    mkdir_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.7's Shift+F6 in-place rename dialog is open.
+    /// See `crate::rename_dialog`'s module doc comment, in particular for
+    /// why the extension is a fixed label rather than unselected text.
+    rename_dialog: Option<Entity<RenameDialogState>>,
+    /// Saved by `open_rename_dialog`, restored and cleared by
+    /// `close_rename_dialog`/`close_rename_dialog_deferred`.
+    rename_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.7's symlink *or* hardlink dialog is open -- one
+    /// field for both, since one `LinkDialogState` type serves both
+    /// commands (see `crate::link_dialog`'s module doc comment) and, like
+    /// every other overlay here, only one can be open at a time anyway.
+    link_dialog: Option<Entity<LinkDialogState>>,
+    /// Saved by `open_link_dialog`, restored and cleared by
+    /// `close_link_dialog`/`close_link_dialog_deferred`.
+    link_dialog_previous_focus: Option<FocusHandle>,
+
     /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
     /// `"never"`), read once at startup the same way every other
     /// `settings.toml`-derived field in this struct is (see
@@ -970,6 +1035,12 @@ impl Workspace {
             copy_move_dialog_previous_focus: None,
             delete_dialog: None,
             delete_dialog_previous_focus: None,
+            mkdir_dialog: None,
+            mkdir_dialog_previous_focus: None,
+            rename_dialog: None,
+            rename_dialog_previous_focus: None,
+            link_dialog: None,
+            link_dialog_previous_focus: None,
             confirm_delete,
             delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
@@ -1815,7 +1886,7 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_this, cx| {
             let outcome = rx.await;
-            let _ = crate::delete_dialog::report_delete_job_outcome(outcome, &workspace, cx);
+            let _ = crate::dialog_job::report_job_outcome(outcome, &workspace, cx);
         })
         .detach();
     }
@@ -1840,6 +1911,238 @@ impl Workspace {
     pub(crate) fn close_delete_dialog_deferred(&mut self, cx: &mut Context<Self>) {
         self.delete_dialog = None;
         self.pending_focus_restore = self.delete_dialog_previous_focus.take();
+        cx.notify();
+    }
+
+    /// The focused panel's active tab's current directory -- the one
+    /// question all three T-5.2.7 `open_*` methods below start from, and
+    /// the piece `open_copy_move_dialog`/`open_delete_dialog` each spell
+    /// out inline. Returns the `PanelSide` too, since the link dialog also
+    /// needs the *other* side's directory for its default.
+    fn focused_panel_dir(&self, window: &Window, cx: &App) -> (PanelSide, PathBuf) {
+        let side = self.focused_panel_side(window, cx);
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let dir = panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .current_dir()
+            .to_path_buf();
+        (side, dir)
+    }
+
+    /// The focused panel's active tab's *cursor* entry name, or `None` if
+    /// there isn't one (an empty listing, or the cursor parked on the
+    /// synthetic ".." row -- see `FileTableDelegate::cursor_entry_name`'s
+    /// own doc comment). Shift+F6 and both link commands resolve their
+    /// single target this way, deliberately *not* through
+    /// `copy_move_dialog::resolve_source_names`' selection-or-cursor
+    /// fallback: each of them acts on exactly one entry (see
+    /// `crate::rename_dialog`/`crate::link_dialog`'s module doc comments).
+    fn focused_cursor_entry_name(&self, window: &Window, cx: &App) -> Option<String> {
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        panel.read(cx).active_table().read(cx).cursor_entry_name(cx)
+    }
+
+    /// F7 (`MkdirDialog`, T-5.2.7, `ops.mkdir`): opens the create-directory
+    /// dialog pre-filled with the focused panel's current directory plus a
+    /// trailing `/`, so the user types only the new segment(s) --
+    /// `duet_ops::plan_mkdir` handles a nested `a/b/c` in one job, which is
+    /// this task's own "as TC does" AC clause.
+    ///
+    /// Unlike every other `open_*` here there is no selection or cursor to
+    /// resolve: F7 makes something new, so there is nothing to act *on*.
+    /// A no-op, silently, if the dialog is already open (the same
+    /// "reopening shouldn't stack a second one" convention every sibling
+    /// overlay follows).
+    fn open_mkdir_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mkdir_dialog.is_some() {
+            return;
+        }
+
+        let (_side, dir) = self.focused_panel_dir(window, cx);
+        let mut initial = dir.to_string_lossy().into_owned();
+        if !initial.ends_with('/') {
+            initial.push('/');
+        }
+
+        self.mkdir_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            MkdirDialogState::new(
+                initial,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.mkdir_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// Mirrors `close_copy_move_dialog` exactly -- always has a live
+    /// `Window`.
+    pub(crate) fn close_mkdir_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mkdir_dialog = None;
+        if let Some(handle) = self.mkdir_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Mirrors `close_copy_move_dialog_deferred` exactly; see
+    /// `pending_focus_restore`'s doc comment for why the actual
+    /// `window.focus` call happens on `Self::render`'s next pass instead.
+    pub(crate) fn close_mkdir_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.mkdir_dialog = None;
+        self.pending_focus_restore = self.mkdir_dialog_previous_focus.take();
+        cx.notify();
+    }
+
+    /// Shift+F6 (`RenameDialog`, T-5.2.7, `ops.rename_in_place`): opens the
+    /// in-place rename dialog on the focused panel's *cursor* entry. A
+    /// no-op with an explanatory toast if there is no cursor entry to
+    /// rename, and silently if the dialog is already open.
+    fn open_rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename_dialog.is_some() {
+            return;
+        }
+
+        let (_side, dir) = self.focused_panel_dir(window, cx);
+        let Some(name) = self.focused_cursor_entry_name(window, cx) else {
+            window.push_notification(Notification::info("Nothing to rename."), cx);
+            return;
+        };
+        let Ok(source) = crate::file_table::local_vpath(&dir.join(&name)) else {
+            window.push_notification(
+                Notification::warning("That entry doesn't have a valid path."),
+                cx,
+            );
+            return;
+        };
+
+        self.rename_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            RenameDialogState::new(
+                source,
+                name,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.rename_dialog = Some(state);
+        cx.notify();
+    }
+
+    pub(crate) fn close_rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_dialog = None;
+        if let Some(handle) = self.rename_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_rename_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.rename_dialog = None;
+        self.pending_focus_restore = self.rename_dialog_previous_focus.take();
+        cx.notify();
+    }
+
+    /// `Ctrl+Shift+S` (`SymlinkDialog`) / `Ctrl+Shift+H`
+    /// (`HardlinkDialog`), T-5.2.7: opens the link-creation dialog on the
+    /// focused panel's *cursor* entry, defaulting the new link's own path
+    /// to the **other** panel's current directory plus the same basename --
+    /// F5/F6's own "destination defaults to the other panel" convention
+    /// (`open_copy_move_dialog`'s `dest_panel` resolution). A no-op with an
+    /// explanatory toast if there is no cursor entry, and silently if the
+    /// dialog is already open. See `crate::link_dialog`'s module doc
+    /// comment for both the unverified-by-TC keybindings and the disclosed
+    /// "one entry, not a selection" scope boundary.
+    fn open_link_dialog(&mut self, kind: LinkKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_dialog.is_some() {
+            return;
+        }
+
+        let (source_side, source_dir) = self.focused_panel_dir(window, cx);
+        let Some(name) = self.focused_cursor_entry_name(window, cx) else {
+            window.push_notification(Notification::info("Nothing to link to."), cx);
+            return;
+        };
+        let Ok(source) = crate::file_table::local_vpath(&source_dir.join(&name)) else {
+            window.push_notification(
+                Notification::warning("That entry doesn't have a valid path."),
+                cx,
+            );
+            return;
+        };
+
+        let dest_panel = match source_side {
+            PanelSide::Left => self.right_panel.clone(),
+            PanelSide::Right => self.left_panel.clone(),
+        };
+        let dest_dir = dest_panel.read(cx).active_table().read(cx).current_dir();
+        let initial_link_path = dest_dir.join(&name).to_string_lossy().into_owned();
+
+        self.link_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            LinkDialogState::new(
+                kind,
+                source,
+                name,
+                initial_link_path,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.link_dialog = Some(state);
+        cx.notify();
+    }
+
+    pub(crate) fn close_link_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_dialog = None;
+        if let Some(handle) = self.link_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_link_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.link_dialog = None;
+        self.pending_focus_restore = self.link_dialog_previous_focus.take();
         cx.notify();
     }
 
@@ -2281,6 +2584,18 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DeletePermanentDialog, window, cx| {
                 this.open_delete_dialog(true, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &MkdirDialog, window, cx| {
+                this.open_mkdir_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RenameDialog, window, cx| {
+                this.open_rename_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SymlinkDialog, window, cx| {
+                this.open_link_dialog(LinkKind::Symlink, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &HardlinkDialog, window, cx| {
+                this.open_link_dialog(LinkKind::Hardlink, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenOperationManager, window, cx| {
                 this.open_operation_manager(window, cx);
             }))
@@ -2299,6 +2614,15 @@ impl Render for Workspace {
             })
             .when_some(self.delete_dialog.clone(), |this, state| {
                 this.child(delete_dialog_overlay(&state, cx))
+            })
+            .when_some(self.mkdir_dialog.clone(), |this, state| {
+                this.child(mkdir_dialog_overlay(&state, cx))
+            })
+            .when_some(self.rename_dialog.clone(), |this, state| {
+                this.child(rename_dialog_overlay(&state, cx))
+            })
+            .when_some(self.link_dialog.clone(), |this, state| {
+                this.child(link_dialog_overlay(&state, cx))
             })
             .when_some(self.operation_manager.clone(), |this, state| {
                 this.child(operation_manager_overlay(&state, cx))
@@ -2501,6 +2825,113 @@ fn delete_dialog_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_delete_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.7's F7 create-directory overlay -- same `.occlude()`-backdrop/card
+/// shape and same `.on_mouse_down_out` close as `copy_move_dialog_overlay`
+/// (see `command_palette_overlay`'s own doc comment for the full reasoning,
+/// including the real regression this pattern exists to avoid). Nothing is
+/// enqueued until Enter, so an outside click is always a safe "never mind"
+/// here -- unlike `conflict_dialog_overlay`, which deliberately omits it.
+/// Same `480px` width as the copy/move dialog: both are "one path field
+/// plus a hint line". The card sets no `key_context` of its own, same
+/// reasoning as every sibling overlay function.
+fn mkdir_dialog_overlay(
+    state: &Entity<MkdirDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("mkdir-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("mkdir-dialog-card")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_mkdir_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.7's Shift+F6 rename overlay -- identical chrome to
+/// [`mkdir_dialog_overlay`]; see that function's doc comment.
+fn rename_dialog_overlay(
+    state: &Entity<RenameDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("rename-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("rename-dialog-card")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_rename_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.7's symlink/hardlink overlay (one function for both, same as the
+/// one `LinkDialogState` type behind it) -- identical chrome to
+/// [`mkdir_dialog_overlay`]; see that function's doc comment.
+fn link_dialog_overlay(
+    state: &Entity<LinkDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("link-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("link-dialog-card")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_link_dialog(window, cx);
                 })),
         )
 }
@@ -6074,5 +6505,532 @@ mod tests {
             load_confirm_delete_policy(&dir.path().join("absent.toml")),
             "always"
         );
+    }
+
+    // -- T-5.2.7 mkdir / rename / symlink / hardlink -------------------------
+
+    fn open_mkdir_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<MkdirDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.mkdir_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.mkdir_dialog.clone())
+            .expect("the mkdir dialog must be open by now")
+    }
+
+    fn open_rename_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<RenameDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.rename_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.rename_dialog.clone())
+            .expect("the rename dialog must be open by now")
+    }
+
+    fn open_link_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<LinkDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.link_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.link_dialog.clone())
+            .expect("the link dialog must be open by now")
+    }
+
+    /// Confirms whichever of the three T-5.2.7 dialogs currently holds
+    /// focus. Dispatches the resolved `duet_widgets::input::Enter` action
+    /// rather than `simulate_keystrokes("enter")`, for exactly the reason
+    /// `f5_copy_end_to_end_copies_a_real_file_to_the_other_panels_directory`
+    /// documents at length: the latter drives GPUI's synthetic IME pipeline
+    /// into an unrelated upstream panic against a focused, non-empty
+    /// `InputState`. This still exercises the real `InputState::enter` ->
+    /// `cx.emit(PressEnter)` -> `cx.subscribe_in` -> `confirm` path, with no
+    /// shortcut through any dialog's own private methods.
+    fn press_enter(vcx: &mut VisualTestContext) {
+        vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+    }
+
+    /// Escape, likewise dispatched as the already-bound
+    /// `duet_widgets::input::Escape` action `InputState` lets bubble out of
+    /// its own `"Input"` key context -- see `copy_move_dialog.rs`'s module
+    /// doc comment for why no dialog here binds Escape itself.
+    fn press_escape(vcx: &mut VisualTestContext) {
+        vcx.dispatch_action(duet_widgets::input::Escape);
+    }
+
+    // -- F7 mkdir -------------------------------------------------------------
+
+    #[gpui::test]
+    fn f7_opens_the_mkdir_dialog_prefilled_with_the_current_directory(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("anything.txt"), b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(MkdirDialog);
+            let state = open_mkdir_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(
+                    state.destination_value(cx),
+                    format!("{}/", dir.path().to_string_lossy()),
+                    "F7 pre-fills the focused panel's own directory plus a trailing slash, so \
+                     the user types only the new segment(s)"
+                );
+            });
+        });
+    }
+
+    /// This task's own AC clause: "F7 supports creating nested paths in one
+    /// go, as TC does." Real tempdir, real `LocalFs`, the real off-thread
+    /// `plan_mkdir` -> `QueueManager::enqueue` -> `execute()` path; all
+    /// three levels must exist on disk afterwards.
+    #[gpui::test]
+    fn confirming_f7_creates_a_whole_nested_path_in_one_go(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("anything.txt"), b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(MkdirDialog);
+            let state = open_mkdir_dialog_state(&workspace, vcx);
+
+            let nested = dir.path().join("a/b/c");
+            state.update_in(vcx, |state, window, cx| {
+                state.set_destination_value(&nested.to_string_lossy(), window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                nested.is_dir() && workspace.read_with(vcx, |ws, _| ws.mkdir_dialog.is_none())
+            });
+            assert!(dir.path().join("a").is_dir());
+            assert!(dir.path().join("a/b").is_dir());
+        });
+    }
+
+    /// Confirming without typing anything past the pre-filled directory is
+    /// a harmless no-op, not an error: `UnixPathBuf::new` strips the
+    /// trailing slash, leaving the panel's already-existing directory, and
+    /// `plan_mkdir`'s documented "already there is success" convention
+    /// makes that a valid, zero-step plan. See `crate::mkdir_dialog`'s
+    /// module doc comment.
+    #[gpui::test]
+    fn confirming_f7_with_nothing_typed_is_a_harmless_no_op(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("anything.txt"), b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(MkdirDialog);
+            let _state = open_mkdir_dialog_state(&workspace, vcx);
+
+            press_enter(vcx);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.mkdir_dialog.is_none())
+            });
+
+            assert!(dir.path().is_dir(), "the directory itself must survive");
+            assert!(
+                dir.path().join("anything.txt").is_file(),
+                "and so must everything in it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_mkdir_dialog_creates_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("anything.txt"), b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(MkdirDialog);
+            let state = open_mkdir_dialog_state(&workspace, vcx);
+            let nested = dir.path().join("never-created");
+            state.update_in(vcx, |state, window, cx| {
+                state.set_destination_value(&nested.to_string_lossy(), window, cx);
+            });
+
+            press_escape(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.mkdir_dialog.is_none()));
+            assert!(!nested.exists(), "Escape must enqueue nothing at all");
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "cancelling must restore focus to the panel F7 was pressed in"
+                );
+            });
+        });
+    }
+
+    // -- Shift+F6 rename in place ---------------------------------------------
+
+    /// This task's own AC clause, in the split-field form
+    /// `crate::rename_dialog`'s module doc comment justifies at length: the
+    /// editable field holds *only* the stem, and the extension is a fixed
+    /// suffix the user cannot damage.
+    #[gpui::test]
+    fn shift_f6_prefills_the_stem_and_pins_the_extension(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("photo.jpg"), b"jpeg").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(RenameDialog);
+            let state = open_rename_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(
+                    state.stem_value(cx),
+                    "photo",
+                    "the editable field holds the stem alone, never the extension"
+                );
+                assert_eq!(state.extension(), Some("jpg"));
+                assert_eq!(
+                    state.source(),
+                    &crate::file_table::local_vpath(&dir.path().join("photo.jpg")).unwrap(),
+                    "Shift+F6 renames the cursor entry, resolved once at open time"
+                );
+            });
+        });
+    }
+
+    /// The end-to-end half: a real rename on real disk, through the real
+    /// off-thread `plan_rename_in_place` -> `QueueManager::enqueue` ->
+    /// `execute()` path, with the extension carried across untouched even
+    /// though the user only ever edited the stem.
+    #[gpui::test]
+    fn confirming_a_rename_renames_the_file_with_the_extension_intact(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let before = dir.path().join("photo.jpg");
+            let after = dir.path().join("holiday.jpg");
+            std::fs::write(&before, b"jpeg bytes").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(RenameDialog);
+            let state = open_rename_dialog_state(&workspace, vcx);
+            state.update_in(vcx, |state, window, cx| {
+                state.set_stem_value("holiday", window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                after.is_file() && workspace.read_with(vcx, |ws, _| ws.rename_dialog.is_none())
+            });
+            assert!(!before.exists(), "the original name must be gone");
+            assert_eq!(std::fs::read(&after).unwrap(), b"jpeg bytes");
+        });
+    }
+
+    /// A dotfile has no extension by `Path::extension()`'s reckoning (the
+    /// same convention `FileTableDelegate::select_same_extension` uses), so
+    /// the whole name is editable and no fixed suffix is shown -- matching
+    /// TC, and what this task's AC implicitly carves out by only ever
+    /// mentioning "the extension".
+    #[gpui::test]
+    fn shift_f6_on_a_dotfile_makes_the_whole_name_editable(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".bashrc"), b"export X=1").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(RenameDialog);
+            let state = open_rename_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.stem_value(cx), ".bashrc");
+                assert_eq!(
+                    state.extension(),
+                    None,
+                    "a leading dot is not an extension -- there is no fixed suffix to show"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_rename_dialog_keeps_the_original_name_and_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let original = dir.path().join("keep.txt");
+            std::fs::write(&original, b"unchanged").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(RenameDialog);
+            let state = open_rename_dialog_state(&workspace, vcx);
+            state.update_in(vcx, |state, window, cx| {
+                state.set_stem_value("renamed", window, cx);
+            });
+
+            press_escape(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.rename_dialog.is_none()));
+            assert_eq!(std::fs::read(&original).unwrap(), b"unchanged");
+            assert!(!dir.path().join("renamed.txt").exists());
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "cancelling must restore focus to the panel Shift+F6 was pressed in"
+                );
+            });
+        });
+    }
+
+    /// An empty listing has no cursor entry, so there is nothing to rename
+    /// -- a no-op with an explanatory toast, not a dialog on nothing.
+    #[gpui::test]
+    fn shift_f6_in_an_empty_directory_opens_nothing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(RenameDialog);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.rename_dialog.is_none()));
+        });
+    }
+
+    // -- Ctrl+Shift+S symlink / Ctrl+Shift+H hardlink -------------------------
+
+    /// Points the right panel at `dest_dir` and the left at `source_dir`,
+    /// focusing the left -- the preamble both link commands need, since the
+    /// new link's path defaults to the *other* panel's directory.
+    fn focus_left_with_right_panel_at(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        source_dir: &Path,
+        dest_dir: &Path,
+    ) {
+        let right_table =
+            workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+        navigate_panel_to(vcx, &right_table, dest_dir.to_path_buf());
+        focus_left_panel_at(workspace, vcx, source_dir);
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_s_defaults_the_link_path_to_the_other_panels_directory(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("target.txt"), b"real file").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(SymlinkDialog);
+            let state = open_link_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.kind(), LinkKind::Symlink);
+                assert_eq!(
+                    state.source(),
+                    &crate::file_table::local_vpath(&source_dir.path().join("target.txt")).unwrap()
+                );
+                assert_eq!(
+                    state.link_path_value(cx),
+                    dest_dir
+                        .path()
+                        .join("target.txt")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "the new link defaults into the other panel's directory under the same name, \
+                     matching F5/F6's own destination convention"
+                );
+            });
+        });
+    }
+
+    /// The end-to-end symlink: a real link on real disk whose
+    /// `std::fs::read_link` is exactly the source's own absolute path (a
+    /// plain path, not `VPath`'s `file://` URI `Display` form -- see
+    /// `crate::link_dialog`'s module doc comment).
+    #[gpui::test]
+    fn confirming_a_symlink_creates_a_real_link_pointing_at_the_source(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            let source = source_dir.path().join("target.txt");
+            std::fs::write(&source, b"real file").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(SymlinkDialog);
+            let _state = open_link_dialog_state(&workspace, vcx);
+            press_enter(vcx);
+
+            let link = dest_dir.path().join("target.txt");
+            wait_until(vcx, |vcx| {
+                std::fs::symlink_metadata(&link).is_ok()
+                    && workspace.read_with(vcx, |ws, _| ws.link_dialog.is_none())
+            });
+
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "lstat must report a symlink -- metadata() would follow it"
+            );
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                source,
+                "the target stored in the link is the source's plain absolute path"
+            );
+            assert_eq!(
+                std::fs::read(&link).unwrap(),
+                b"real file",
+                "and following it must reach the real content"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_symlink_dialog_creates_nothing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("target.txt"), b"real file").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(SymlinkDialog);
+            let _state = open_link_dialog_state(&workspace, vcx);
+
+            press_escape(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.link_dialog.is_none()));
+            assert!(
+                std::fs::symlink_metadata(dest_dir.path().join("target.txt")).is_err(),
+                "Escape must enqueue nothing at all"
+            );
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| assert!(left_handle.is_focused(window)));
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_shift_h_opens_the_hardlink_dialog_on_the_cursor_entry(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("target.txt"), b"real file").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(HardlinkDialog);
+            let state = open_link_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.kind(), LinkKind::Hardlink);
+                assert_eq!(
+                    state.link_path_value(cx),
+                    dest_dir
+                        .path()
+                        .join("target.txt")
+                        .to_string_lossy()
+                        .into_owned()
+                );
+            });
+        });
+    }
+
+    /// The end-to-end hardlink: both names resolving to the same inode with
+    /// `nlink == 2`, the same assertions `duet-ops`' own
+    /// `hardlink_creates_a_second_name_for_the_same_inode` makes about the
+    /// planner, now made about the whole UI path. The link is deliberately
+    /// created *inside the source directory* rather than the other panel's:
+    /// a hardlink cannot cross filesystems, and two independent `TempDir`s
+    /// are not guaranteed to share one.
+    #[gpui::test]
+    fn confirming_a_hardlink_creates_a_second_name_for_the_same_inode(cx: &mut TestAppContext) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            let source = source_dir.path().join("target.txt");
+            std::fs::write(&source, b"shared content").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(HardlinkDialog);
+            let state = open_link_dialog_state(&workspace, vcx);
+            let link = source_dir.path().join("alias.txt");
+            state.update_in(vcx, |state, window, cx| {
+                state.set_link_path_value(&link.to_string_lossy(), window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                link.is_file() && workspace.read_with(vcx, |ws, _| ws.link_dialog.is_none())
+            });
+
+            let source_meta = std::fs::metadata(&source).unwrap();
+            let link_meta = std::fs::metadata(&link).unwrap();
+            assert_eq!(
+                source_meta.ino(),
+                link_meta.ino(),
+                "both names must resolve to the same inode"
+            );
+            assert_eq!(source_meta.nlink(), 2);
+
+            std::fs::write(&source, b"changed").unwrap();
+            assert_eq!(
+                std::fs::read(&link).unwrap(),
+                b"changed",
+                "a write through either name must be visible through the other"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_hardlink_dialog_creates_nothing(cx: &mut TestAppContext) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("target.txt"), b"real file").unwrap();
+            focus_left_with_right_panel_at(&workspace, vcx, source_dir.path(), dest_dir.path());
+
+            vcx.dispatch_action(HardlinkDialog);
+            let state = open_link_dialog_state(&workspace, vcx);
+            let link = source_dir.path().join("alias.txt");
+            state.update_in(vcx, |state, window, cx| {
+                state.set_link_path_value(&link.to_string_lossy(), window, cx);
+            });
+
+            press_escape(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.link_dialog.is_none()));
+            assert!(!link.exists(), "Escape must enqueue nothing at all");
+            assert_eq!(
+                std::fs::metadata(source_dir.path().join("target.txt"))
+                    .unwrap()
+                    .nlink(),
+                1,
+                "the source must still have exactly one name"
+            );
+        });
     }
 }
