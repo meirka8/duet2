@@ -57,6 +57,11 @@
 //!   answer → a live `ConflictResolver`, if `execute()` was given one →
 //!   `PlanOptions::default_conflict` (the job-level default, and the only
 //!   tier available with no live resolver at all).
+//! - [`rerun`] — T-5.2.4: [`rerun::plan_from_report`], the pure
+//!   `Plan` + `JobReport` -> smaller `Plan` rebuild behind the error/skip
+//!   report's own "re-run failed" action (`docs/commands.md`'s
+//!   `ops.queue.retry_failed`). The one planner here that walks nothing at
+//!   all: everything it needs is already in the finished job.
 //! - [`job`] / [`event`] — the queued unit and the event stream a UI (or
 //!   test harness) subscribes to instead of polling (design.md §8.2).
 //! - [`journal`] — T-5.1.2, the FR-OPS-07 crash-safety backbone:
@@ -78,6 +83,7 @@ mod mover;
 mod plan;
 mod planner;
 mod queue;
+mod rerun;
 mod step;
 
 pub use conflict::{
@@ -93,4 +99,5 @@ pub use mover::plan_move;
 pub use plan::{Plan, PlanOptions, PlanTotals};
 pub use planner::{CancelToken, PlannerError, plan_copy};
 pub use queue::{QueueError, QueueManager};
+pub use rerun::plan_from_report;
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
