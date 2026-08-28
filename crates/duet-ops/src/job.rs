@@ -45,6 +45,14 @@ pub enum JobKind {
     CreateDir,
     CreateSymlink,
     CreateHardlink,
+    /// T-5.2.8's `Ctrl+A` attributes/permissions change (FR-OPS-12) —
+    /// a plan of nothing but [`crate::Step::SetMeta`] steps, one per
+    /// affected path, produced by [`crate::plan_attributes`]. One variant
+    /// covers both the non-recursive and recursive cases, and both the
+    /// permission and the timestamp halves: they differ only in how many
+    /// steps the plan has and which `MetaPatch` fields are `Some`, not in
+    /// what the queue manager should call the job.
+    ChangeAttributes,
 }
 
 /// A queued job: a `Plan` plus its current lifecycle state and queue

@@ -573,6 +573,7 @@ pub(crate) fn describe_kind(kind: JobKind) -> &'static str {
         JobKind::CreateDir => "Create directory",
         JobKind::CreateSymlink => "Create symlink",
         JobKind::CreateHardlink => "Create hardlink",
+        JobKind::ChangeAttributes => "Change attributes",
     }
 }
 

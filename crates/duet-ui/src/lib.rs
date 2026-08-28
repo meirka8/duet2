@@ -17,6 +17,7 @@
 //! (`docs/config-schema.md` §4), live desktop light/dark follow, and
 //! `themes/*.toml` loading with hot reload (`theme_controller`).
 
+mod attributes_dialog;
 mod command_palette;
 mod conflict_dialog;
 mod copy_move_dialog;

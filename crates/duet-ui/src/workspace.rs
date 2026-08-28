@@ -38,6 +38,9 @@ use gpui::{
     WindowBounds, WindowOptions, actions, px, size,
 };
 
+use crate::attributes_dialog::{
+    AttributesDialogState, AttributesPrefill, bind_attributes_dialog_keys,
+};
 use crate::command_palette::CommandPaletteDelegate;
 use crate::conflict_dialog::{
     ConflictDialogState, ConflictRequest, InteractiveConflictResolver, bind_conflict_dialog_keys,
@@ -191,6 +194,30 @@ actions!(
     [MkdirDialog, RenameDialog, SymlinkDialog, HardlinkDialog]
 );
 
+// T-5.2.8's Ctrl+A attributes/permissions dialog (FR-OPS-12). Unlike the
+// two link chords right above, this one is a **verified TC binding**:
+// `docs/keymap-tc.csv` row 16 (`ops.change_attributes`, "known"
+// confidence) with the note "Single most-cited keybinding 'gotcha' in TC"
+// -- in Total Commander, Ctrl+A opens Change Attributes, it does *not*
+// select all. This app deliberately follows that, which costs nothing
+// here: "select all" is `Ctrl++` (`file_table::SelectAll`, per
+// `docs/keymap-tc.csv`'s own `sel.all` row), so Ctrl+A was genuinely
+// unclaimed by every `KeyBinding::new` call site in this crate.
+//
+// `gpui-component`'s `InputState` binds Ctrl+A to a select-all inside its
+// own `"Input"` key context, which is strictly deeper than `"Workspace"`
+// -- so a focused text field still gets select-all, and only a focused
+// panel opens this dialog. That is the correct behaviour for both, not a
+// conflict.
+//
+// `docs/commands.md` catalogues the same command as `file.attributes`
+// (`panel && selection.nonempty`) -- a known, pre-existing id mismatch
+// with the CSV's `ops.change_attributes`, not something this task
+// reconciles. Its `file.chmod_recursive`/`file.set_timestamps` neighbours
+// are this same dialog's own internals (the Ctrl+R toggle, the two
+// timestamp fields), not separate top-level commands.
+actions!(duet_workspace, [AttributesDialog]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -220,6 +247,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("shift-f6", RenameDialog, Some("Workspace")),
         KeyBinding::new("ctrl-shift-s", SymlinkDialog, Some("Workspace")),
         KeyBinding::new("ctrl-shift-h", HardlinkDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-a", AttributesDialog, Some("Workspace")),
     ]);
 }
 
@@ -249,6 +277,7 @@ pub fn run() {
         bind_operation_manager_keys(cx);
         bind_job_report_dialog_keys(cx);
         bind_conflict_dialog_keys(cx);
+        bind_attributes_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -558,6 +587,16 @@ pub struct Workspace {
     /// Saved by `open_link_dialog`, restored and cleared by
     /// `close_link_dialog`/`close_link_dialog_deferred`.
     link_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.8's `Ctrl+A` attributes/permissions dialog is
+    /// open. Mirrors `copy_move_dialog`'s own field exactly; see
+    /// `crate::attributes_dialog`'s module doc comment, in particular for
+    /// why `Ctrl+A` is Change Attributes here and not "select all".
+    attributes_dialog: Option<Entity<AttributesDialogState>>,
+    /// Saved by `open_attributes_dialog` on the path that actually shows
+    /// the dialog, restored and cleared by `close_attributes_dialog`/
+    /// `close_attributes_dialog_deferred`.
+    attributes_dialog_previous_focus: Option<FocusHandle>,
 
     /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
     /// `"never"`), read once at startup the same way every other
@@ -1058,6 +1097,8 @@ impl Workspace {
             rename_dialog_previous_focus: None,
             link_dialog: None,
             link_dialog_previous_focus: None,
+            attributes_dialog: None,
+            attributes_dialog_previous_focus: None,
             confirm_delete,
             delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
@@ -2165,6 +2206,196 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `Ctrl+A` (`AttributesDialog`), T-5.2.8: opens the attributes/
+    /// permissions dialog on the focused panel's selection -- or the cursor
+    /// row, if nothing is selected, via the same
+    /// `copy_move_dialog::resolve_source_names` fallback F5/F6/F8 use and
+    /// that `docs/commands.md`'s own `panel && selection.nonempty`
+    /// precondition for `file.attributes` implies. Deliberately *not* the
+    /// "exactly one entry" scope T-5.2.7's link dialogs chose: changing
+    /// permissions across a multi-selection is an ordinary thing to want,
+    /// and `duet_ops::plan_attributes` takes a `&[VPath]` for exactly that
+    /// reason.
+    ///
+    /// A no-op with an explanatory toast if there is nothing to act on, and
+    /// silently if the dialog is already open.
+    ///
+    /// # Why this one is asynchronous
+    ///
+    /// With exactly one target the dialog opens pre-filled with that
+    /// entry's *current* mode and timestamps, which needs a real `stat`.
+    /// `Metadata::mode` is not part of the panel's already-loaded listing
+    /// (`FileTableSettings`' own `ListFields` don't request it), so unlike
+    /// `open_delete_dialog`'s directory check this cannot be answered from
+    /// memory. The `stat` therefore runs on the ops runtime and the dialog
+    /// is constructed in the continuation -- the same "`tokio_handle.spawn`,
+    /// a `oneshot`, then `window.spawn`/`update_in`" shape
+    /// [`Self::open_delete_dialog`] already uses, so the continuation still
+    /// has a live `Window` to take focus with.
+    ///
+    /// With more than one target there is nothing to pre-fill from (see
+    /// `AttributesDialogState::new`), so that path skips the `stat` and
+    /// shows the dialog synchronously.
+    fn open_attributes_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.attributes_dialog.is_some() {
+            return;
+        }
+
+        let source_panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let source_table = source_panel.read(cx).active_table().clone();
+        let current_dir = source_table.read(cx).current_dir().to_path_buf();
+        let (names, dir_names) = {
+            let table_state = source_table.read(cx).state().read(cx);
+            let delegate = table_state.delegate();
+            let names = crate::copy_move_dialog::resolve_source_names(delegate);
+            // Directory-ness comes free out of the already-loaded model --
+            // no I/O, exactly as `open_delete_dialog` reads it. Only used
+            // to make the recursive hint line honest.
+            let model = delegate.model();
+            let dir_names: std::collections::HashSet<String> = model
+                .ordered_names()
+                .filter(|(id, _)| model.entries().kind(*id) == duet_types::EntryKind::Directory)
+                .map(|(_, name)| name.to_string())
+                .collect();
+            (names, dir_names)
+        };
+        if names.is_empty() {
+            window.push_notification(Notification::info("Nothing selected."), cx);
+            return;
+        }
+
+        let mut targets: Vec<VPath> = Vec::with_capacity(names.len());
+        let mut has_directory_target = false;
+        for name in &names {
+            let Ok(vpath) = crate::file_table::local_vpath(&current_dir.join(name)) else {
+                continue;
+            };
+            has_directory_target |= dir_names.contains(name);
+            targets.push(vpath);
+        }
+        if targets.is_empty() {
+            window.push_notification(
+                Notification::warning("The selected item(s) don't have a valid path."),
+                cx,
+            );
+            return;
+        }
+
+        let single_name = (targets.len() == 1).then(|| names[0].clone());
+        if targets.len() > 1 {
+            self.show_attributes_dialog(
+                targets,
+                single_name,
+                has_directory_target,
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let target = targets[0].clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tokio_handle.spawn(async move {
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            // `follow_symlinks: false`: a cursor parked on a symlink should
+            // show the link's *own* attributes, matching what the panel row
+            // beside it already reports.
+            let prefill = fs
+                .stat(&target, false)
+                .await
+                .ok()
+                .map(|meta| AttributesPrefill {
+                    mode: meta.mode,
+                    modified_secs: meta.modified.map(|t| t.secs),
+                    accessed_secs: meta.accessed.map(|t| t.secs),
+                });
+            let _ = tx.send(prefill);
+        });
+        let weak_workspace = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                // A failed `stat` (or a dropped sender during runtime
+                // shutdown) degrades to "no pre-fill" -- four blank fields,
+                // every one of which means "leave unchanged". Never a
+                // silently swallowed Ctrl+A.
+                let prefill = rx.await.unwrap_or(None);
+                let _ = weak_workspace.update_in(cx, |this: &mut Workspace, window, cx| {
+                    this.show_attributes_dialog(
+                        targets,
+                        single_name,
+                        has_directory_target,
+                        prefill,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .detach();
+    }
+
+    /// Constructs, stores and focuses the attributes dialog --
+    /// [`Self::open_attributes_dialog`]'s one "actually show it" path,
+    /// reachable both synchronously (a multi-selection, nothing to
+    /// pre-fill) and from its spawned `stat` continuation. Captures the
+    /// focus to restore here rather than in `open_attributes_dialog`, for
+    /// the same reason `show_delete_dialog` does: the paths that never show
+    /// a dialog never take focus away, so they have nothing to restore.
+    #[allow(clippy::too_many_arguments)]
+    fn show_attributes_dialog(
+        &mut self,
+        targets: Vec<VPath>,
+        single_name: Option<String>,
+        has_directory_target: bool,
+        prefill: Option<AttributesPrefill>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.attributes_dialog.is_some() {
+            return;
+        }
+        self.attributes_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            AttributesDialogState::new(
+                targets,
+                single_name,
+                has_directory_target,
+                prefill,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.attributes_dialog = Some(state);
+        cx.notify();
+    }
+
+    pub(crate) fn close_attributes_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.attributes_dialog = None;
+        if let Some(handle) = self.attributes_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_attributes_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.attributes_dialog = None;
+        self.pending_focus_restore = self.attributes_dialog_previous_focus.take();
+        cx.notify();
+    }
+
     /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
     /// "does `parent` match either panel's already-loaded directory" half
     /// -- see that method's own doc comment for the full picture (T-5.2.1's
@@ -2704,6 +2935,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &HardlinkDialog, window, cx| {
                 this.open_link_dialog(LinkKind::Hardlink, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &AttributesDialog, window, cx| {
+                this.open_attributes_dialog(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenOperationManager, window, cx| {
                 this.open_operation_manager(window, cx);
             }))
@@ -2731,6 +2965,9 @@ impl Render for Workspace {
             })
             .when_some(self.link_dialog.clone(), |this, state| {
                 this.child(link_dialog_overlay(&state, cx))
+            })
+            .when_some(self.attributes_dialog.clone(), |this, state| {
+                this.child(attributes_dialog_overlay(&state, cx))
             })
             .when_some(self.operation_manager.clone(), |this, state| {
                 this.child(operation_manager_overlay(&state, cx))
@@ -3043,6 +3280,42 @@ fn link_dialog_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_link_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.8's Ctrl+A attributes overlay -- same chrome as
+/// [`mkdir_dialog_overlay`] (see that function's doc comment), just a wider
+/// card: this dialog has four labelled fields where every sibling has one
+/// unlabelled one, and a `140px` label column plus a usable input needs
+/// more than `480px` to avoid squeezing `YYYY-MM-DD HH:MM` down to nothing.
+fn attributes_dialog_overlay(
+    state: &Entity<AttributesDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("attributes-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("attributes-dialog-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_attributes_dialog(window, cx);
                 })),
         )
 }
@@ -3777,6 +4050,9 @@ mod tests {
     // T-5.2.6's own overlay-internal actions -- same reasoning as the two
     // imports above: declared in `crate::delete_dialog`, not here.
     use crate::delete_dialog::{CancelDelete, ConfirmDelete, ToggleTrashPermanent};
+    // T-5.2.8's own overlay-internal action -- same reasoning as the three
+    // imports above: declared in `crate::attributes_dialog`, not here.
+    use crate::attributes_dialog::ToggleRecursiveApply;
     use duet_ops::{ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope};
     use duet_types::{EntryKind, Metadata, Timestamp};
     use duet_widgets::input::IndentInline;
@@ -3863,6 +4139,7 @@ mod tests {
             bind_operation_manager_keys(cx);
             bind_job_report_dialog_keys(cx);
             bind_conflict_dialog_keys(cx);
+            bind_attributes_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -7204,6 +7481,394 @@ mod tests {
                 1,
                 "the source must still have exactly one name"
             );
+        });
+    }
+
+    // -- T-5.2.8 Ctrl+A attributes / permissions -------------------------------
+
+    fn open_attributes_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<AttributesDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.attributes_dialog.clone())
+            .expect("the attributes dialog must be open by now")
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `Ctrl+A` opens Change Attributes -- **not** select-all
+    /// (`docs/keymap-tc.csv` row 16's own "single most-cited keybinding
+    /// 'gotcha' in TC" note). Driven by a real keystroke rather than
+    /// `dispatch_action`, so this actually proves `bind_workspace_keys`'
+    /// `"ctrl-a"` binding resolves from a focused panel; safe to simulate
+    /// here for the same reason `the_f8_and_shift_f8_keystrokes_really_open
+    /// _the_dialog` is (a panel, not an `InputState`, holds focus at the
+    /// moment the keystroke lands).
+    #[gpui::test]
+    fn ctrl_a_opens_the_attributes_dialog_prefilled_with_the_entrys_real_mode(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("subject.txt");
+            std::fs::write(&file, b"x").unwrap();
+            chmod(&file, 0o640);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.simulate_keystrokes("ctrl-a");
+            let state = open_attributes_dialog_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(
+                    state.targets(),
+                    &[crate::file_table::local_vpath(&file).unwrap()],
+                    "with nothing selected, Ctrl+A falls back to the cursor entry"
+                );
+                assert_eq!(
+                    state.mode_octal_value(cx),
+                    "640",
+                    "the octal field opens showing the file's real current mode"
+                );
+                assert_eq!(
+                    state.mode_symbolic_value(cx),
+                    "rw-r-----",
+                    "and the symbolic field shows exactly the same bits"
+                );
+                assert!(
+                    !state.recursive(),
+                    "recursive apply starts off -- it is the more destructive choice"
+                );
+            });
+        });
+    }
+
+    /// This task's AC, verbatim: "octal and symbolic entry agree." Driven
+    /// through the real `InputState::set_value` -> `InputEvent::Change` ->
+    /// `cx.subscribe_in` path, not by calling the sync method directly.
+    #[gpui::test]
+    fn typing_in_either_mode_field_live_updates_the_other(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("subject.txt");
+            std::fs::write(&file, b"x").unwrap();
+            chmod(&file, 0o600);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+
+            // Octal -> symbolic.
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("644", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.mode_symbolic_value(cx), "rw-r--r--");
+                assert_eq!(state.mode_octal_value(cx), "644", "and stays put itself");
+            });
+
+            // Symbolic -> octal, including a special bit, which must come
+            // back as the four-digit rendering.
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_symbolic_value("rwsr-xr-x", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.mode_octal_value(cx), "4755");
+                assert_eq!(state.mode_symbolic_value(cx), "rwsr-xr-x");
+            });
+
+            // Garbage in one field must leave the other alone rather than
+            // propagating nonsense.
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("99z", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(
+                    state.mode_symbolic_value(cx),
+                    "rwsr-xr-x",
+                    "an unparseable octal value must not blank or corrupt the symbolic field"
+                );
+            });
+
+            // Clearing one field *does* propagate -- both must agree that
+            // the mode is being left unchanged.
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("", window, cx);
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.mode_symbolic_value(cx), "");
+            });
+        });
+    }
+
+    /// End-to-end, non-recursive: a real mode change on real disk through
+    /// the real off-thread `plan_attributes` -> `QueueManager::enqueue` ->
+    /// `execute()` path, asserted with a real `stat`.
+    #[gpui::test]
+    fn confirming_a_mode_change_changes_exactly_that_file_on_disk(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let subject = dir.path().join("a-subject.txt");
+            let bystander = dir.path().join("z-bystander.txt");
+            std::fs::write(&subject, b"x").unwrap();
+            std::fs::write(&bystander, b"y").unwrap();
+            chmod(&subject, 0o600);
+            chmod(&bystander, 0o600);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("754", window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                mode_of(&subject) == 0o754
+                    && workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_none())
+            });
+            assert_eq!(
+                mode_of(&bystander),
+                0o600,
+                "only the cursor entry was targeted -- the other file must be untouched"
+            );
+        });
+    }
+
+    /// The AC's other half: "recursive apply runs through the operation
+    /// queue, not synchronously." The toggle is dispatched as its real
+    /// `ToggleRecursiveApply` action (`Ctrl+R` inside the dialog's own key
+    /// context); everything beneath the directory must end up changed, at
+    /// every depth.
+    #[gpui::test]
+    fn confirming_a_recursive_mode_change_reaches_every_entry_beneath_the_directory(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("tree");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("top.txt"), b"x").unwrap();
+            std::fs::create_dir(root.join("sub")).unwrap();
+            std::fs::write(root.join("sub/deep.txt"), b"x").unwrap();
+            let everything = [
+                root.clone(),
+                root.join("top.txt"),
+                root.join("sub"),
+                root.join("sub/deep.txt"),
+            ];
+            for p in &everything {
+                chmod(p, 0o700);
+            }
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+            vcx.dispatch_action(ToggleRecursiveApply);
+            state.read_with(vcx, |state, _| {
+                assert!(state.recursive(), "Ctrl+R must have flipped the toggle on");
+            });
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("755", window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                everything.iter().all(|p| mode_of(p) == 0o755)
+                    && workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_none())
+            });
+        });
+    }
+
+    /// Without the toggle, the very same directory target must leave its
+    /// contents alone -- the other side of the recursive test above.
+    #[gpui::test]
+    fn confirming_without_the_recursive_toggle_leaves_the_contents_alone(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("tree");
+            std::fs::create_dir(&root).unwrap();
+            let inside = root.join("inside.txt");
+            std::fs::write(&inside, b"x").unwrap();
+            chmod(&root, 0o700);
+            chmod(&inside, 0o600);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("755", window, cx);
+            });
+            press_enter(vcx);
+
+            wait_until(vcx, |vcx| {
+                mode_of(&root) == 0o755
+                    && workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_none())
+            });
+            assert_eq!(
+                mode_of(&inside),
+                0o600,
+                "recursive apply is off by default -- the contents must be untouched"
+            );
+        });
+    }
+
+    /// The timestamp-editing half of the AC, read back through a real
+    /// `stat` on real disk.
+    #[gpui::test]
+    fn confirming_a_timestamp_change_is_readable_back_from_disk(cx: &mut TestAppContext) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("dated.txt");
+            std::fs::write(&file, b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+
+            // The dialog opens pre-filled with the file's real mtime, in
+            // exactly the format the panel's own Date column uses.
+            let current_mtime = std::fs::metadata(&file).unwrap().mtime();
+            state.read_with(vcx, |state, cx| {
+                let mut expected = String::new();
+                crate::file_table::write_date(&mut expected, current_mtime);
+                assert_eq!(state.modified_value(cx), expected);
+            });
+
+            state.update_in(vcx, |state, window, cx| {
+                state.set_modified_value("2001-02-03 04:05", window, cx);
+            });
+            press_enter(vcx);
+
+            // 2001-02-03 04:05:00 UTC.
+            let expected_secs = 981_173_100i64;
+            wait_until(vcx, |vcx| {
+                std::fs::metadata(&file).unwrap().mtime() == expected_secs
+                    && workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_none())
+            });
+        });
+    }
+
+    /// With more than one target there is no single "current value" to
+    /// show, so both mode fields (and both timestamp fields) open blank --
+    /// and a blank field means "leave unchanged", so confirming without
+    /// typing anything must enqueue nothing at all.
+    #[gpui::test]
+    fn a_multi_selection_opens_blank_and_confirming_it_untouched_enqueues_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.txt");
+            let b = dir.path().join("b.txt");
+            std::fs::write(&a, b"x").unwrap();
+            std::fs::write(&b, b"y").unwrap();
+            chmod(&a, 0o600);
+            chmod(&b, 0o640);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            // Ctrl++ in this app, not Ctrl+A -- which is the whole point of
+            // the TC binding this dialog is behind.
+            vcx.dispatch_action(crate::file_table::SelectAll);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.targets().len(), 2, "both selected entries");
+                assert_eq!(
+                    state.mode_octal_value(cx),
+                    "",
+                    "two entries with different modes have no single value to pre-fill"
+                );
+                assert_eq!(state.mode_symbolic_value(cx), "");
+                assert_eq!(state.modified_value(cx), "");
+            });
+
+            press_enter(vcx);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.attributes_dialog.is_none())
+            });
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.queue.snapshot().is_empty(),
+                    "an entirely blank form is a no-op close, not an enqueued job"
+                );
+            });
+            assert_eq!(mode_of(&a), 0o600, "and nothing on disk changed");
+            assert_eq!(mode_of(&b), 0o640);
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_attributes_dialog_changes_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("subject.txt");
+            std::fs::write(&file, b"x").unwrap();
+            chmod(&file, 0o600);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let state = open_attributes_dialog_state(&workspace, vcx);
+            state.update_in(vcx, |state, window, cx| {
+                state.set_mode_octal_value("777", window, cx);
+            });
+
+            press_escape(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(ws.attributes_dialog.is_none());
+                assert!(
+                    ws.queue.snapshot().is_empty(),
+                    "Escape must enqueue nothing at all"
+                );
+            });
+            assert_eq!(mode_of(&file), 0o600, "the mode on disk must be unchanged");
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "cancelling must restore focus to the panel Ctrl+A was pressed in"
+                );
+            });
+        });
+    }
+
+    /// An empty listing has no selection and no cursor entry, so there is
+    /// nothing to change attributes on -- a no-op with a toast, not a
+    /// dialog on nothing.
+    #[gpui::test]
+    fn ctrl_a_in_an_empty_directory_opens_nothing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(AttributesDialog);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.attributes_dialog.is_none()));
         });
     }
 
