@@ -130,10 +130,16 @@
 //! - **No live per-conflict prompt** (T-5.2.3) -- `JobEvent::
 //!   ConflictDetected` is only logged (`Workspace::new`'s event-consumer
 //!   loop), never surfaced as an interactive prompt here.
-//! - **No itemized error/skip list with "re-run failed"** (T-5.2.4) -- a
-//!   `Failed`/`CompletedWithSkips` row shows a terminal summary count
-//!   (`report.errors.len()`/`report.skipped.len()`) via [`progress_line`],
-//!   nothing more.
+//! - **No itemized error/skip list with "re-run failed" *in this
+//!   overlay*.** T-5.2.4 has since landed, but as its own separate
+//!   overlay (`crate::job_report_dialog`): a `Failed`/
+//!   `CompletedWithSkips` row here still shows only the terminal summary
+//!   count (`report.errors.len()`/`report.skipped.len()`) via
+//!   [`progress_line`], with Enter on the row drilling into the full list.
+//!   The row itself stays a one-line summary by design -- an inline,
+//!   expandable fifty-row list is exactly the "manager becomes a
+//!   dashboard" shape this overlay's own performance section argues
+//!   against.
 //! - **No interrupted-operation-recovery-at-startup UI** (T-5.2.5).
 //! - **No queue reordering UI.** `QueueManager::reorder` exists and is
 //!   real, but "per-job controls" (this task's own AC wording) reads
@@ -178,6 +184,7 @@ actions!(
         OperationManagerPauseSelected,
         OperationManagerResumeSelected,
         OperationManagerCancelSelected,
+        OperationManagerOpenReport,
     ]
 );
 
@@ -202,6 +209,23 @@ pub(crate) fn bind_operation_manager_keys(cx: &mut App) {
             OperationManagerCancelSelected,
             Some("OperationManager"),
         ),
+        // T-5.2.4 (`ops.queue.show_errors`): Enter on the cursor row opens
+        // that job's error/skip report -- "view details on the selected
+        // row" is a near-universal list convention, and this crate's own
+        // `FileTable` already binds Enter to exactly that shape of
+        // "act on the cursor row". Bare `O` ("open") is a second,
+        // mnemonic chord for the same action, in the spirit of the two
+        // bindings TC itself gives most commands; both were confirmed
+        // unclaimed against every other `KeyBinding::new` call site in
+        // this crate, and neither collides with `P`/`R`/`C` above. See
+        // `crate::job_report_dialog`'s module doc comment for the full
+        // disclosed-default reasoning.
+        KeyBinding::new(
+            "enter",
+            OperationManagerOpenReport,
+            Some("OperationManager"),
+        ),
+        KeyBinding::new("o", OperationManagerOpenReport, Some("OperationManager")),
     ]);
 }
 
@@ -305,6 +329,39 @@ impl OperationManagerState {
         self.act_on_selected(QueueManager::cancel, cx);
     }
 
+    /// Enter/`O` (T-5.2.4, `ops.queue.show_errors`): opens the error/skip
+    /// report for whichever job is at `cursor`'s row -- the same "look up
+    /// whichever job is at this row" shape [`Self::act_on_selected`] uses,
+    /// but routed into a different overlay (`Workspace::
+    /// open_job_report_dialog`) rather than a `QueueManager` call, so it
+    /// can't share that helper's `fn(&QueueManager, JobId)` signature.
+    ///
+    /// A deliberate no-op when there is nothing to show: the row is still
+    /// running (no report exists yet, by construction -- only
+    /// `JobState::Terminal` carries one), or it finished cleanly with
+    /// neither errors nor skips. That matches `act_on_selected`'s own "no
+    /// matching job/state is a harmless no-op, not an error" tolerance,
+    /// and `docs/commands.md`'s own `job.has_errors` context predicate for
+    /// this command -- a command whose predicate is false simply doesn't
+    /// fire.
+    fn open_report_for_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let jobs = self.jobs();
+        let Some(job) = jobs.get(self.cursor) else {
+            return;
+        };
+        let JobState::Terminal { report, .. } = &job.state else {
+            return;
+        };
+        if !crate::job_report_dialog::has_anything_to_report(report) {
+            return;
+        }
+        let job = job.clone();
+        let workspace = self.workspace.clone();
+        let _ = workspace.update(cx, |workspace, cx| {
+            workspace.open_job_report_dialog(job, window, cx);
+        });
+    }
+
     /// Escape: close without acting on anything, mirroring
     /// `CopyMoveDialogState::cancel`/`HotlistDelegate::cancel` exactly.
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -385,7 +442,7 @@ impl Render for OperationManagerState {
                     .text_color(tokens.color.statusbar_fg)
                     .child(
                         "Up/Down select \u{2022} P pause \u{2022} R resume \u{2022} \
-                         C cancel \u{2022} Esc close",
+                         C cancel \u{2022} Enter report \u{2022} Esc close",
                     ),
             )
             .on_action(cx.listener(|this, _: &CloseOperationManager, window, cx| {
@@ -414,6 +471,11 @@ impl Render for OperationManagerState {
             .on_action(
                 cx.listener(|this, _: &OperationManagerCancelSelected, _window, cx| {
                     this.cancel_selected(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &OperationManagerOpenReport, window, cx| {
+                    this.open_report_for_selected(window, cx);
                 }),
             )
     }
@@ -497,7 +559,12 @@ pub(crate) fn tray_summary(
 /// `JobKind`'s own human-readable label -- covers every variant
 /// explicitly (no wildcard arm) so a future `JobKind` addition fails to
 /// compile here rather than silently falling back to a placeholder.
-fn describe_kind(kind: JobKind) -> &'static str {
+///
+/// `pub(crate)` since T-5.2.4: `crate::job_report_dialog`'s own title line
+/// names the same job kind, and two independently-worded labels for one
+/// `JobKind` would be a way for the manager row and the report opened
+/// straight off it to disagree in front of the user.
+pub(crate) fn describe_kind(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Copy => "Copy",
         JobKind::Move => "Move",
@@ -531,12 +598,24 @@ fn describe_state(state: &JobState) -> &'static str {
 /// matching `QueueManager::pause`/`resume`/`cancel`'s own documented
 /// state requirements exactly (`Running`-only pause, `Paused`-only
 /// resume, cancel for anything not yet `Terminal`).
+///
+/// A `Terminal` row offers nothing at all *unless* its report has
+/// something in it, in which case the one thing it does offer is T-5.2.4's
+/// Enter -- matching [`OperationManagerState::open_report_for_selected`]'s
+/// own gate exactly, so the hint never promises a keystroke that would
+/// no-op.
 fn controls_hint(state: &JobState) -> &'static str {
     match state {
         JobState::Running { .. } => "P pause \u{2022} C cancel",
         JobState::Paused { .. } => "R resume \u{2022} C cancel",
         JobState::Queued | JobState::Planning => "C cancel",
-        JobState::Terminal { .. } => "",
+        JobState::Terminal { report, .. } => {
+            if crate::job_report_dialog::has_anything_to_report(report) {
+                "Enter report"
+            } else {
+                ""
+            }
+        }
     }
 }
 

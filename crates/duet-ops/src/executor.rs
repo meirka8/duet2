@@ -1091,15 +1091,13 @@ fn step_primary_path(step: &Step) -> Option<VPath> {
 /// field exists to prevent (T-5.1.5: a cross-device move's terminal
 /// `Remove` running even though the copy it was supposed to follow failed
 /// or was never reached).
+///
+/// Delegates to [`Step::depends_on`] (T-5.2.4 promoted this same match to
+/// an inherent method, since [`crate::plan_from_report`] needs it too from
+/// outside this module) rather than keeping a second copy of the variant
+/// list that could drift from it.
 fn step_depends_on(step: &Step) -> Option<u32> {
-    match step {
-        Step::Remove { depends_on, .. }
-        | Step::Verify { depends_on, .. }
-        | Step::SetMeta { depends_on, .. }
-        | Step::Link { depends_on, .. }
-        | Step::Symlink { depends_on, .. } => *depends_on,
-        _ => None,
-    }
+    step.depends_on()
 }
 
 /// `Some(reason)` if `step` has an unmet [`step_depends_on`] dependency and

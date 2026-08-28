@@ -206,6 +206,40 @@ impl Step {
         }
     }
 
+    /// The `step_index` this step is contingent on, if it carries such a
+    /// dependency at all — the same field the executor's own dependency
+    /// gate reads (`crate::executor`'s `step_depends_on`, which now
+    /// delegates here) and the thing [`crate::plan_from_report`] has to
+    /// *remap* when it rebuilds a subset of a plan's steps into a smaller
+    /// re-run plan.
+    ///
+    /// Only `Link`, `Symlink`, `SetMeta`, `Remove`, and `Verify` carry a
+    /// `depends_on` field; `CreateDir`, `CopyFile`, `Reflink`, and
+    /// `Rename` do not, and their `None` here is a genuine "there is no
+    /// dependency to express," not a missing one — their ordering is
+    /// *positional* instead. See [`crate::plan_mkdir`]'s own doc comment:
+    /// "`Step::CreateDir` has no `depends_on` field, and doesn't need
+    /// one... Position in `Plan::steps` therefore already guarantees
+    /// ordering."
+    ///
+    /// Every variant is matched explicitly (no wildcard arm), same
+    /// reasoning as [`Step::kind`]'s: a future `Step` variant that carries
+    /// a dependency should fail to compile here rather than silently
+    /// report `None` and lose its gating.
+    pub fn depends_on(&self) -> Option<u32> {
+        match self {
+            Step::Link { depends_on, .. }
+            | Step::Symlink { depends_on, .. }
+            | Step::SetMeta { depends_on, .. }
+            | Step::Remove { depends_on, .. }
+            | Step::Verify { depends_on, .. } => *depends_on,
+            Step::CreateDir { .. }
+            | Step::CopyFile { .. }
+            | Step::Reflink { .. }
+            | Step::Rename { .. } => None,
+        }
+    }
+
     /// Planned byte count this step contributes to `Plan`'s totals, or `0`
     /// for steps with no content-transfer size of their own (everything
     /// but `CopyFile`/`Reflink`).

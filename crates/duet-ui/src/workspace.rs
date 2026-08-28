@@ -49,6 +49,7 @@ use crate::file_table::{
 };
 use crate::function_bar::{self, FKeySlot};
 use crate::hotlist::HotlistDelegate;
+use crate::job_report_dialog::{JobReportDialogState, bind_job_report_dialog_keys};
 use crate::link_dialog::{LinkDialogState, LinkKind};
 use crate::mkdir_dialog::MkdirDialogState;
 use crate::operation_manager::{OperationManagerState, bind_operation_manager_keys};
@@ -246,6 +247,7 @@ pub fn run() {
         bind_copy_move_dialog_keys(cx);
         bind_delete_dialog_keys(cx);
         bind_operation_manager_keys(cx);
+        bind_job_report_dialog_keys(cx);
         bind_conflict_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
@@ -630,6 +632,21 @@ pub struct Workspace {
     /// `close_operation_manager` -- same reasoning as
     /// `copy_move_dialog_previous_focus`.
     operation_manager_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.4's error/skip report overlay is open -- opened
+    /// from the operation manager's own Enter/`O` on a terminal row
+    /// (`ops.queue.show_errors`), which this app deliberately treats as
+    /// *replacing* the manager rather than stacking on top of it; see
+    /// `crate::job_report_dialog`'s module doc comment for that disclosed
+    /// judgment call and the two concrete reasons behind it.
+    job_report_dialog: Option<Entity<JobReportDialogState>>,
+    /// Saved by `open_job_report_dialog`, restored and cleared by
+    /// `close_job_report_dialog`/`close_job_report_dialog_deferred`. Since
+    /// opening the report closes the operation manager underneath it, this
+    /// inherits the *manager's* own saved handle (the panel Ctrl+O was
+    /// pressed in) rather than the manager's about-to-be-dropped one --
+    /// see `open_job_report_dialog`.
+    job_report_dialog_previous_focus: Option<FocusHandle>,
 
     /// T-5.2.3's live conflict dialog (FR-OPS-04): `Some` while a real,
     /// unresolved conflict from any running copy/move job is waiting on a
@@ -1049,6 +1066,8 @@ impl Workspace {
             job_progress: HashMap::new(),
             operation_manager: None,
             operation_manager_previous_focus: None,
+            job_report_dialog: None,
+            job_report_dialog_previous_focus: None,
             conflict_dialog: None,
             conflict_dialog_previous_focus: None,
             pending_conflict_focus: None,
@@ -2208,6 +2227,95 @@ impl Workspace {
         cx.notify();
     }
 
+    /// T-5.2.4 (`ops.queue.show_errors`): opens the error/skip report for
+    /// an already-finished `job` -- this task's own AC, "a job with 50
+    /// permission errors ends with an actionable list, not 50 dialogs."
+    /// Called only from `crate::operation_manager`'s Enter/`O` handler,
+    /// which has already established that `job` is `Terminal` and that its
+    /// report has something in it.
+    ///
+    /// **Opening the report closes the operation manager underneath it**
+    /// -- a "drill down, replacing the view" feel rather than a stacked
+    /// one. See `crate::job_report_dialog`'s module doc comment for the
+    /// full disclosed reasoning (two stacked backdrops darken the
+    /// workspace twice over, and the manager's window-wide
+    /// `.on_mouse_down_out` would close it on the first click into this
+    /// dialog anyway, stranding a saved focus handle). The manager's own
+    /// saved previous focus is *inherited* rather than dropped, so Escape
+    /// here lands back on the panel Ctrl+O was pressed in.
+    ///
+    /// A no-op, silently, if a report is already open -- the same
+    /// "reopening shouldn't stack a second one" convention every sibling
+    /// overlay follows.
+    pub(crate) fn open_job_report_dialog(
+        &mut self,
+        job: duet_ops::Job,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.job_report_dialog.is_some() {
+            return;
+        }
+        // Fully qualified rather than imported at the top of this file:
+        // `workspace.rs`'s non-test code inspects a `JobState` in exactly
+        // this one place (everywhere else it goes through
+        // `crate::operation_manager`), and a bare `use` would be a
+        // near-unused import -- see the test module's own note on the
+        // same type.
+        let duet_ops::JobState::Terminal { report, .. } = job.state else {
+            return;
+        };
+
+        self.job_report_dialog_previous_focus = self
+            .operation_manager_previous_focus
+            .take()
+            .or_else(|| window.focused(cx));
+        self.operation_manager = None;
+
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            JobReportDialogState::new(
+                job.kind,
+                job.plan,
+                report,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.job_report_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// Mirrors `close_delete_dialog` exactly -- always has a live
+    /// `Window`.
+    pub(crate) fn close_job_report_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.job_report_dialog = None;
+        if let Some(handle) = self.job_report_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// The one close path with no live `Window` --
+    /// `JobReportDialogState::rerun`'s async enqueue success callback.
+    /// Mirrors `close_delete_dialog_deferred` exactly; see
+    /// `pending_focus_restore`'s doc comment for why the actual
+    /// `window.focus` call happens on `Self::render`'s next pass instead.
+    pub(crate) fn close_job_report_dialog_deferred(&mut self, cx: &mut Context<Self>) {
+        self.job_report_dialog = None;
+        self.pending_focus_restore = self.job_report_dialog_previous_focus.take();
+        cx.notify();
+    }
+
     /// Constructs a fresh [`ConflictDialogState`] entity for `request` and
     /// stores it as `self.conflict_dialog` -- the one piece of
     /// construction logic [`Self::open_conflict_dialog_deferred`] (no live
@@ -2627,6 +2735,9 @@ impl Render for Workspace {
             .when_some(self.operation_manager.clone(), |this, state| {
                 this.child(operation_manager_overlay(&state, cx))
             })
+            .when_some(self.job_report_dialog.clone(), |this, state| {
+                this.child(job_report_dialog_overlay(&state, cx))
+            })
             .when_some(self.conflict_dialog.clone(), |this, state| {
                 this.child(conflict_dialog_overlay(&state, cx))
             })
@@ -2972,6 +3083,48 @@ fn operation_manager_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_operation_manager(window, cx);
+                })),
+        )
+}
+
+/// T-5.2.4's error/skip report overlay -- same `.occlude()`-backdrop/card
+/// shape and same `.on_mouse_down_out` close as `operation_manager_overlay`
+/// (see `command_palette_overlay`'s own doc comment for the full
+/// reasoning, including the real regression this pattern exists to
+/// avoid): an outside click is a safe "never mind" here, since nothing is
+/// enqueued until R/Enter. Same `560px` width as the operation manager it
+/// drills in from -- a path plus a classified error message is at least as
+/// wide as a job row, and the two views read as one flow when they don't
+/// jump size. The card sets no `key_context` of its own, same reasoning as
+/// every sibling overlay function: `JobReportDialogState::render` already
+/// sets `"JobReport"` on its own root.
+fn job_report_dialog_overlay(
+    state: &Entity<JobReportDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("job-report-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("job-report-dialog-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_job_report_dialog(window, cx);
                 })),
         )
 }
@@ -3597,9 +3750,13 @@ mod tests {
     // `OpenOperationManager`, defined right in this file and already
     // reachable via `use super::*;` below) they need naming explicitly.
     use crate::operation_manager::{
-        OperationManagerCursorDown, OperationManagerCursorUp, OperationManagerPauseSelected,
-        OperationManagerResumeSelected,
+        OperationManagerCursorDown, OperationManagerCursorUp, OperationManagerOpenReport,
+        OperationManagerPauseSelected, OperationManagerResumeSelected,
     };
+    // T-5.2.4's own overlay-internal actions -- same reasoning as the
+    // `operation_manager` import right above: declared in
+    // `crate::job_report_dialog`, not here.
+    use crate::job_report_dialog::{CloseJobReport, RerunFailedItems};
     use duet_widgets::list::ListDelegate as _;
     use duet_widgets::table::TableDelegate as _;
     use gpui::{TestAppContext, VisualTestContext};
@@ -3704,6 +3861,7 @@ mod tests {
             bind_copy_move_dialog_keys(cx);
             bind_delete_dialog_keys(cx);
             bind_operation_manager_keys(cx);
+            bind_job_report_dialog_keys(cx);
             bind_conflict_dialog_keys(cx);
         });
 
@@ -7046,6 +7204,441 @@ mod tests {
                 1,
                 "the source must still have exactly one name"
             );
+        });
+    }
+
+    // -- T-5.2.4 error/skip report + re-run failed ----------------------------
+
+    /// Plans and enqueues a real permanent-delete job against the real
+    /// `LocalFs`, exactly the way `Workspace::start_delete_job` does, and
+    /// returns its `JobId`. Same shape as [`enqueue_slow_copy`] right
+    /// above -- the plan runs on the ops runtime, and the caller gets the
+    /// id back synchronously so it has something to wait on.
+    ///
+    /// Deliberately enqueued with no `ConflictResolver` (matching
+    /// `delete_dialog::spawn_delete_job`'s own `None`), so any conflict
+    /// falls through to `PlanOptions::default_conflict` rather than
+    /// blocking an executor thread on a dialog no test is driving.
+    fn enqueue_permanent_delete(
+        tokio_handle: &tokio::runtime::Handle,
+        queue: Arc<QueueManager>,
+        targets: Vec<VPath>,
+        state_dir: PathBuf,
+    ) -> duet_ops::JobId {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tokio_handle.spawn(async move {
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            let cancel = duet_ops::CancelToken::new();
+            let plan = duet_ops::plan_delete(
+                fs.as_ref(),
+                &targets,
+                duet_ops::DeleteMode::Permanent,
+                duet_ops::PlanOptions::default(),
+                &cancel,
+            )
+            .await
+            .expect("plan_delete over real tempdirs must succeed");
+            let id = queue.enqueue(
+                JobKind::Delete { permanent: true },
+                plan,
+                0,
+                fs,
+                state_dir,
+                1,
+                None,
+            );
+            let _ = tx.send(id);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("plan_delete + enqueue must complete quickly")
+    }
+
+    /// The copy counterpart of [`enqueue_permanent_delete`]: a real
+    /// `plan_copy` of `sources` into `dst` against the real, un-slowed
+    /// `LocalFs`. With no resolver and `PlanOptions::default()`
+    /// (`ConflictPolicy::Skip`), a destination that already exists makes
+    /// the job end `CompletedWithSkips` with a real `SkipEntry` -- which
+    /// is exactly the second half of what T-5.2.4's report has to show.
+    fn enqueue_copy(
+        tokio_handle: &tokio::runtime::Handle,
+        queue: Arc<QueueManager>,
+        sources: Vec<VPath>,
+        dst: VPath,
+        state_dir: PathBuf,
+    ) -> duet_ops::JobId {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tokio_handle.spawn(async move {
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+            let cancel = duet_ops::CancelToken::new();
+            let plan = duet_ops::plan_copy(
+                fs.as_ref(),
+                &sources,
+                &dst,
+                duet_ops::PlanOptions::default(),
+                &cancel,
+            )
+            .await
+            .expect("plan_copy over real tempdirs must succeed");
+            let id = queue.enqueue(JobKind::Copy, plan, 0, fs, state_dir, 1, None);
+            let _ = tx.send(id);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("plan_copy + enqueue must complete quickly")
+    }
+
+    fn queue_state_dir_and_handle(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> (Arc<QueueManager>, PathBuf, tokio::runtime::Handle) {
+        workspace.read_with(vcx, |ws, _| {
+            (
+                ws.queue.clone(),
+                ws.state_dir
+                    .clone()
+                    .expect("test env always resolves a state dir"),
+                ws.tokio_handle.clone(),
+            )
+        })
+    }
+
+    /// A directory whose write bit is off, holding `count` files: removing
+    /// anything inside it fails with `EACCES` regardless of the files' own
+    /// modes, which is `duet_ops::deleter`'s own
+    /// `a_permission_denied_removal_surfaces_as_a_real_failure` setup and
+    /// the most direct way to get a genuinely `Failed` job with real
+    /// `StepFailure`s out of the real executor.
+    ///
+    /// Returns the locked directory and the paths inside it. **Every
+    /// caller must `unlock_dir` before its `TempDir` drops**, or the
+    /// cleanup itself fails for the same reason the job did.
+    fn locked_dir_with_files(root: &Path, count: usize) -> (PathBuf, Vec<PathBuf>) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let files: Vec<PathBuf> = (0..count)
+            .map(|i| {
+                let path = locked.join(format!("doomed{i}.txt"));
+                std::fs::write(&path, b"bye").unwrap();
+                path
+            })
+            .collect();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        (locked, files)
+    }
+
+    fn unlock_dir(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn wait_for_terminal(
+        vcx: &mut VisualTestContext,
+        queue: &QueueManager,
+        job_id: duet_ops::JobId,
+    ) -> JobOutcome {
+        wait_until(vcx, |_vcx| {
+            matches!(
+                queue.job(job_id).map(|j| j.state),
+                Some(JobState::Terminal { .. })
+            )
+        });
+        match queue
+            .job(job_id)
+            .expect("the job must still be listed")
+            .state
+        {
+            JobState::Terminal { outcome, .. } => outcome,
+            other => panic!("expected a terminal job, got {other:?}"),
+        }
+    }
+
+    /// Opens the operation manager on a queue holding exactly one job (so
+    /// the cursor's default row 0 is unambiguously that job) and drills
+    /// into its report with the real `OperationManagerOpenReport` action.
+    fn open_report_via_the_manager(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        job_id: duet_ops::JobId,
+    ) {
+        focus_left_panel(workspace, vcx);
+        vcx.dispatch_action(OpenOperationManager);
+        let _ = vcx.update(|window, cx| window.draw(cx));
+        let manager = workspace
+            .read_with(vcx, |ws, _| ws.operation_manager.clone())
+            .expect("Ctrl+O must open the manager");
+        wait_until(vcx, |vcx| {
+            manager.read_with(vcx, |m, _| {
+                m.jobs_for_test().first().map(|j| j.id) == Some(job_id)
+            })
+        });
+        vcx.dispatch_action(OperationManagerOpenReport);
+        let _ = vcx.update(|window, cx| window.draw(cx));
+    }
+
+    fn job_report_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<JobReportDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.job_report_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.job_report_dialog.clone())
+            .expect("the report dialog must be open by now")
+    }
+
+    /// This task's own AC, as literally as a test can state it: a job that
+    /// fails on *every* one of its targets ends with **one** list holding
+    /// every failure, not one dialog each. Real tempdirs, the real
+    /// `LocalFs`, the real `plan_delete` -> `QueueManager::enqueue` ->
+    /// `execute()` path, and the report read straight off the real job.
+    #[gpui::test]
+    fn a_job_that_fails_on_every_target_ends_with_one_actionable_list(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let (locked, files) = locked_dir_with_files(dir.path(), 5);
+            let (queue, state_dir, tokio_handle) = queue_state_dir_and_handle(&workspace, vcx);
+
+            let targets: Vec<VPath> = files
+                .iter()
+                .map(|p| crate::file_table::local_vpath(p).unwrap())
+                .collect();
+            let job_id = enqueue_permanent_delete(&tokio_handle, queue.clone(), targets, state_dir);
+
+            let outcome = wait_for_terminal(vcx, &queue, job_id);
+            assert_eq!(
+                outcome,
+                JobOutcome::Failed,
+                "a delete denied on every target must end Failed"
+            );
+
+            open_report_via_the_manager(&workspace, vcx, job_id);
+            let state = job_report_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, _| {
+                assert_eq!(
+                    state.title_text(),
+                    "Delete (permanent) \u{2014} 5 errors",
+                    "one headline for the whole job, not one per failure"
+                );
+                let lines = state.error_lines();
+                assert_eq!(lines.len(), 5, "every failure gets its own row: {lines:?}");
+                for (file, line) in files.iter().zip(&lines) {
+                    assert!(
+                        line.contains(&file.to_string_lossy().to_string()),
+                        "each row must name its own path: {line}"
+                    );
+                    assert!(
+                        line.contains("permission denied"),
+                        "and classify it: {line}"
+                    );
+                }
+                assert!(state.skip_lines().is_empty());
+                assert_eq!(state.kind(), JobKind::Delete { permanent: true });
+            });
+
+            // Opening the report replaces the manager -- the disclosed
+            // judgment call in `job_report_dialog`'s module doc comment.
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.operation_manager.is_none(),
+                    "drilling into the report closes the manager it came from"
+                );
+            });
+
+            unlock_dir(&locked);
+        });
+    }
+
+    /// The skip half of the same view: a copy whose destination already
+    /// exists ends `CompletedWithSkips` under `PlanOptions::default()`'s
+    /// `ConflictPolicy::Skip`, and the report lists the skipped path and
+    /// the executor's own reason -- not an error row.
+    #[gpui::test]
+    fn a_job_that_skipped_work_reports_the_skips_not_errors(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let source_dir = tempfile::tempdir().unwrap();
+            let dest_dir = tempfile::tempdir().unwrap();
+            let source = source_dir.path().join("a.txt");
+            std::fs::write(&source, b"new").unwrap();
+            std::fs::write(dest_dir.path().join("a.txt"), b"already here").unwrap();
+            let (queue, state_dir, tokio_handle) = queue_state_dir_and_handle(&workspace, vcx);
+
+            let job_id = enqueue_copy(
+                &tokio_handle,
+                queue.clone(),
+                vec![crate::file_table::local_vpath(&source).unwrap()],
+                crate::file_table::local_vpath(dest_dir.path()).unwrap(),
+                state_dir,
+            );
+
+            assert_eq!(
+                wait_for_terminal(vcx, &queue, job_id),
+                JobOutcome::CompletedWithSkips
+            );
+
+            open_report_via_the_manager(&workspace, vcx, job_id);
+            let state = job_report_state(&workspace, vcx);
+
+            state.read_with(vcx, |state, _| {
+                assert_eq!(state.title_text(), "Copy \u{2014} 1 skipped");
+                assert!(state.error_lines().is_empty());
+                let skips = state.skip_lines();
+                assert_eq!(skips.len(), 1, "{skips:?}");
+                assert!(
+                    skips[0].contains("a.txt"),
+                    "the skipped row must name the path: {}",
+                    skips[0]
+                );
+            });
+
+            assert_eq!(
+                std::fs::read(dest_dir.path().join("a.txt")).unwrap(),
+                b"already here",
+                "a skip really did leave the destination alone"
+            );
+        });
+    }
+
+    /// The gate: a job that finished cleanly has nothing to report, so
+    /// Enter on its row is a silent no-op and the manager stays put --
+    /// `docs/commands.md`'s own `job.has_errors` predicate, enforced.
+    #[gpui::test]
+    fn a_cleanly_completed_job_has_no_report_to_open(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let victim = dir.path().join("doomed.txt");
+            std::fs::write(&victim, b"bye").unwrap();
+            let (queue, state_dir, tokio_handle) = queue_state_dir_and_handle(&workspace, vcx);
+
+            let job_id = enqueue_permanent_delete(
+                &tokio_handle,
+                queue.clone(),
+                vec![crate::file_table::local_vpath(&victim).unwrap()],
+                state_dir,
+            );
+            assert_eq!(
+                wait_for_terminal(vcx, &queue, job_id),
+                JobOutcome::Completed
+            );
+
+            open_report_via_the_manager(&workspace, vcx, job_id);
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.job_report_dialog.is_none(),
+                    "there is nothing to show, so Enter must do nothing at all"
+                );
+                assert!(
+                    ws.operation_manager.is_some(),
+                    "and the manager the keystroke was aimed at must stay open"
+                );
+            });
+        });
+    }
+
+    /// The other half of the AC's "actionable": re-running from the report
+    /// genuinely re-attempts the failed work, and -- with the permission
+    /// that caused the failure restored first -- genuinely succeeds this
+    /// time. Asserted against real disk state, not merely against a second
+    /// job having been enqueued.
+    #[gpui::test]
+    fn re_running_a_failed_delete_succeeds_once_the_permission_is_restored(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let (locked, files) = locked_dir_with_files(dir.path(), 2);
+            let (queue, state_dir, tokio_handle) = queue_state_dir_and_handle(&workspace, vcx);
+
+            let targets: Vec<VPath> = files
+                .iter()
+                .map(|p| crate::file_table::local_vpath(p).unwrap())
+                .collect();
+            let job_id = enqueue_permanent_delete(&tokio_handle, queue.clone(), targets, state_dir);
+            assert_eq!(wait_for_terminal(vcx, &queue, job_id), JobOutcome::Failed);
+            assert!(
+                files.iter().all(|f| f.exists()),
+                "nothing may have been deleted by the denied job"
+            );
+
+            open_report_via_the_manager(&workspace, vcx, job_id);
+            let _state = job_report_state(&workspace, vcx);
+
+            // The user's real fix, between reading the report and hitting
+            // R: make the directory writable again.
+            unlock_dir(&locked);
+
+            vcx.dispatch_action(RerunFailedItems);
+            wait_until(vcx, |vcx| {
+                files.iter().all(|f| !f.exists())
+                    && workspace.read_with(vcx, |ws, _| ws.job_report_dialog.is_none())
+            });
+
+            let ids: Vec<duet_ops::JobId> = queue.snapshot().into_iter().map(|j| j.id).collect();
+            assert_eq!(
+                ids.len(),
+                2,
+                "the retry is a real, separate job, not a mutation of the original"
+            );
+            let retry_id = *ids.iter().find(|id| **id != job_id).unwrap();
+            assert_eq!(
+                wait_for_terminal(vcx, &queue, retry_id),
+                JobOutcome::Completed,
+                "and it must genuinely succeed this time, not fail the same way"
+            );
+            let retry = queue.job(retry_id).unwrap();
+            assert_eq!(
+                retry.plan.steps.len(),
+                2,
+                "the retry plan holds exactly the two steps that failed"
+            );
+            assert_eq!(retry.kind, JobKind::Delete { permanent: true });
+        });
+    }
+
+    #[gpui::test]
+    fn escaping_the_job_report_re_runs_nothing_and_restores_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let (locked, files) = locked_dir_with_files(dir.path(), 1);
+            let (queue, state_dir, tokio_handle) = queue_state_dir_and_handle(&workspace, vcx);
+
+            let job_id = enqueue_permanent_delete(
+                &tokio_handle,
+                queue.clone(),
+                vec![crate::file_table::local_vpath(&files[0]).unwrap()],
+                state_dir,
+            );
+            assert_eq!(wait_for_terminal(vcx, &queue, job_id), JobOutcome::Failed);
+
+            open_report_via_the_manager(&workspace, vcx, job_id);
+            let _state = job_report_state(&workspace, vcx);
+
+            // Unlocked *before* Escape, so that "the file is still there"
+            // afterwards can only mean "nothing was re-run" -- not "a
+            // retry ran and was denied again".
+            unlock_dir(&locked);
+
+            vcx.dispatch_action(CloseJobReport);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, _| assert!(ws.job_report_dialog.is_none()));
+            assert!(files[0].exists(), "Escape must enqueue nothing at all");
+            assert_eq!(
+                queue.snapshot().len(),
+                1,
+                "and no second job may have appeared"
+            );
+
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "closing the report must restore focus to the panel Ctrl+O was pressed in"
+                );
+            });
         });
     }
 }
