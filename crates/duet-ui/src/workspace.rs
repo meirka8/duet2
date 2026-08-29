@@ -16,8 +16,8 @@ use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
 use duet_ops::{
-    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, ProgressSnapshot,
-    QueueManager,
+    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, JournalReader,
+    ProgressSnapshot, QueueManager, RecoveryReport,
 };
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
@@ -57,6 +57,7 @@ use crate::link_dialog::{LinkDialogState, LinkKind};
 use crate::mkdir_dialog::MkdirDialogState;
 use crate::operation_manager::{OperationManagerState, bind_operation_manager_keys};
 use crate::panel::{Panel, bind_panel_keys};
+use crate::recovery_dialog::{RecoveryDialogState, bind_recovery_dialog_keys};
 use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
 
@@ -278,6 +279,7 @@ pub fn run() {
         bind_job_report_dialog_keys(cx);
         bind_conflict_dialog_keys(cx);
         bind_attributes_dialog_keys(cx);
+        bind_recovery_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -597,6 +599,21 @@ pub struct Workspace {
     /// the dialog, restored and cleared by `close_attributes_dialog`/
     /// `close_attributes_dialog_deferred`.
     attributes_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.2.5's startup interrupted-operation recovery
+    /// dialog is open. Unlike every other dialog above, this one is never
+    /// opened by a user keystroke -- `Self::new` constructs it directly
+    /// (see that method's own startup-scan section) when a fresh
+    /// `JournalReader::scan` finds at least one report still needing
+    /// attention, and it is otherwise `None` for the rest of the process's
+    /// life once closed. See `crate::recovery_dialog`'s module doc comment
+    /// for the full architecture.
+    recovery_dialog: Option<Entity<RecoveryDialogState>>,
+    /// Saved by `Self::new` on the path that actually shows the dialog,
+    /// restored and cleared by `close_recovery_dialog` -- this dialog has
+    /// no `_deferred` sibling; see `crate::recovery_dialog`'s module doc
+    /// comment for why its own async continuations never need one.
+    recovery_dialog_previous_focus: Option<FocusHandle>,
 
     /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
     /// `"never"`), read once at startup the same way every other
@@ -941,7 +958,7 @@ impl Workspace {
 
         // T-4.3.7's original notice (see `pending_notice`'s doc comment)
         // becomes the queue's first, possible entry.
-        let pending_notice: Vec<PendingNotice> = pending_notice
+        let mut pending_notice: Vec<PendingNotice> = pending_notice
             .into_iter()
             .map(|message| PendingNotice {
                 level: NoticeLevel::Warning,
@@ -962,6 +979,27 @@ impl Workspace {
         ));
         let state_dir = duet_config::paths::duet_state_dir().ok();
 
+        // T-5.2.5: the startup interrupted-operation recovery scan
+        // (FR-OPS-07) -- synchronous, like every other startup-time load
+        // in this constructor (`load_session_with_notice`,
+        // `load_hotlist_entries`, ...): `JournalReader::scan` only ever
+        // reads a handful of small journal files, and there is no live
+        // `Window` yet for an async round-trip to hand a result back into
+        // anyway. Folded into `pending_notice` exactly the way T-4.3.7's
+        // own `session.json` load failure is -- "a file that exists and
+        // failed to load is a real event" applies just as much to a
+        // corrupt journal as to a corrupt session file.
+        let (recovery_reports, recovery_scan_notice) = state_dir
+            .as_deref()
+            .map(scan_startup_recovery_reports)
+            .unwrap_or_default();
+        if let Some(message) = recovery_scan_notice {
+            pending_notice.push(PendingNotice {
+                level: NoticeLevel::Error,
+                message,
+            });
+        }
+
         // T-5.2.3: the live conflict dialog's own request channel --
         // `InteractiveConflictResolver::resolve` (called synchronously
         // from deep inside a `tokio::spawn`'d executor task, potentially
@@ -972,6 +1010,45 @@ impl Workspace {
         let (conflict_request_tx, mut conflict_request_rx) =
             tokio::sync::mpsc::unbounded_channel::<ConflictRequest>();
         let conflict_resolver = Arc::new(InteractiveConflictResolver::new(conflict_request_tx));
+
+        // T-5.2.5: if the scan above found anything needing attention,
+        // build the dialog right here -- a live `Window`/`Context<Self>`
+        // are both already in scope (unlike `pending_notice`'s own
+        // `push_notification` path, this constructs an `Entity` directly
+        // rather than calling anything that needs `gpui-component`'s
+        // `Root`, so there is no "no live Window yet" problem to work
+        // around). `window.focused(cx)` is almost certainly `None` this
+        // early in construction -- that is fine and expected, the same
+        // way every other `close_*_dialog`'s `Option<FocusHandle>` already
+        // tolerates a `None` previous focus.
+        let recovery_dialog_previous_focus = window.focused(cx);
+        let recovery_dialog = if recovery_reports.is_empty() {
+            None
+        } else {
+            // `recovery_reports` is only ever non-empty when `state_dir`
+            // resolved to `Some` -- `scan_startup_recovery_reports` only
+            // ran against a real path in that case (see just above). This
+            // documents an invariant, not a guess.
+            let dir = state_dir
+                .clone()
+                .expect("a non-empty recovery scan implies state_dir resolved");
+            let recovery_workspace = cx.entity().downgrade();
+            let recovery_tokio_handle = tokio_handle.clone();
+            let recovery_queue = queue.clone();
+            let recovery_conflict_resolver = conflict_resolver.clone();
+            Some(cx.new(|cx| {
+                RecoveryDialogState::new(
+                    recovery_reports,
+                    recovery_workspace,
+                    recovery_tokio_handle,
+                    recovery_queue,
+                    dir,
+                    recovery_conflict_resolver,
+                    window,
+                    cx,
+                )
+            }))
+        };
 
         // The conflict-request consumer loop: mirrors `queue_events_rx`'s
         // own loop below in every structural respect (a `cx.spawn` task
@@ -1099,6 +1176,8 @@ impl Workspace {
             link_dialog_previous_focus: None,
             attributes_dialog: None,
             attributes_dialog_previous_focus: None,
+            recovery_dialog,
+            recovery_dialog_previous_focus,
             confirm_delete,
             delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
@@ -2396,6 +2475,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes T-5.2.5's recovery dialog -- Escape's path, and the one every
+    /// resume/discard success path also uses directly (see `crate::
+    /// recovery_dialog`'s module doc comment for why that dialog's own
+    /// async continuations always have a live `&mut Window` by the time
+    /// they'd call this, unlike every sibling dialog's `cx.spawn`-based
+    /// continuations). There is deliberately no `close_recovery_dialog_
+    /// deferred`: nothing in this dialog ever needs one.
+    pub(crate) fn close_recovery_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.recovery_dialog = None;
+        if let Some(handle) = self.recovery_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
     /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
     /// "does `parent` match either panel's already-loaded directory" half
     /// -- see that method's own doc comment for the full picture (T-5.2.1's
@@ -2978,6 +3072,9 @@ impl Render for Workspace {
             .when_some(self.conflict_dialog.clone(), |this, state| {
                 this.child(conflict_dialog_overlay(&state, cx))
             })
+            .when_some(self.recovery_dialog.clone(), |this, state| {
+                this.child(recovery_dialog_overlay(&state, cx))
+            })
     }
 }
 
@@ -3320,6 +3417,43 @@ fn attributes_dialog_overlay(
         )
 }
 
+/// T-5.2.5's startup recovery overlay -- same `.occlude()`-backdrop/card
+/// chrome as [`attributes_dialog_overlay`] (see `command_palette_overlay`'s
+/// own doc comment for the full reasoning). A click on the backdrop closes
+/// the dialog exactly like Escape does -- see `crate::recovery_dialog`'s
+/// module doc comment for why that is a deliberate, disclosed "resolve
+/// nothing, it reappears next launch" choice rather than a gap.
+fn recovery_dialog_overlay(
+    state: &Entity<RecoveryDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("recovery-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("recovery-dialog-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_recovery_dialog(window, cx);
+                })),
+        )
+}
+
 /// T-5.2.2's operation manager overlay -- same `.occlude()`-backdrop/card
 /// shape as `copy_move_dialog_overlay` (see `command_palette_overlay`'s
 /// own doc comment for the full reasoning, including the real regression
@@ -3646,6 +3780,51 @@ fn load_session_with_notice(path: &Path) -> (Option<duet_config::Session>, Optio
             );
             let notice = format!("Couldn't restore your last session ({err}) -- starting fresh.");
             (None, Some(notice))
+        }
+    }
+}
+
+/// T-5.2.5's startup recovery scan (FR-OPS-07): every [`RecoveryReport`]
+/// `JournalReader::scan` finds under `dir` that still "needs attention" --
+/// `!incomplete_steps.is_empty() || !orphaned_partials.is_empty()`,
+/// deliberately **not** filtered on `last_outcome`. A journal whose last
+/// record is `JobFinished { outcome: Completed, .. }` can still carry a
+/// real orphaned partial (`JournalReader::scan`'s own doc comment: a crash
+/// landing between that `Completion`/`JobFinished` pair and the last
+/// partial's rename is exactly this case) -- filtering on `last_outcome`
+/// instead would silently hide that leak, which is precisely the gap
+/// `JournalReader::scan`'s own module doc comment says this method exists
+/// to rule out.
+///
+/// Same "no file/dir yet is silent, a real read/parse failure becomes a
+/// notice" split as [`load_session_with_notice`]: a `state_dir` with no
+/// `jobs/` directory at all (nothing has ever run) is the ordinary case
+/// and returns an empty list with no notice; a `state_dir` that exists but
+/// whose scan genuinely failed (a corrupt journal -- a parse failure
+/// anywhere but a torn trailing record, which `JournalReader::scan` itself
+/// already tolerates) is a real "we couldn't check for interrupted
+/// operations" event, meant for `Workspace::pending_notice`. A pure
+/// wrapper around `JournalReader::scan` (aside from the filter) so this
+/// branching is unit-testable without a real `Window`/`Workspace`, same
+/// reasoning as [`load_session_with_notice`]/[`resolve_panel_session`].
+fn scan_startup_recovery_reports(dir: &Path) -> (Vec<RecoveryReport>, Option<String>) {
+    match JournalReader::scan(dir) {
+        Ok(reports) => {
+            let needing_attention = reports
+                .into_iter()
+                .filter(|r| !r.incomplete_steps.is_empty() || !r.orphaned_partials.is_empty())
+                .collect();
+            (needing_attention, None)
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "duet_ui::workspace",
+                "startup recovery scan failed ({dir:?}): {err}"
+            );
+            (
+                Vec::new(),
+                Some(format!("Couldn't check for interrupted operations: {err}")),
+            )
         }
     }
 }
@@ -4053,7 +4232,16 @@ mod tests {
     // T-5.2.8's own overlay-internal action -- same reasoning as the three
     // imports above: declared in `crate::attributes_dialog`, not here.
     use crate::attributes_dialog::ToggleRecursiveApply;
-    use duet_ops::{ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope};
+    // T-5.2.5's own overlay-internal actions -- same reasoning as the four
+    // imports above: declared in `crate::recovery_dialog`, not here.
+    use crate::recovery_dialog::{
+        CloseRecoveryDialog, RecoveryDialogCursorDown, RecoveryDialogCursorUp,
+        RecoveryDialogDiscard, RecoveryDialogResume, RecoveryDialogToggleInspect,
+    };
+    use duet_ops::{
+        ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope, Journal, JournalRecord,
+        StepOutcome,
+    };
     use duet_types::{EntryKind, Metadata, Timestamp};
     use duet_widgets::input::IndentInline;
 
@@ -4100,6 +4288,40 @@ mod tests {
         settings_toml: Option<&str>,
         f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext, &Path),
     ) {
+        with_configured_workspace_inner(cx, settings_toml, |_duet_state_dir| {}, f);
+    }
+
+    /// [`with_configured_workspace`] plus one thing only T-5.2.5's own
+    /// recovery tests need: a `pre_construct` hook that runs after
+    /// `$XDG_STATE_HOME` is redirected but *before* `Workspace::new`'s own
+    /// startup `JournalReader::scan` runs against it -- the one thing no
+    /// existing helper offers, since every other test only ever needs to
+    /// touch the redirected directories *after* construction (`with_
+    /// configured_workspace`'s own `&Path` parameter to `f`). `pre_construct`
+    /// receives `duet_config::paths::duet_state_dir()`'s own real result
+    /// (not the bare `$XDG_STATE_HOME` tempdir root -- i.e. exactly the
+    /// path `Journal::open`/`JournalReader::scan` themselves use), so a
+    /// test can write real journal files with `duet_ops::Journal` directly
+    /// and have `Workspace::new`'s scan see exactly what it wrote.
+    ///
+    /// A sibling function rather than a new parameter threaded through
+    /// [`with_configured_workspace`] itself: every one of that function's
+    /// thirteen existing call sites would otherwise need touching just to
+    /// pass a no-op closure, for a hook only this one task's tests need.
+    fn with_configured_workspace_and_recovery_seed(
+        cx: &mut TestAppContext,
+        pre_construct: impl FnOnce(&Path),
+        f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext, &Path),
+    ) {
+        with_configured_workspace_inner(cx, None, pre_construct, f);
+    }
+
+    fn with_configured_workspace_inner(
+        cx: &mut TestAppContext,
+        settings_toml: Option<&str>,
+        pre_construct: impl FnOnce(&Path),
+        f: impl FnOnce(Entity<Workspace>, &mut VisualTestContext, &Path),
+    ) {
         let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config_dir = tempfile::tempdir().unwrap();
         let state_dir = tempfile::tempdir().unwrap();
@@ -4119,6 +4341,11 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("settings.toml"), body).unwrap();
         }
+        // Runs after the redirect above but before `Workspace::new`'s own
+        // startup recovery scan -- see this function's own doc comment.
+        // `duet_state_dir()` cannot fail here: `$XDG_STATE_HOME` was just
+        // set, unconditionally, two lines above.
+        pre_construct(&duet_config::paths::duet_state_dir().unwrap());
 
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -4140,6 +4367,7 @@ mod tests {
             bind_job_report_dialog_keys(cx);
             bind_conflict_dialog_keys(cx);
             bind_attributes_dialog_keys(cx);
+            bind_recovery_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -8305,5 +8533,475 @@ mod tests {
                 );
             });
         });
+    }
+
+    // -- T-5.2.5 startup interrupted-operation recovery -----------------------
+
+    /// Writes a real, still-dangling journal for `job_id` -- `JobStarted`
+    /// plus one `Intent` for `plan.steps[step_index]`, deliberately no
+    /// `Completion` and no `JobFinished` -- the exact "crashed mid-step"
+    /// shape `duet_ops::journal`'s own tests already establish. Shared by
+    /// every test below that needs a real, on-disk crashed job to recover
+    /// from.
+    fn write_dangling_journal(
+        state_dir: &Path,
+        job_id: JobId,
+        kind: JobKind,
+        plan: &duet_ops::Plan,
+        step_index: u32,
+        partial_name: Option<&str>,
+    ) {
+        let mut journal = Journal::open(job_id, state_dir).unwrap();
+        journal
+            .append(&JournalRecord::JobStarted {
+                job_id,
+                started_at: Timestamp::EPOCH,
+                plan: plan.clone(),
+                kind,
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::Intent {
+                step_index,
+                step: plan.steps[step_index as usize].clone(),
+                partial_name: partial_name.map(str::to_string),
+            })
+            .unwrap();
+    }
+
+    fn recovery_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<RecoveryDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.recovery_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.recovery_dialog.clone())
+            .expect("the recovery dialog must be open by now")
+    }
+
+    /// A pre-seeded crashed journal (`JobStarted` + a dangling `Intent`, no
+    /// `Completion`, no `JobFinished`) makes `Workspace::new` auto-open the
+    /// recovery dialog with exactly that report.
+    #[gpui::test]
+    fn a_crashed_journal_makes_workspace_new_auto_open_the_recovery_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        let job_id = JobId(101);
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            move |state_dir| {
+                let plan = duet_ops::Plan::new(
+                    vec![duet_ops::Step::CreateDir {
+                        dest: crate::file_table::local_vpath(Path::new(
+                            "/tmp/duet-recovery-test-auto-open",
+                        ))
+                        .unwrap(),
+                        mode: None,
+                    }],
+                    duet_ops::PlanOptions::default(),
+                );
+                write_dangling_journal(state_dir, job_id, JobKind::CreateDir, &plan, 0, None);
+            },
+            |workspace, vcx, _data_dir| {
+                let state = recovery_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |state, _cx| {
+                    let reports = state.reports();
+                    assert_eq!(reports.len(), 1);
+                    assert_eq!(reports[0].job_id, job_id);
+                    assert_eq!(reports[0].kind, JobKind::CreateDir);
+                    assert_eq!(reports[0].incomplete_steps, vec![0]);
+                });
+            },
+        );
+    }
+
+    /// Up/Down move the cursor by one row, clamping at both ends rather
+    /// than wrapping -- same convention `crate::file_table::
+    /// move_cursor_by`/`crate::operation_manager::cursor_up`/`cursor_down`
+    /// already establish for a plain row cursor.
+    #[gpui::test]
+    fn cursor_up_and_down_clamp_at_both_ends_of_the_report_list(cx: &mut TestAppContext) {
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            |state_dir| {
+                for (job_id, target) in [
+                    (JobId(11), "/tmp/duet-recovery-test-cursor-a"),
+                    (JobId(12), "/tmp/duet-recovery-test-cursor-b"),
+                ] {
+                    let plan = duet_ops::Plan::new(
+                        vec![duet_ops::Step::CreateDir {
+                            dest: crate::file_table::local_vpath(Path::new(target)).unwrap(),
+                            mode: None,
+                        }],
+                        duet_ops::PlanOptions::default(),
+                    );
+                    write_dangling_journal(state_dir, job_id, JobKind::CreateDir, &plan, 0, None);
+                }
+            },
+            |workspace, vcx, _data_dir| {
+                let state = recovery_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |state, _cx| {
+                    assert_eq!(state.reports().len(), 2);
+                    assert_eq!(state.cursor(), 0);
+                });
+
+                // Doesn't wrap past the top.
+                vcx.dispatch_action(RecoveryDialogCursorUp);
+                state.read_with(vcx, |state, _cx| assert_eq!(state.cursor(), 0));
+
+                vcx.dispatch_action(RecoveryDialogCursorDown);
+                state.read_with(vcx, |state, _cx| assert_eq!(state.cursor(), 1));
+
+                // Doesn't run past the bottom either.
+                vcx.dispatch_action(RecoveryDialogCursorDown);
+                state.read_with(vcx, |state, _cx| assert_eq!(state.cursor(), 1));
+
+                vcx.dispatch_action(RecoveryDialogCursorUp);
+                state.read_with(vcx, |state, _cx| assert_eq!(state.cursor(), 0));
+            },
+        );
+    }
+
+    /// `Space` toggles the cursor row's inline "inspect" expansion --
+    /// no third overlay layer, just a field flip. See `crate::
+    /// recovery_dialog`'s module doc comment for why this is inline rather
+    /// than a second dialog.
+    #[gpui::test]
+    fn space_toggles_the_cursor_rows_inline_inspect_detail(cx: &mut TestAppContext) {
+        let job_id = JobId(13);
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            move |state_dir| {
+                let plan = duet_ops::Plan::new(
+                    vec![duet_ops::Step::CreateDir {
+                        dest: crate::file_table::local_vpath(Path::new(
+                            "/tmp/duet-recovery-test-inspect",
+                        ))
+                        .unwrap(),
+                        mode: None,
+                    }],
+                    duet_ops::PlanOptions::default(),
+                );
+                write_dangling_journal(state_dir, job_id, JobKind::CreateDir, &plan, 0, None);
+            },
+            |workspace, vcx, _data_dir| {
+                let state = recovery_dialog_state(&workspace, vcx);
+                state.read_with(vcx, |state, _cx| assert!(!state.inspecting()));
+
+                vcx.dispatch_action(RecoveryDialogToggleInspect);
+                state.read_with(vcx, |state, _cx| assert!(state.inspecting()));
+
+                vcx.dispatch_action(RecoveryDialogToggleInspect);
+                state.read_with(vcx, |state, _cx| assert!(!state.inspecting()));
+            },
+        );
+    }
+
+    /// Enter (`RecoveryDialogResume`) on a crashed `CreateDir` actually
+    /// creates the directory on disk, removes that report from the dialog
+    /// (closing it, since it was the only one), and a *fresh*
+    /// `JournalReader::scan` of the same `state_dir` shows the original
+    /// job's report fully accounted for -- `incomplete_steps` empty,
+    /// `last_outcome == Some(JobOutcome::Cancelled)` -- proving `Journal::
+    /// resolve` actually ran, not just that the UI forgot about it.
+    #[gpui::test]
+    fn resuming_a_crashed_create_dir_creates_it_and_resolves_the_original_journal(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let new_dir_path = dir.path().join("resumed-dir");
+        let job_id = JobId(202);
+
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            {
+                let new_dir_path = new_dir_path.clone();
+                move |state_dir| {
+                    let plan = duet_ops::Plan::new(
+                        vec![duet_ops::Step::CreateDir {
+                            dest: crate::file_table::local_vpath(&new_dir_path).unwrap(),
+                            mode: None,
+                        }],
+                        duet_ops::PlanOptions::default(),
+                    );
+                    write_dangling_journal(state_dir, job_id, JobKind::CreateDir, &plan, 0, None);
+                }
+            },
+            {
+                let new_dir_path = new_dir_path.clone();
+                move |workspace, vcx, _data_dir| {
+                    let _ = recovery_dialog_state(&workspace, vcx);
+                    vcx.dispatch_action(RecoveryDialogResume);
+
+                    let state_dir = duet_config::paths::duet_state_dir().unwrap();
+                    wait_until(vcx, |vcx| {
+                        new_dir_path.is_dir()
+                            && workspace.read_with(vcx, |ws, _| ws.recovery_dialog.is_none())
+                    });
+
+                    let reports = JournalReader::scan(&state_dir).unwrap();
+                    let original = reports
+                        .iter()
+                        .find(|r| r.job_id == job_id)
+                        .expect("the original job's journal must still exist");
+                    assert!(
+                        original.incomplete_steps.is_empty(),
+                        "resume must resolve the original job's dangling intent"
+                    );
+                    assert_eq!(original.last_outcome, Some(JobOutcome::Cancelled));
+                }
+            },
+        );
+    }
+
+    /// `D` (`RecoveryDialogDiscard`) on a crashed copy with a real orphaned
+    /// `.duet-partial-*` file actually deletes it from disk, removes that
+    /// report from the dialog, and a fresh rescan shows the original job
+    /// fully resolved the same way the resume test proves.
+    #[gpui::test]
+    fn discarding_a_crashed_copy_deletes_the_orphaned_partial_and_resolves_the_original_journal(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_dir = dir.path().join("dst");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join("a.txt");
+        let partial_name = ".duet-partial-abc123-a.txt";
+        let partial_path = dest_dir.join(partial_name);
+        std::fs::write(&partial_path, b"partial content").unwrap();
+        let job_id = JobId(303);
+
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            {
+                let dest_file = dest_file.clone();
+                move |state_dir| {
+                    let plan = duet_ops::Plan::new(
+                        vec![duet_ops::Step::CopyFile {
+                            source: crate::file_table::local_vpath(Path::new(
+                                "/tmp/duet-recovery-test-nonexistent-source",
+                            ))
+                            .unwrap(),
+                            dest: crate::file_table::local_vpath(&dest_file).unwrap(),
+                            size: 4,
+                            conflict: None,
+                        }],
+                        duet_ops::PlanOptions::default(),
+                    );
+                    write_dangling_journal(
+                        state_dir,
+                        job_id,
+                        JobKind::Copy,
+                        &plan,
+                        0,
+                        Some(partial_name),
+                    );
+                }
+            },
+            {
+                let partial_path = partial_path.clone();
+                move |workspace, vcx, _data_dir| {
+                    let _ = recovery_dialog_state(&workspace, vcx);
+                    vcx.dispatch_action(RecoveryDialogDiscard);
+
+                    let state_dir = duet_config::paths::duet_state_dir().unwrap();
+                    wait_until(vcx, |vcx| {
+                        !partial_path.exists()
+                            && workspace.read_with(vcx, |ws, _| ws.recovery_dialog.is_none())
+                    });
+
+                    let reports = JournalReader::scan(&state_dir).unwrap();
+                    let original = reports
+                        .iter()
+                        .find(|r| r.job_id == job_id)
+                        .expect("the original job's journal must still exist");
+                    assert!(
+                        original.incomplete_steps.is_empty(),
+                        "discard must resolve the original job's dangling intent"
+                    );
+                    assert_eq!(original.last_outcome, Some(JobOutcome::Cancelled));
+                }
+            },
+        );
+    }
+
+    /// Escape closes the dialog without resolving anything -- a *fresh*
+    /// `JournalReader::scan` (called directly here, not through the UI)
+    /// must still report the exact same `incomplete_steps`/
+    /// `orphaned_partials` as before Escape was pressed, proving nothing
+    /// was silently written. See `crate::recovery_dialog`'s module doc
+    /// comment for why this is the deliberate, disclosed behaviour.
+    #[gpui::test]
+    fn escaping_the_recovery_dialog_resolves_nothing_and_the_report_is_unmutated(
+        cx: &mut TestAppContext,
+    ) {
+        let job_id = JobId(404);
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            move |state_dir| {
+                let plan = duet_ops::Plan::new(
+                    vec![duet_ops::Step::CreateDir {
+                        dest: crate::file_table::local_vpath(Path::new(
+                            "/tmp/duet-recovery-test-escape",
+                        ))
+                        .unwrap(),
+                        mode: None,
+                    }],
+                    duet_ops::PlanOptions::default(),
+                );
+                write_dangling_journal(state_dir, job_id, JobKind::CreateDir, &plan, 0, None);
+            },
+            |workspace, vcx, _data_dir| {
+                let _ = recovery_dialog_state(&workspace, vcx);
+                let state_dir = duet_config::paths::duet_state_dir().unwrap();
+                let before_report = JournalReader::scan(&state_dir)
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.job_id == job_id)
+                    .expect("must exist before Escape");
+
+                vcx.dispatch_action(CloseRecoveryDialog);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+
+                workspace.read_with(vcx, |ws, _| assert!(ws.recovery_dialog.is_none()));
+
+                let after_report = JournalReader::scan(&state_dir)
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.job_id == job_id)
+                    .expect("must still exist after Escape -- nothing was resolved");
+                assert_eq!(
+                    after_report.incomplete_steps,
+                    before_report.incomplete_steps
+                );
+                assert_eq!(
+                    after_report.orphaned_partials,
+                    before_report.orphaned_partials
+                );
+                assert_eq!(after_report.last_outcome, before_report.last_outcome);
+            },
+        );
+    }
+
+    /// A journal representing a cleanly finished job (`JobStarted` + a
+    /// matching `Intent`+`Completion` for its one step + `JobFinished {
+    /// outcome: Completed }`, no orphaned partials) does not cause the
+    /// dialog to open at all.
+    #[gpui::test]
+    fn a_cleanly_finished_job_does_not_open_the_recovery_dialog(cx: &mut TestAppContext) {
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            |state_dir| {
+                let plan = duet_ops::Plan::new(
+                    vec![duet_ops::Step::CreateDir {
+                        dest: crate::file_table::local_vpath(Path::new(
+                            "/tmp/duet-recovery-test-finished",
+                        ))
+                        .unwrap(),
+                        mode: None,
+                    }],
+                    duet_ops::PlanOptions::default(),
+                );
+                let job_id = JobId(505);
+                let mut journal = Journal::open(job_id, state_dir).unwrap();
+                journal
+                    .append(&JournalRecord::JobStarted {
+                        job_id,
+                        started_at: Timestamp::EPOCH,
+                        plan: plan.clone(),
+                        kind: JobKind::CreateDir,
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::Intent {
+                        step_index: 0,
+                        step: plan.steps[0].clone(),
+                        partial_name: None,
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::Completion {
+                        step_index: 0,
+                        outcome: StepOutcome::Succeeded,
+                    })
+                    .unwrap();
+                journal
+                    .append(&JournalRecord::JobFinished {
+                        outcome: JobOutcome::Completed,
+                        finished_at: Timestamp::EPOCH,
+                    })
+                    .unwrap();
+            },
+            |workspace, vcx, _data_dir| {
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                workspace.read_with(vcx, |ws, _| {
+                    assert!(
+                        ws.recovery_dialog.is_none(),
+                        "a cleanly finished job with no orphaned partials must not surface \
+                         anything"
+                    );
+                });
+            },
+        );
+    }
+
+    /// A corrupt journal file (a real parse failure, not the expected
+    /// torn-trailing-record artifact `JournalReader::scan` already
+    /// tolerates -- mirrors `duet_ops::journal`'s own
+    /// `scan_treats_a_truncated_trailing_record_as_absent_not_an_error`
+    /// test for the exact shape this must differ from) produces a notice
+    /// rather than crashing `Workspace::new`, and the dialog does not
+    /// open.
+    #[gpui::test]
+    fn a_corrupt_journal_surfaces_a_notice_instead_of_crashing_workspace_new(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace_and_recovery_seed(
+            cx,
+            |state_dir| {
+                let job_id = JobId(606);
+                let path;
+                {
+                    let mut journal = Journal::open(job_id, state_dir).unwrap();
+                    journal
+                        .append(&JournalRecord::JobStarted {
+                            job_id,
+                            started_at: Timestamp::EPOCH,
+                            plan: duet_ops::Plan::new(Vec::new(), duet_ops::PlanOptions::default()),
+                            kind: JobKind::Copy,
+                        })
+                        .unwrap();
+                    path = journal.path().to_path_buf();
+                }
+                // A non-JSON line followed by a trailing newline -- the
+                // file therefore *ends* with `\n`, so `JournalReader::
+                // scan`'s "only a torn trailing record is tolerated" rule
+                // (see `duet_ops::journal`'s own module doc comment,
+                // "Wire format" section) treats this as a hard parse
+                // failure, not an expected crash artifact.
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                writeln!(file, "not valid json at all").unwrap();
+            },
+            |workspace, vcx, _data_dir| {
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                workspace.read_with(vcx, |ws, _| {
+                    assert!(
+                        ws.recovery_dialog.is_none(),
+                        "a scan that fails outright must not open the dialog"
+                    );
+                });
+                let notification_count = vcx.update(|window, cx| window.notifications(cx).len());
+                assert!(
+                    notification_count > 0,
+                    "a corrupt journal must surface a notice, not silently no-op"
+                );
+            },
+        );
     }
 }
