@@ -73,6 +73,19 @@
 //!   report's own "re-run failed" action (`docs/commands.md`'s
 //!   `ops.queue.retry_failed`). The one planner here that walks nothing at
 //!   all: everything it needs is already in the finished job.
+//! - [`recovery`] — T-5.2.5 (FR-OPS-07), phase 1 of 2:
+//!   [`recovery::plan_from_recovery`], the same "keep only these step
+//!   indices, remap `depends_on`" rebuild as `rerun` but sourced from a
+//!   crash-recovered [`journal::RecoveryReport`]'s `incomplete_steps`
+//!   instead of a finished job's errors/skips, plus
+//!   [`recovery::orphaned_partial_path`], which re-derives an orphaned
+//!   `.duet-partial-*` file's real path from a `RecoveryReport` so a
+//!   "discard" action can delete it. This crate's half of the "N
+//!   interrupted operations — review" startup story: the actual scan
+//!   already exists ([`journal::JournalReader::scan`]), and
+//!   [`journal::Journal::resolve`] closes a job back out once its
+//!   dangling intents have been resumed or discarded. Building the
+//!   startup UI itself on top of this is phase 2's job, in `duet-ui`.
 //! - [`job`] / [`event`] — the queued unit and the event stream a UI (or
 //!   test harness) subscribes to instead of polling (design.md §8.2).
 //! - [`journal`] — T-5.1.2, the FR-OPS-07 crash-safety backbone:
@@ -95,6 +108,7 @@ mod mover;
 mod plan;
 mod planner;
 mod queue;
+mod recovery;
 mod rerun;
 mod step;
 
@@ -112,5 +126,6 @@ pub use mover::plan_move;
 pub use plan::{Plan, PlanOptions, PlanTotals};
 pub use planner::{CancelToken, PlannerError, plan_copy};
 pub use queue::{QueueError, QueueManager};
+pub use recovery::{orphaned_partial_path, plan_from_recovery};
 pub use rerun::plan_from_report;
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};

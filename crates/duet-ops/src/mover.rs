@@ -427,7 +427,7 @@ mod tests {
 
     use super::*;
     use crate::executor::{ExecutionControl, execute};
-    use crate::job::{JobId, JobReport};
+    use crate::job::{JobId, JobKind, JobReport};
     use crate::journal::Journal;
     use crate::step::StepKind;
 
@@ -439,7 +439,18 @@ mod tests {
         let journal = Journal::open(JobId(job_id), state_dir).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        execute(fs, JobId(job_id), plan, journal, 2, tx, control, None).await
+        execute(
+            fs,
+            JobId(job_id),
+            JobKind::Move,
+            plan,
+            journal,
+            2,
+            tx,
+            control,
+            None,
+        )
+        .await
     }
 
     /// A `FileSystem` test double wrapping a real [`LocalFs`], whose `stat`

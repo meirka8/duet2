@@ -92,6 +92,25 @@ pub fn plan_from_report(original: &Plan, report: &JobReport) -> Plan {
     redo.extend(report.errors.iter().map(|failure| failure.step_index));
     redo.extend(report.skipped.iter().map(|skip| skip.step_index));
 
+    rebuild_subset(original, redo)
+}
+
+/// The shared "keep only these step indices, remapping `depends_on` onto
+/// the smaller list" transformation behind both [`plan_from_report`]
+/// (T-5.2.4: re-run what didn't work) and [`crate::recovery::
+/// plan_from_recovery`] (T-5.2.5: resume what was interrupted) -- see the
+/// module doc comment's "`depends_on` remapping" section for the two cases
+/// (cleared vs. remapped) this implements. Both callers differ only in
+/// *how* they arrive at `redo` (a finished job's errors/skips vs. a
+/// crash-recovered journal's dangling intents); once they have it, rebuild
+/// ing the plan is exactly the same operation, so it lives here once
+/// rather than being duplicated per caller.
+///
+/// `redo` is a `BTreeSet` (not a `Vec`/slice) so this function's own
+/// contract -- ascending original order, deduplicated -- is enforced by
+/// the type the caller hands in, rather than by a documented-but-
+/// unenforced calling convention.
+pub(crate) fn rebuild_subset(original: &Plan, redo: BTreeSet<u32>) -> Plan {
     let mut new_index_of: HashMap<u32, u32> = HashMap::with_capacity(redo.len());
     let mut steps: Vec<Step> = Vec::with_capacity(redo.len());
     for old_index in redo {

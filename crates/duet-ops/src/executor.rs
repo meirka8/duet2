@@ -194,7 +194,7 @@ use crate::conflict::{
     ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
 };
 use crate::event::{JobEvent, ProgressSnapshot};
-use crate::job::{JobId, JobOutcome, JobReport, StepFailure};
+use crate::job::{JobId, JobKind, JobOutcome, JobReport, StepFailure};
 use crate::journal::{Journal, JournalRecord, StepOutcome};
 use crate::plan::Plan;
 use crate::step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
@@ -683,6 +683,7 @@ impl EtaEstimator {
 pub async fn execute(
     fs: Arc<dyn FileSystem>,
     job_id: JobId,
+    kind: JobKind,
     plan: Plan,
     journal: Journal,
     concurrency: usize,
@@ -699,6 +700,7 @@ pub async fn execute(
             job_id,
             started_at,
             plan: plan.clone(),
+            kind,
         })
         .await
     {
@@ -2518,6 +2520,7 @@ mod tests {
         let report = execute(
             fs,
             JobIdT(1),
+            JobKind::Copy,
             plan,
             journal,
             concurrency,
@@ -3080,6 +3083,7 @@ mod tests {
         let handle = tokio::spawn(execute(
             fs,
             JobIdT(1),
+            JobKind::Copy,
             plan,
             journal,
             1,
@@ -3299,6 +3303,7 @@ mod tests {
         let handle = tokio::spawn(execute(
             fs_for_task,
             JobIdT(2),
+            JobKind::Copy,
             plan,
             journal,
             1, // force sequential so cancellation is guaranteed mid-batch
@@ -3363,6 +3368,7 @@ mod tests {
         let handle = tokio::spawn(execute(
             Arc::clone(&fs),
             JobIdT(3),
+            JobKind::Copy,
             plan,
             journal,
             1,
@@ -3731,6 +3737,7 @@ mod tests {
         let handle = tokio::spawn(execute(
             fs,
             JobIdT(1),
+            JobKind::Copy,
             plan,
             journal,
             1,
@@ -4322,7 +4329,17 @@ mod tests {
         let journal = Journal::open(JobIdT(1), state.path()).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 1, tx, control, None));
+        let handle = tokio::spawn(execute(
+            fs,
+            JobIdT(1),
+            JobKind::Copy,
+            plan,
+            journal,
+            1,
+            tx,
+            control,
+            None,
+        ));
 
         let mut throughput_samples: Vec<u64> = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -4493,7 +4510,17 @@ mod tests {
         // effective aggregate throughput by however many are in flight at
         // once, making the paced rate meaningless as a bound. One stream
         // at a time keeps the sustained rate exactly `PACED_BYTES_PER_SEC`.
-        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 1, tx, control, None));
+        let handle = tokio::spawn(execute(
+            fs,
+            JobIdT(1),
+            JobKind::Copy,
+            plan,
+            journal,
+            1,
+            tx,
+            control,
+            None,
+        ));
 
         // Find the Progress sample closest to (but not before) t=10s.
         let mut predicted_at_10s: Option<u64> = None;
@@ -4596,6 +4623,7 @@ mod tests {
         let handle = tokio::spawn(execute(
             Arc::clone(&fs),
             JobIdT(1),
+            JobKind::Copy,
             plan,
             journal,
             1,
@@ -4901,7 +4929,17 @@ mod tests {
         let journal = Journal::open(JobIdT(1), state.path()).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let control = ExecutionControl::new();
-        let handle = tokio::spawn(execute(fs, JobIdT(1), plan, journal, 2, tx, control, None));
+        let handle = tokio::spawn(execute(
+            fs,
+            JobIdT(1),
+            JobKind::Copy,
+            plan,
+            journal,
+            2,
+            tx,
+            control,
+            None,
+        ));
 
         let mut throughput_samples: Vec<(u64, u64)> = Vec::new(); // (bytes_done, throughput)
         while let Some(event) = rx.recv().await {

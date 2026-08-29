@@ -358,6 +358,7 @@ fn try_start_next(
                     let entry = guard.jobs.get(&id).unwrap();
                     (
                         id,
+                        entry.job.kind,
                         entry.job.plan.clone(),
                         Arc::clone(&entry.fs),
                         entry.state_dir.clone(),
@@ -369,12 +370,13 @@ fn try_start_next(
             }
         };
         match started {
-            Some((id, plan, fs, state_dir, concurrency, resolver, control)) => {
+            Some((id, kind, plan, fs, state_dir, concurrency, resolver, control)) => {
                 spawn_job(
                     Arc::clone(state),
                     max_concurrent,
                     events.clone(),
                     id,
+                    kind,
                     plan,
                     fs,
                     state_dir,
@@ -400,6 +402,7 @@ fn spawn_job(
     max_concurrent: usize,
     events: mpsc::UnboundedSender<JobEvent>,
     id: JobId,
+    kind: JobKind,
     plan: Plan,
     fs: Arc<dyn FileSystem>,
     state_dir: PathBuf,
@@ -451,6 +454,7 @@ fn spawn_job(
         let exec_handle = tokio::spawn(execute(
             fs,
             id,
+            kind,
             plan,
             journal,
             concurrency.max(1),

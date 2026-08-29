@@ -74,7 +74,7 @@ use std::path::{Path, PathBuf};
 use duet_types::{ErrorKind, Result, Timestamp, VfsError};
 use serde::{Deserialize, Serialize};
 
-use crate::job::{JobId, JobOutcome, StepFailure};
+use crate::job::{JobId, JobKind, JobOutcome, StepFailure};
 use crate::plan::Plan;
 use crate::step::Step;
 
@@ -98,6 +98,14 @@ pub enum JournalRecord {
         job_id: JobId,
         started_at: Timestamp,
         plan: Plan,
+        /// What kind of user-facing operation this job represents
+        /// ([`JobKind`]) — persisted here (T-5.2.5) so a recovery scan can
+        /// reconstruct a [`RecoveryReport`] with enough context to label
+        /// "3 interrupted operations" by kind ("2 copies, 1 move") without
+        /// needing the queue's in-memory `Job` to have survived the crash
+        /// too, matching this record's existing "the whole `Plan`, not
+        /// just its id" precedent one field over.
+        kind: JobKind,
     },
     /// Declares intent to execute `step` (at `step_index` in the job's
     /// plan) before any side effect of it happens. This record must be
@@ -148,6 +156,9 @@ pub enum StepOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryReport {
     pub job_id: JobId,
+    /// This job's [`JobKind`], carried straight from its [`JournalRecord::
+    /// JobStarted`] record — see that field's own doc comment.
+    pub kind: JobKind,
     pub plan: Plan,
     /// Steps whose `Intent` has no matching `Completion` — the exact
     /// remaining work (design.md §9.3: "resume (re-plan the remainder ...)").
@@ -257,6 +268,44 @@ impl Journal {
         self.file.sync_all().map_err(io_error)?;
         Ok(())
     }
+
+    /// Durably resolves every one of `report`'s still-dangling intents as
+    /// deliberately abandoned (never completed, and not going to be —
+    /// either because their remaining work was just handed off to a fresh
+    /// job's own journal via T-5.2.5's resume, or because the operator
+    /// just discarded the orphaned partials via T-5.2.5's discard), then
+    /// closes the job out as `Cancelled`. After this call, this exact
+    /// `RecoveryReport` will never again appear in a [`JournalReader::
+    /// scan`] — every previously-dangling `Intent` now has a matching
+    /// `Completion`, so `fold`'s Intent/Completion pairing no longer finds
+    /// anything incomplete, and `last_outcome` becomes
+    /// `Some(JobOutcome::Cancelled)`.
+    ///
+    /// `self` is consumed (not `&mut self`) because nothing should append
+    /// to this handle again afterward — the caller re-opens fresh if it
+    /// ever needs to touch this job's journal again, matching
+    /// [`Journal::open`]'s own "reopening an existing journal appends,
+    /// never truncates" contract.
+    ///
+    /// # Errors
+    /// Same as [`Journal::append`] — a `Completion`/`JobFinished` record
+    /// failing to durably write. A caller that gets an error here cannot
+    /// assume the job was actually closed out; re-scanning is the only way
+    /// to know how far this call got.
+    pub fn resolve(mut self, report: &RecoveryReport, reason: &str) -> Result<()> {
+        for &step_index in &report.incomplete_steps {
+            self.append(&JournalRecord::Completion {
+                step_index,
+                outcome: StepOutcome::Skipped {
+                    reason: reason.to_string(),
+                },
+            })?;
+        }
+        self.append(&JournalRecord::JobFinished {
+            outcome: JobOutcome::Cancelled,
+            finished_at: Timestamp::from(std::time::SystemTime::now()),
+        })
+    }
 }
 
 /// Reads journal files back for crash recovery. A separate type from
@@ -355,6 +404,7 @@ impl JournalReader {
         let JournalRecord::JobStarted {
             job_id,
             plan,
+            kind,
             started_at: _,
         } = first
         else {
@@ -406,6 +456,7 @@ impl JournalReader {
 
         Ok(Some(RecoveryReport {
             job_id: *job_id,
+            kind: *kind,
             plan: plan.clone(),
             incomplete_steps,
             orphaned_partials,
@@ -449,6 +500,7 @@ mod tests {
                     job_id: JobId(2),
                     started_at: Timestamp::EPOCH,
                     plan: Plan::new(Vec::new(), PlanOptions::default()),
+                    kind: JobKind::Copy,
                 })
                 .unwrap();
         }
@@ -489,6 +541,7 @@ mod tests {
                 job_id: JobId(3),
                 started_at: Timestamp::EPOCH,
                 plan: plan.clone(),
+                kind: JobKind::Copy,
             })
             .unwrap();
         journal
@@ -546,6 +599,7 @@ mod tests {
                 job_id: JobId(4),
                 started_at: Timestamp::EPOCH,
                 plan: plan.clone(),
+                kind: JobKind::Copy,
             })
             .unwrap();
         // Step 0: fully completed -- crucially, its own Intent also
@@ -587,6 +641,142 @@ mod tests {
         assert_eq!(report.last_outcome, None);
     }
 
+    /// T-5.2.5: `JournalRecord::JobStarted`'s new `kind` field must survive
+    /// a real serde round-trip, not just compile -- the wire format is
+    /// newline-delimited JSON (see the module doc comment's "Wire format"
+    /// section), so a field that's present in the Rust struct but silently
+    /// dropped or misnamed in the `Serialize`/`Deserialize` derive would
+    /// still compile fine and only fail at runtime.
+    #[test]
+    fn job_started_kind_round_trips_through_serde() {
+        let record = JournalRecord::JobStarted {
+            job_id: JobId(1),
+            started_at: Timestamp::EPOCH,
+            plan: Plan::new(Vec::new(), PlanOptions::default()),
+            kind: JobKind::Delete { permanent: true },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        let back: JournalRecord = serde_json::from_str(&line).unwrap();
+        match back {
+            JournalRecord::JobStarted { kind, .. } => {
+                assert_eq!(kind, JobKind::Delete { permanent: true });
+            }
+            other => panic!("expected JobStarted, got {other:?}"),
+        }
+    }
+
+    /// A `RecoveryReport` built by a real `JournalReader::scan`/`fold` must
+    /// carry the same `kind` its `JobStarted` record was written with --
+    /// this is what lets T-5.2.5's startup recovery UI label each
+    /// interrupted operation ("2 copies, 1 move") without re-deriving it
+    /// from the plan's step shapes.
+    #[test]
+    fn scan_carries_the_jobs_kind_into_the_recovery_report() {
+        let dir = TempDir::new().unwrap();
+        let plan = Plan::new(
+            vec![Step::CreateDir {
+                dest: test_vpath(0),
+                mode: None,
+            }],
+            PlanOptions::default(),
+        );
+        let mut journal = Journal::open(JobId(5), dir.path()).unwrap();
+        journal
+            .append(&JournalRecord::JobStarted {
+                job_id: JobId(5),
+                started_at: Timestamp::EPOCH,
+                plan: plan.clone(),
+                kind: JobKind::Move,
+            })
+            .unwrap();
+        // A dangling Intent -- otherwise irrelevant to this test, just
+        // needed to keep the journal a realistic mid-job shape.
+        journal
+            .append(&JournalRecord::Intent {
+                step_index: 0,
+                step: plan.steps[0].clone(),
+                partial_name: None,
+            })
+            .unwrap();
+
+        let reports = JournalReader::scan(dir.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].kind, JobKind::Move);
+    }
+
+    /// `Journal::resolve` must not just return `Ok(())` -- it must actually
+    /// close the loop: after resolving, re-scanning the exact same
+    /// `state_dir` must show the job as fully accounted for (no more
+    /// incomplete steps) and terminally `Cancelled`, proving the appended
+    /// `Completion`/`JobFinished` records are both durable and correctly
+    /// paired by a fresh `JournalReader::fold`, not just self-consistent
+    /// from `resolve`'s own point of view.
+    #[test]
+    fn resolve_closes_out_a_dangling_job_so_a_rescan_shows_it_fully_accounted_for() {
+        let dir = TempDir::new().unwrap();
+        let plan = Plan::new(
+            vec![
+                Step::CreateDir {
+                    dest: test_vpath(0),
+                    mode: None,
+                },
+                Step::CreateDir {
+                    dest: test_vpath(1),
+                    mode: None,
+                },
+            ],
+            PlanOptions::default(),
+        );
+        let job_id = JobId(6);
+        let mut journal = Journal::open(job_id, dir.path()).unwrap();
+        journal
+            .append(&JournalRecord::JobStarted {
+                job_id,
+                started_at: Timestamp::EPOCH,
+                plan: plan.clone(),
+                kind: JobKind::CreateDir,
+            })
+            .unwrap();
+        // Step 0: genuinely completed.
+        journal
+            .append(&JournalRecord::Intent {
+                step_index: 0,
+                step: plan.steps[0].clone(),
+                partial_name: None,
+            })
+            .unwrap();
+        journal
+            .append(&JournalRecord::Completion {
+                step_index: 0,
+                outcome: StepOutcome::Succeeded,
+            })
+            .unwrap();
+        // Step 1: Intent only -- the one genuinely dangling step.
+        journal
+            .append(&JournalRecord::Intent {
+                step_index: 1,
+                step: plan.steps[1].clone(),
+                partial_name: None,
+            })
+            .unwrap();
+
+        let reports_before = JournalReader::scan(dir.path()).unwrap();
+        assert_eq!(reports_before.len(), 1);
+        assert_eq!(reports_before[0].incomplete_steps, vec![1]);
+        assert_eq!(reports_before[0].last_outcome, None);
+
+        let journal = Journal::open(job_id, dir.path()).unwrap();
+        journal.resolve(&reports_before[0], "test reason").unwrap();
+
+        let reports_after = JournalReader::scan(dir.path()).unwrap();
+        assert_eq!(reports_after.len(), 1);
+        assert!(
+            reports_after[0].incomplete_steps.is_empty(),
+            "resolve must leave no incomplete steps behind on a fresh rescan"
+        );
+        assert_eq!(reports_after[0].last_outcome, Some(JobOutcome::Cancelled));
+    }
+
     #[test]
     fn scan_treats_a_truncated_trailing_record_as_absent_not_an_error() {
         let dir = TempDir::new().unwrap();
@@ -604,6 +794,7 @@ mod tests {
                         }],
                         PlanOptions::default(),
                     ),
+                    kind: JobKind::Copy,
                 })
                 .unwrap();
             journal
@@ -688,6 +879,7 @@ mod tests {
                     job_id: JobId(99),
                     started_at: Timestamp::EPOCH,
                     plan: Plan::new(Vec::new(), PlanOptions::default()),
+                    kind: JobKind::Copy,
                 })
                 .unwrap();
             for step_index in 0..10_000_000u32 {
