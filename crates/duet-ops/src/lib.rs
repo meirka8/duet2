@@ -37,6 +37,17 @@
 //!   computing — but still real journaled jobs, so a `mkdir` gets the same
 //!   off-UI-thread execution, crash evidence, and conflict engine a copy
 //!   does. See its own module doc comment.
+//! - [`attributes`] — T-5.2.8: [`attributes::plan_attributes`], the
+//!   `Ctrl+A` "Change Attributes" dialog's backing planner. Adds no `Step`
+//!   variant and no executor arm — `Step::SetMeta`/`MetaPatch` have both
+//!   been real since T-3.1.5/T-5.1.6 — it is only the walk that decides
+//!   which paths one patch applies to, which is what makes "recursive
+//!   apply runs through the operation queue, not synchronously" (its own
+//!   AC) true by construction. See its module doc comment for the one
+//!   genuinely load-bearing decision in it: a symlink met during the
+//!   recursive walk is skipped, because `set_meta`'s mode half is a
+//!   symlink-*following* `chmodat` and design.md §13 forbids following one
+//!   implicitly during a recursive chmod.
 //! - [`executor`] — T-5.1.3: runs a `Plan`'s steps against a `FileSystem`,
 //!   bracketing every one with journal `Intent`/`Completion` records, with
 //!   a bounded per-device-aware worker pool and cooperative pause/cancel.
@@ -72,6 +83,7 @@
 //!   support, and `journal`'s own module doc comment for exactly how much
 //!   of that proof this task covers versus leaves to T-10.2.1.
 
+mod attributes;
 mod conflict;
 mod creators;
 mod deleter;
@@ -86,6 +98,7 @@ mod queue;
 mod rerun;
 mod step;
 
+pub use attributes::plan_attributes;
 pub use conflict::{
     ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, ConflictScope,
 };

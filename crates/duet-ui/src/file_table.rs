@@ -1547,6 +1547,37 @@ pub(crate) fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
     (y, m, d, hour, minute)
 }
 
+/// The exact inverse of [`civil_from_unix`]: `YYYY-MM-DD HH:MM` parts back
+/// to Unix seconds, via Howard Hinnant's `days_from_civil` -- the mirror
+/// algorithm his own page publishes alongside the `civil_from_days` above.
+/// Kept immediately next to its forward twin, and round-trip-tested
+/// against it, so the pair can't drift (the same reasoning
+/// `rename_dialog::split_stem_extension`/`join_stem_extension` are kept
+/// adjacent for).
+///
+/// Added by T-5.2.8, whose attributes dialog needs to turn an edited
+/// `YYYY-MM-DD HH:MM` field back into a `duet_types::Timestamp`. Seconds
+/// are always `0`: the format this codebase displays has minute
+/// resolution, so there is nothing finer for a user to have typed.
+///
+/// **Does no validation.** `unix_from_civil(2023, 2, 30, ...)` happily
+/// returns the instant `civil_from_unix` would call `2023-03-02` --
+/// exactly as Hinnant's own algorithm is specified to. Callers that need
+/// to reject an impossible date do it by round-tripping the result back
+/// through [`civil_from_unix`] and checking it comes back unchanged (see
+/// `crate::attributes_dialog::parse_date_time`), which catches every
+/// out-of-range component with no month-length table of its own.
+pub(crate) fn unix_from_civil(y: i64, m: u32, d: u32, hh: u32, mm: u32) -> i64 {
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + i64::from(hh) * 3600 + i64::from(mm) * 60
+}
+
 /// The `YYYY-MM-DD HH:MM` formatter itself -- `pub(crate)` (T-5.2.3) so
 /// `crate::conflict_dialog`'s side-by-side metadata block can format a
 /// `Metadata::modified` timestamp the same way this table's own Date
@@ -4158,5 +4189,52 @@ mod tests {
         buf.clear();
         write_date(&mut buf, 0);
         assert_eq!(buf, "-");
+    }
+
+    /// T-5.2.8: `unix_from_civil` is only useful if it is *exactly* the
+    /// inverse of the `civil_from_unix` this table already displays with --
+    /// otherwise the attributes dialog would pre-fill a timestamp field
+    /// with one instant and write back a different one.
+    #[test]
+    fn civil_time_round_trips_through_its_own_inverse() {
+        for secs in [
+            0i64,           // the epoch itself
+            1_700_000_000,  // 2023-11-14 22:13, the case above
+            951_782_400,    // 2000-02-29, a leap day in a leap century
+            4_107_542_400,  // 2100-03-01, just past a *non*-leap century
+            981_173_100,    // 2001-02-03 04:05
+            -1_000_000_000, // pre-epoch: 1938-04-24
+            2_147_483_647,  // the 32-bit time_t rollover
+        ] {
+            // Truncate to the minute first: the format itself has no
+            // seconds field, so that is the finest granularity the pair
+            // can possibly round-trip.
+            let secs = secs - secs.rem_euclid(60);
+            let (y, m, d, hh, mm) = civil_from_unix(secs);
+            assert_eq!(
+                unix_from_civil(y, m, d, hh, mm),
+                secs,
+                "{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} did not round-trip"
+            );
+            // ... and the other direction: parts -> seconds -> parts.
+            assert_eq!(
+                civil_from_unix(unix_from_civil(y, m, d, hh, mm)),
+                (y, m, d, hh, mm)
+            );
+        }
+    }
+
+    /// The specific behaviour `attributes_dialog::parse_date_time` relies
+    /// on to reject an impossible date without a month-length table:
+    /// `unix_from_civil` normalises rather than erroring, so a day that
+    /// doesn't exist comes back as a *different* date.
+    #[test]
+    fn an_impossible_date_normalises_rather_than_erroring() {
+        let secs = unix_from_civil(2023, 2, 30, 0, 0);
+        assert_eq!(
+            civil_from_unix(secs),
+            (2023, 3, 2, 0, 0),
+            "February 30th rolls forward -- which is exactly how a caller detects it"
+        );
     }
 }
