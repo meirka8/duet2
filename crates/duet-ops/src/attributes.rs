@@ -210,6 +210,7 @@ mod tests {
         crate::executor::execute(
             fs,
             crate::job::JobId(1),
+            crate::job::JobKind::ChangeAttributes,
             plan,
             journal,
             1,
