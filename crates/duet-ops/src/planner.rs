@@ -97,6 +97,13 @@ pub enum PlannerError {
     /// there's no basename to join onto `dest_dir`, so this source can't
     /// be placed in the destination tree at all.
     NoFileName(VPath),
+    /// T-5.3.1: `duet_platform::trash::resolve_trash_destination` couldn't
+    /// resolve a trash destination for `target` -- carries a pre-formatted
+    /// `message` (that resolver's own `TrashError::to_string()`) rather
+    /// than the error type itself, so this crate doesn't need
+    /// `duet-platform` as more than the one call site
+    /// (`crate::deleter::plan_delete`) that constructs this variant.
+    Trash { target: VPath, message: String },
 }
 
 /// One directory still to descend into: `source` is where to read entries

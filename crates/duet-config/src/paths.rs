@@ -66,23 +66,27 @@ pub fn xdg_data_home() -> Result<PathBuf> {
 }
 
 /// `~/.local/share/Trash/files` (or `$XDG_DATA_HOME/Trash/files`) -- where
-/// T-5.2.6's trash-mode delete moves its targets.
+/// a home-filesystem trash-mode delete moves its targets' content.
 ///
-/// **A deliberately minimal placeholder, not the freedesktop trash spec.**
-/// design.md §9.10/FR-CFG-07's full implementation -- `.trashinfo` sidecars
-/// recording each item's original path and deletion time, `$topdir/
-/// .Trash-$uid` for targets on other mounts, and a browsable/restorable
-/// trash view -- is T-5.3.1's own, later scope. This function does none of
-/// that; it only answers "which directory does a trashed file move into,"
-/// which is all `duet_ops::DeleteMode::Trash` needs (see
-/// `duet_ops::deleter`'s own module doc comment for why "trash" is just
-/// `plan_move` into a directory at that layer).
-///
-/// Nothing built on this needs undoing or migrating when T-5.3.1 lands:
-/// this is the *same* final location the real spec-compliant
-/// implementation uses for a home-filesystem delete. T-5.3.1 layers the
-/// sidecar metadata and the other-mount cases on top of this destination
-/// rather than replacing it.
+/// Historically (T-5.2.6) this was a deliberately minimal placeholder --
+/// "trash" meant nothing more than moving into this one fixed directory,
+/// with no `.trashinfo` sidecars and no per-mount routing at all. T-5.3.1
+/// layered the real freedesktop trash spec on top (`duet_platform::trash`:
+/// `.trashinfo` metadata, `$topdir/.Trash{,-$uid}` for a target on another
+/// filesystem) *without* changing this function or the path it returns --
+/// this is still exactly where a target sharing `$XDG_DATA_HOME`'s own
+/// filesystem lands, unchanged. A target on a different filesystem uses a
+/// different, per-mount trash directory instead (never this one) -- see
+/// `duet_platform::trash`'s own module doc comment for that resolution.
+/// `duet_ops::DeleteMode::Trash` no longer takes this value directly --
+/// it carries `data_home` (this crate's [`xdg_data_home`] result, resolved
+/// once by `duet_ui::delete_dialog::resolve_delete_mode`), and
+/// `duet_ops::deleter::plan_delete` joins `"Trash"`/`"files"` onto it
+/// itself (via `duet_platform::trash::resolve_trash_destination`) per
+/// target, the same two path components this function joins. This
+/// function's own direct callers today are `duet-ui`'s tests, which
+/// assert their expectations against it independently rather than
+/// depending on the ops-engine internals producing the identical path.
 pub fn trash_files_dir() -> Result<PathBuf> {
     Ok(xdg_data_home()?.join("Trash").join("files"))
 }

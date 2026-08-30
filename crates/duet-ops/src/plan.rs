@@ -107,7 +107,11 @@ impl Plan {
                 // T-5.1.7's inode-dedup wins and has nothing to do with
                 // symbolic links.
                 StepKind::Symlink => totals.files += 1,
-                StepKind::Rename | StepKind::SetMeta | StepKind::Remove | StepKind::Verify => {}
+                StepKind::Rename
+                | StepKind::SetMeta
+                | StepKind::Remove
+                | StepKind::Verify
+                | StepKind::WriteTrashInfo => {}
             }
             totals.bytes += step.planned_bytes();
         }

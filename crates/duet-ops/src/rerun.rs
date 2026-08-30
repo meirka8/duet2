@@ -40,12 +40,13 @@
 //!   alongside its dependent, so the gate still means something -- remap
 //!   it to that step's new index within the rebuilt subset.
 //!
-//! Steps that carry no `depends_on` field at all (`CreateDir`,
-//! `CopyFile`, `Reflink`, `Rename`) need nothing done to them, because
-//! their ordering is positional -- which is also why the redo set is
-//! rebuilt in ascending `step_index` order rather than in whatever order
-//! the report happened to record the failures. See [`Step::depends_on`]'s
-//! own doc comment.
+//! Steps that carry no `depends_on` field at all (`CreateDir`, `CopyFile`,
+//! `Reflink`, `WriteTrashInfo`) need nothing done to them, because their
+//! ordering is positional -- which is also why the redo set is rebuilt in
+//! ascending `step_index` order rather than in whatever order the report
+//! happened to record the failures. See [`Step::depends_on`]'s own doc
+//! comment (T-5.3.1 added `Rename` to the set of variants that *do* carry
+//! one, for the freedesktop-trash `WriteTrashInfo` → `Rename` barrier).
 //!
 //! # Options are reused verbatim
 //!
@@ -144,11 +145,10 @@ fn depends_on_mut(step: &mut Step) -> Option<&mut Option<u32>> {
         | Step::Symlink { depends_on, .. }
         | Step::SetMeta { depends_on, .. }
         | Step::Remove { depends_on, .. }
-        | Step::Verify { depends_on, .. } => Some(depends_on),
-        Step::CreateDir { .. }
-        | Step::CopyFile { .. }
-        | Step::Reflink { .. }
-        | Step::Rename { .. } => None,
+        | Step::Verify { depends_on, .. }
+        | Step::Rename { depends_on, .. } => Some(depends_on),
+        Step::CreateDir { .. } | Step::CopyFile { .. } | Step::Reflink { .. } => None,
+        Step::WriteTrashInfo { .. } => None,
     }
 }
 

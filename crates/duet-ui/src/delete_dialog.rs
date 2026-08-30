@@ -15,14 +15,19 @@
 //! constructed only once that decision has already been made.
 //!
 //! "Trash" here means exactly what `duet_ops::deleter`'s own module doc
-//! comment says it means at the planner layer -- move the target into a
-//! real directory (`duet_config::paths::trash_files_dir`) instead of
-//! removing its content. It is **not** the freedesktop trash spec:
-//! `.trashinfo` sidecars, `$topdir/.Trash-$uid` for other mounts, and a
-//! browsable/restorable trash view are all T-5.3.1's own, later scope, and
-//! nothing here needs undoing when that lands (see `trash_files_dir`'s own
-//! doc comment: it is already the same destination the spec-compliant
-//! implementation uses for a home-filesystem delete).
+//! comment says it means at the planner layer -- since T-5.3.1, that is the
+//! *real* freedesktop trash spec (`.trashinfo` sidecars, `$topdir/
+//! .Trash{,-$uid}` for a target on another filesystem, all resolved by
+//! `duet_platform::trash`), not the earlier T-5.1.8/T-5.2.6 placeholder
+//! ("move into a fixed directory") this comment used to describe. This
+//! module's own job stays exactly as narrow as before, though: resolve
+//! `duet_config::paths::xdg_data_home()` once and hand it to `plan_delete`
+//! as `DeleteMode::Trash { data_home }` -- per-target routing (which
+//! filesystem a target is actually on, which of the two per-mount trash
+//! methods applies there) is entirely `duet_ops::deleter`/
+//! `duet_platform::trash`'s job now, not something this dialog precomputes
+//! or creates a directory for itself. A trash browser/restore view is
+//! still T-5.3.2's own, later, separate scope.
 //!
 //! # No `ConflictResolver`, deliberately
 //!
@@ -104,9 +109,12 @@ pub(crate) struct DeleteDialogState {
     /// (`crate::copy_move_dialog::resolve_source_names`), not a second,
     /// parallel answer to "what am I operating on".
     targets: Vec<VPath>,
-    /// The dialog's current choice: `true` removes content, `false` moves
-    /// it into `duet_config::paths::trash_files_dir()`. Defaults from
-    /// `operations.delete_default` (and `trash.enabled`, see
+    /// The dialog's current choice: `true` removes content, `false` trashes
+    /// it per the freedesktop spec (`duet_platform::trash`, via
+    /// `resolve_delete_mode`/`plan_delete` -- for a target that stays on
+    /// `$XDG_DATA_HOME`'s own filesystem, this lands at the same
+    /// `duet_config::paths::trash_files_dir()` path as always). Defaults
+    /// from `operations.delete_default` (and `trash.enabled`, see
     /// `workspace::load_delete_default_permanent`) unless
     /// `permanent_forced` is set.
     permanent: bool,
@@ -425,21 +433,21 @@ pub(crate) fn spawn_delete_job(
 }
 
 /// Turns the dialog's `permanent` choice into the [`DeleteMode`]
-/// `plan_delete` takes, creating the trash directory if this is the first
-/// thing ever trashed on this machine (`plan_move`, which trash mode is
-/// built on, needs a destination that already exists). Any failure here
-/// becomes the same user-facing "couldn't plan the operation" toast a
-/// planner error would.
+/// `plan_delete` takes. For trash mode this is now just `$XDG_DATA_HOME`
+/// itself (`duet_config::paths::xdg_data_home()`) -- no directory creation
+/// and no per-target routing decision here at all; `plan_delete` calls into
+/// `duet_platform::trash` once per target to resolve (and create, as
+/// needed) each one's actual trash destination, since different targets in
+/// one job may live on different filesystems. Any failure here becomes the
+/// same user-facing "couldn't plan the operation" toast a planner error
+/// would.
 async fn resolve_delete_mode(permanent: bool) -> Result<DeleteMode, String> {
     if permanent {
         return Ok(DeleteMode::Permanent);
     }
-    let dir = duet_config::paths::trash_files_dir().map_err(|e| e.to_string())?;
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("couldn't create the trash directory {}: {e}", dir.display()))?;
-    let trash_dir = crate::file_table::local_vpath(&dir)?;
-    Ok(DeleteMode::Trash { trash_dir })
+    let dir = duet_config::paths::xdg_data_home().map_err(|e| e.to_string())?;
+    let data_home = crate::file_table::local_vpath(&dir)?;
+    Ok(DeleteMode::Trash { data_home })
 }
 
 /// Which of `dirs` (name plus already-resolved path) actually have at

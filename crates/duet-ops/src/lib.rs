@@ -23,12 +23,15 @@
 //!   becomes one zero-cost `Rename`; cross-device becomes a `CopyFile` +
 //!   (optional `Verify`) + `Remove` sequence, dependency-gated so the
 //!   source is never removed unless its copy is known to have succeeded.
-//! - [`deleter`] — T-5.1.8: `JobKind::Delete`'s two modes. Permanent
-//!   delete needs no walk of its own (`RemoveMode::Recursive` already
-//!   recurses safely at the `duet-vfs` layer, T-3.1.3); trash mode is
-//!   [`mover::plan_move`] reused wholesale, targeting a caller-supplied
-//!   trash directory — the full freedesktop trash spec itself is
-//!   T-5.3.1/T-5.3.2's later, separate scope.
+//! - [`deleter`] — T-5.1.8/T-5.3.1: `JobKind::Delete`'s two modes.
+//!   Permanent delete needs no walk of its own (`RemoveMode::Recursive`
+//!   already recurses safely at the `duet-vfs` layer, T-3.1.3). Trash mode
+//!   (T-5.3.1) is the full freedesktop trash spec: `duet_platform::trash`
+//!   resolves each target's own trash destination (home trash, or the
+//!   correct per-mount `$topdir/.Trash{,-$uid}` for a target on another
+//!   filesystem) and this module turns that into a `Step::WriteTrashInfo`
+//!   and `Step::Rename` pair per target. T-5.3.2 (a browsable/restorable
+//!   trash view) is still later, separate scope.
 //! - [`creators`] — T-5.2.7's four "create one thing" planners
 //!   ([`creators::plan_mkdir`], [`creators::plan_rename_in_place`],
 //!   [`creators::plan_symlink`], [`creators::plan_hardlink`]): the
