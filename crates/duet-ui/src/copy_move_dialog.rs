@@ -629,6 +629,7 @@ pub(crate) fn describe_planner_error(err: &PlannerError) -> String {
         PlannerError::Cancelled => "cancelled".to_string(),
         PlannerError::Vfs(e) => e.to_string(),
         PlannerError::NoFileName(path) => format!("{path} has no file name"),
+        PlannerError::Trash { target, message } => format!("{target}: {message}"),
     }
 }
 

@@ -183,6 +183,7 @@ pub async fn plan_move(
                 source: source.clone(),
                 dest,
                 conflict: None,
+                depends_on: None,
             });
         } else {
             cross_device.push(CrossDeviceEntry {

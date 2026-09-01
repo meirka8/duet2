@@ -20,6 +20,13 @@ duet-types = { path = "../duet-types" }
 # `duet-ops` sits right after `duet-vfs` in design.md §7.5/§8.1's crate list
 # precisely because the operation engine consumes the VFS layer.
 duet-vfs = { path = "../duet-vfs" }
+# T-5.3.1: `deleter::plan_delete`'s trash mode calls into
+# `duet_platform::trash::resolve_trash_destination` for the freedesktop
+# trash-spec decision (per-mount `$topdir/.Trash{,-$uid}` resolution,
+# `.trashinfo` formatting) -- a clean, non-circular addition, since
+# `duet-platform` itself has zero dependencies of its own (design.md §8.1's
+# crate list keeps it a peer of `duet-vfs`, not a consumer of it).
+duet-platform = { path = "../duet-platform" }
 serde.workspace = true
 # `FileSystem::read_dir`'s `BoxStream` needs `StreamExt::next()` to consume.
 futures-util.workspace = true

@@ -12,3 +12,26 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# T-5.3.1: the freedesktop trash spec's `VPath` <-> real-path boundary --
+# `duet-platform::trash` takes/returns plain `std::path::Path` (design.md
+# §9.10: this crate is a "pure decision" layer, not a `duet-vfs` consumer),
+# but `duet-ops` calls it with paths derived from `VPath`s, so a `TrashError`
+# needs to be constructible without forcing every caller to re-derive a
+# `VPath` from a `std::path::PathBuf` by hand. `duet-types` is "no deps
+# beyond std/serde" (its own module doc comment) -- the lightest possible
+# addition for this.
+duet-types = { path = "../duet-types" }
+# T-5.3.1's own directive: topdir discovery (`st_dev` comparison),
+# `$topdir/.Trash/$uid` vs `$topdir/.Trash-$uid` resolution (symlink check,
+# sticky-bit check, `mkdirat`/`chmodat` with exact 0700 regardless of
+# umask), and the process's real uid (`rustix::process::getuid`) -- the same
+# `*at`-relative-syscall convention `duet-vfs::local` already established,
+# reused directly here since this module needs the identical primitives
+# rather than duet-vfs's own (private, `duet-vfs`-internal) `local::probe`
+# module, which this crate deliberately does not depend on (design.md's
+# crate graph keeps `duet-platform` a peer of `duet-vfs`, not a consumer of
+# it -- see `documentation/design.md` §8.3's component diagram).
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.12"

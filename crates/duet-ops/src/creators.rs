@@ -195,6 +195,7 @@ pub fn plan_rename_in_place(
             source: source.clone(),
             dest,
             conflict: None,
+            depends_on: None,
         }],
         options,
     ))

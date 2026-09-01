@@ -541,6 +541,9 @@ fn describe_incomplete_step(step: &Step) -> String {
         Step::SetMeta { target, .. } => format!("Set attributes on {}", path_str(target)),
         Step::Remove { target, .. } => format!("Remove {}", path_str(target)),
         Step::Verify { dest, .. } => format!("Verify {}", path_str(dest)),
+        Step::WriteTrashInfo { info_path, .. } => {
+            format!("Write trash metadata {}", path_str(info_path))
+        }
     }
 }
 

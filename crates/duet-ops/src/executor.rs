@@ -1085,6 +1085,7 @@ fn step_primary_path(step: &Step) -> Option<VPath> {
         Step::Symlink { link_path, .. } => Some(link_path.clone()),
         Step::SetMeta { target, .. } | Step::Remove { target, .. } => Some(target.clone()),
         Step::Verify { dest, .. } => Some(dest.clone()),
+        Step::WriteTrashInfo { info_path, .. } => Some(info_path.clone()),
     }
 }
 
@@ -1273,6 +1274,7 @@ async fn dispatch(
             source,
             dest,
             conflict,
+            ..
         } => rename_step(ctx, step_index, *conflict, source, dest).await,
         Step::SetMeta { target, patch, .. } => set_meta_step(&*ctx.fs, target, patch).await,
         Step::Remove { target, mode, .. } => remove_step(&*ctx.fs, target, *mode).await,
@@ -1286,6 +1288,9 @@ async fn dispatch(
             algorithm,
             ..
         } => verify_step(ctx, source, dest, *algorithm).await,
+        Step::WriteTrashInfo { info_path, content } => {
+            write_trash_info_step(&*ctx.fs, info_path, content).await
+        }
     }
 }
 
@@ -1833,6 +1838,36 @@ async fn symlink_to_alternate(
         }
         Err(e) => Err(e),
     }
+}
+
+/// [`Step::WriteTrashInfo`]'s only real backend — writes `content` verbatim
+/// to `info_path` at mode `0600`, exclusively (a name collision here would
+/// mean `duet_platform::trash`'s plan-time uniqueness check and this step's
+/// actual execution disagreed, which is a genuine bug to surface as a
+/// failure, not a conflict to resolve). No partial-file staging: a
+/// `.trashinfo` sidecar is a handful of bytes, written and committed in one
+/// shot through the same `open_write`/`commit` contract every other write
+/// in this module uses, just without `naive_copy`'s chunking loop (nothing
+/// here is large enough to need it).
+async fn write_trash_info_step(
+    fs: &dyn FileSystem,
+    info_path: &VPath,
+    content: &str,
+) -> Result<StepAttempt> {
+    let mut writer = fs
+        .open_write(
+            info_path,
+            WriteOpts::create_new()
+                .with_mode(Mode::new(0o600))
+                .with_expected_size(content.len() as u64),
+        )
+        .await?;
+    if let Err(e) = writer.write_all(content.as_bytes()).await {
+        let _ = writer.abort().await;
+        return Err(Box::new(VfsError::from_io(e)));
+    }
+    writer.commit().await?;
+    Ok(StepAttempt::Done(StepOutcome::Succeeded))
 }
 
 async fn set_meta_step(
@@ -5462,6 +5497,7 @@ mod tests {
                 source: vpath_for(&source),
                 dest: vpath_for(&dest),
                 conflict: Some(ConflictPolicy::Overwrite),
+                depends_on: None,
             }],
             PlanOptions::default(),
         );

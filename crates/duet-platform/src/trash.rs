@@ -1,0 +1,1091 @@
+// SPDX-License-Identifier: MIT
+//! T-5.3.1: the full freedesktop trash-spec implementation (design.md
+//! §9.10, FR-CFG-07) — `$topdir/.Trash-$uid` for a target on a different
+//! filesystem than `$XDG_DATA_HOME`, `.trashinfo` sidecar metadata, and the
+//! two-method per-mount trash-directory resolution the spec defines. This
+//! module owns only the *pure decision*: given a target's real path and
+//! `$XDG_DATA_HOME`, where does its trashed content go, and what does its
+//! `.trashinfo` sidecar say — as plain `std::path::PathBuf`/`String` values,
+//! with no `Step`/`Plan`/`FileSystem` involved at all. `duet_ops::deleter`
+//! is the one caller: it turns [`resolve_trash_destination`]'s answer into
+//! a `Step::WriteTrashInfo` + `Step::Rename` pair per target (see that
+//! module's own doc comment for why the actual filesystem mutation stays
+//! there, journaled, rather than happening inside this crate).
+//!
+//! # Why plan-time name resolution, not the executor's live `AutoRename`
+//!
+//! The spec requires a `.trashinfo` file whose name exactly matches its
+//! paired content file inside `$trash/files/` — so if two targets in one
+//! job both happen to be named `a.txt`, the second one needs its
+//! `.trashinfo` written for whatever collision-free name it actually lands
+//! at (`a (2).txt`), not for `a.txt`. `duet_ops::executor`'s own
+//! `ConflictPolicy::AutoRename` resolves that name live, at *execution*
+//! time, with no channel to report the chosen name back to anything that
+//! could still act on it (`StepOutcome::Succeeded` carries no data).
+//! Reusing it here would mean `.trashinfo` could never reliably know what
+//! name to target.
+//!
+//! [`resolve_trash_destination`] resolves the collision-free name
+//! *up front*, at plan-build time, via [`unique_trash_name`]'s own
+//! `fs.stat`-probing loop — the same shape `executor::auto_rename_target`
+//! already uses, just called earlier, by the planner rather than the
+//! executor. `duet_ops::deleter` bakes the exact resolved name into both
+//! the `Step::WriteTrashInfo`'s `info_path` and the `Step::Rename`'s
+//! `dest`, so the two can never disagree about the name — and the
+//! `Rename`'s own conflict policy needs no live resolution at all
+//! (`Some(ConflictPolicy::Abort)`, a paranoid backstop for the plan-time-
+//! to-execution-time TOCTOU window every other `AutoRename` use already
+//! has and already mitigates the same way: fail loudly rather than
+//! silently pick a second name `.trashinfo` was never written for).
+//!
+//! # Local time without a date/time crate dependency
+//!
+//! `.trashinfo`'s `DeletionDate` must be local time, no timezone suffix.
+//! This crate has no `chrono`/`time`/`jiff` dependency (design.md §7.5's
+//! "additions earn their keep" policy, and `duet-platform` is otherwise
+//! dependency-free) — correctly converting a Unix timestamp to local civil
+//! time needs the system timezone database, which none of this crate's
+//! existing tools (`rustix`, hand-rolled Howard-Hinnant civil-time algebra
+//! like `duet-ui::file_table::civil_from_unix` already uses for UTC) can
+//! provide on their own. [`local_civil_time`] instead calls the C library's
+//! `localtime_r(3)` directly via a small hand-written `extern "C"` binding
+//! — no `libc` crate needed, since every Linux binary already links against
+//! the system libc, and Duet is Linux-only (this whole module already
+//! assumes Linux-specific syscalls throughout). The `struct tm` layout
+//! mirrored here (`sec/min/hour/mday/mon/year/wday/yday/isdst` plus the
+//! glibc/musl `tm_gmtoff`/`tm_zone` extensions, in that order) is the same
+//! on both major Linux libc implementations.
+
+use std::collections::HashSet;
+use std::ffi::c_char;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use rustix::fs::{self, AtFlags, CWD, FileType, Mode};
+use rustix::io::Errno;
+
+/// Tracks trash-content destinations already claimed by an earlier
+/// [`resolve_trash_destination`]/[`resolve_trash_destination_at`] call
+/// *within the same planning pass*.
+///
+/// This exists because [`unique_trash_name`]'s own collision probe only
+/// sees what already exists on disk right now -- and two targets trashed
+/// together in one job haven't actually moved anything yet by the time the
+/// second one is planned (planning and execution are separate phases; see
+/// `duet_ops::deleter`'s own module doc comment). Without this, two
+/// same-named targets in one job would both resolve to the identical
+/// `files/<name>` destination (each one's own probe finding nothing on
+/// disk yet), and the second target's `Step::Rename` would collide with
+/// the first's at execution time -- exactly the freedesktop-spec-mandated
+/// disambiguation this module exists to get right, silently defeated by
+/// planning-vs-execution timing.
+///
+/// A caller building one job's worth of trash steps constructs one
+/// `TrashReservations` and passes the same instance to every target's
+/// resolution call; a caller resolving destinations independently (e.g. a
+/// one-off, single-target trash) can pass a fresh
+/// [`TrashReservations::new`] each time.
+#[derive(Debug, Default)]
+pub struct TrashReservations(HashSet<PathBuf>);
+
+impl TrashReservations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A target's resolved trash destination — [`resolve_trash_destination`]'s
+/// whole answer. `duet_ops::deleter` turns this directly into a
+/// `Step::WriteTrashInfo { info_path, content: trashinfo }` followed by a
+/// `Step::Rename { dest: content_path, .. }`, in that order (see the module
+/// doc comment's "Why plan-time name resolution" section for why the name
+/// in both paths is guaranteed to match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTrash {
+    /// Where the trashed content itself goes — `$trash/files/<name>`.
+    pub content_path: PathBuf,
+    /// Where the `.trashinfo` sidecar goes — `$trash/info/<name>.trashinfo`,
+    /// the exact same `<name>` as `content_path`.
+    pub info_path: PathBuf,
+    /// The fully formatted `.trashinfo` file content (`[Trash Info]` header,
+    /// `Path=`, `DeletionDate=`), ready to write verbatim.
+    pub trashinfo: String,
+}
+
+/// Everything that can go wrong resolving a target's trash destination.
+#[derive(Debug)]
+pub enum TrashError {
+    /// A `stat`/`mkdir`/`chmod` syscall failed. `path` is whichever path
+    /// was being operated on when it happened.
+    Io { path: PathBuf, source: io::Error },
+    /// Neither method 1 (`$topdir/.Trash/$uid`, sticky bit set, not a
+    /// symlink) nor method 2 (`$topdir/.Trash-$uid`) could be used for
+    /// `topdir` — a read-only filesystem with no writable trash location
+    /// at all, e.g. This is a genuine, surfaced failure per this
+    /// codebase's "no silent failure" convention (never silently falls
+    /// back to copying into the home trash instead).
+    NoUsableTrash { topdir: PathBuf },
+}
+
+impl std::fmt::Display for TrashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrashError::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            TrashError::NoUsableTrash { topdir } => write!(
+                f,
+                "{}: no usable trash directory (neither .Trash/$uid with the sticky bit set \
+                 nor .Trash-$uid could be used)",
+                topdir.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrashError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TrashError::Io { source, .. } => Some(source),
+            TrashError::NoUsableTrash { .. } => None,
+        }
+    }
+}
+
+fn io_err(e: Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw_os_error())
+}
+
+fn io_err_at(path: &Path, e: Errno) -> TrashError {
+    TrashError::Io {
+        path: path.to_path_buf(),
+        source: io_err(e),
+    }
+}
+
+/// As [`io_err_at`], but for an already-converted `io::Error` (e.g. from
+/// [`dev_of`]/[`topdir_of`], which already return `io::Result` themselves).
+fn trash_io_err(path: &Path, e: io::Error) -> TrashError {
+    TrashError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    }
+}
+
+/// Resolves `target`'s trash destination — see the module doc comment for
+/// the full design. `target` must currently exist (its device is stat'd);
+/// `xdg_data_home` is `duet_config::paths::xdg_data_home()`'s result,
+/// passed in rather than resolved here since environment/`$HOME`
+/// resolution is a `duet-config` concern, not this backend-agnostic
+/// crate's (mirroring `duet_ops::deleter`'s own established boundary with
+/// `duet-config`).
+///
+/// Creates whatever trash-root directories the resolution needs
+/// (`$XDG_DATA_HOME/Trash/{files,info}` or `$topdir/.Trash/$uid/
+/// {files,info}` or `$topdir/.Trash-$uid/{files,info}`) as a side effect —
+/// this is a synchronous, blocking function (a handful of `stat`/`mkdir`/
+/// `chmod` syscalls), meant to be called off the UI thread, the same way
+/// every other blocking call this crate's callers make already is (see
+/// `duet_ops::deleter::plan_delete`'s own doc comment: planning already
+/// does inline blocking `FileSystem` calls in the same async context this
+/// is called from).
+///
+/// # Errors
+/// [`TrashError::Io`] for any failed syscall; [`TrashError::NoUsableTrash`]
+/// if `target` is on a different filesystem than `xdg_data_home` and
+/// neither per-mount trash method is usable there.
+pub fn resolve_trash_destination(
+    target: &Path,
+    xdg_data_home: &Path,
+    reservations: &mut TrashReservations,
+) -> Result<ResolvedTrash, TrashError> {
+    resolve_trash_destination_at(target, xdg_data_home, SystemTime::now(), reservations)
+}
+
+/// [`resolve_trash_destination`] with an explicit `DeletionDate` clock
+/// source, for deterministic tests.
+pub fn resolve_trash_destination_at(
+    target: &Path,
+    xdg_data_home: &Path,
+    now: SystemTime,
+    reservations: &mut TrashReservations,
+) -> Result<ResolvedTrash, TrashError> {
+    let location = resolve_trash_location(target, xdg_data_home)?;
+
+    let original_name =
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| TrashError::Io {
+                path: target.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"),
+            })?;
+    let unique_name = unique_trash_name(
+        &location.files_dir,
+        &location.info_dir,
+        original_name,
+        reservations,
+    )
+    .map_err(|e| TrashError::Io {
+        path: location.files_dir.clone(),
+        source: e,
+    })?;
+
+    let content_path = location.files_dir.join(&unique_name);
+    let info_path = location.info_dir.join(format!("{unique_name}.trashinfo"));
+    reservations.0.insert(content_path.clone());
+
+    let path_field = match &location.topdir {
+        // Home trash: absolute, percent-encoded original path.
+        None => percent_encode_path(&target.to_string_lossy()),
+        // Topdir trash: percent-encoded path *relative to topdir* -- an
+        // absolute Path here is the spec's single biggest correctness
+        // trap (see the module doc comment).
+        Some(topdir) => {
+            let relative = target.strip_prefix(topdir).unwrap_or(target);
+            percent_encode_path(&relative.to_string_lossy())
+        }
+    };
+    let civil = local_civil_time(unix_secs(now));
+    let trashinfo = format_trashinfo(&path_field, civil);
+
+    Ok(ResolvedTrash {
+        content_path,
+        info_path,
+        trashinfo,
+    })
+}
+
+/// The trash root a target should use, already created (`files`/`info`
+/// subdirectories included) by the time this returns.
+struct TrashLocation {
+    files_dir: PathBuf,
+    info_dir: PathBuf,
+    /// `None` for home trash (`Path=` is absolute); `Some(topdir)` for a
+    /// per-mount trash (`Path=` is relative to `topdir`).
+    topdir: Option<PathBuf>,
+}
+
+fn resolve_trash_location(
+    target: &Path,
+    xdg_data_home: &Path,
+) -> Result<TrashLocation, TrashError> {
+    let target_dev = dev_of(target).map_err(|e| trash_io_err(target, e))?;
+
+    std::fs::create_dir_all(xdg_data_home).map_err(|e| TrashError::Io {
+        path: xdg_data_home.to_path_buf(),
+        source: e,
+    })?;
+    let home_dev = dev_of(xdg_data_home).map_err(|e| trash_io_err(xdg_data_home, e))?;
+
+    if target_dev == home_dev {
+        let root = xdg_data_home.join("Trash");
+        create_trash_root(&root)?;
+        return Ok(TrashLocation {
+            files_dir: root.join("files"),
+            info_dir: root.join("info"),
+            topdir: None,
+        });
+    }
+
+    // A different filesystem: the trash itself must live there too, so a
+    // trash "move" is always a same-device rename, never a cross-device
+    // copy -- see the module doc comment's own note on why `duet_ops::
+    // deleter` never needs a `CopyFile` fallback for trash.
+    let topdir = topdir_of(target).map_err(|e| trash_io_err(target, e))?;
+    let uid = rustix::process::getuid().as_raw();
+
+    if let Some(root) = try_method_one(&topdir, uid) {
+        return Ok(TrashLocation {
+            files_dir: root.join("files"),
+            info_dir: root.join("info"),
+            topdir: Some(topdir),
+        });
+    }
+    if let Some(root) = try_method_two(&topdir, uid) {
+        return Ok(TrashLocation {
+            files_dir: root.join("files"),
+            info_dir: root.join("info"),
+            topdir: Some(topdir),
+        });
+    }
+    Err(TrashError::NoUsableTrash { topdir })
+}
+
+/// Walks up from `path`'s parent directory, comparing `st_dev` to `path`'s
+/// own device, until it changes (or `/` is reached) -- the last directory
+/// that still shares `path`'s device is its mount point ("topdir" in the
+/// spec's terminology). No `/proc/self/mountinfo` parsing needed: a file
+/// and its containing directory are always on the same device (a mount
+/// happens at a directory boundary), so this `st_dev`-comparison walk finds
+/// the boundary directly.
+fn topdir_of(path: &Path) -> io::Result<PathBuf> {
+    let target_dev = dev_of(path)?;
+    let mut topdir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => return Ok(PathBuf::from("/")),
+    };
+    loop {
+        if topdir == Path::new("/") {
+            return Ok(topdir);
+        }
+        let Some(parent) = topdir.parent() else {
+            return Ok(topdir);
+        };
+        let parent_dev = match dev_of(parent) {
+            Ok(d) => d,
+            // Can't stat further up (permission denied on some ancestor,
+            // e.g.) -- treat what we've found so far as the boundary
+            // rather than erroring the whole resolution over it.
+            Err(_) => return Ok(topdir),
+        };
+        if parent_dev != target_dev {
+            return Ok(topdir);
+        }
+        topdir = parent.to_path_buf();
+    }
+}
+
+fn dev_of(path: &Path) -> io::Result<u64> {
+    fs::statat(CWD, path, AtFlags::empty())
+        .map(|st| st.st_dev)
+        .map_err(io_err)
+}
+
+/// Bytes that make an existing directory entry unsafe to reuse as a
+/// per-user trash root, per the spec: it must be a real directory (not a
+/// symlink), owned by `uid`, and not group/other readable or writable.
+/// Shared by [`try_method_one`]/[`try_method_two`]'s "does an existing
+/// entry still qualify" check.
+fn existing_dir_is_safe_trash_root(path: &Path, uid: u32) -> bool {
+    match fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            FileType::from_raw_mode(st.st_mode) == FileType::Directory
+                && st.st_uid == uid
+                && st.st_mode & 0o077 == 0
+        }
+        // Doesn't exist (or can't be stat'd) -- not "unsafe", just "not
+        // there yet", which the caller creates fresh.
+        Err(_) => true,
+    }
+}
+
+const STICKY_BIT: u32 = 0o1000;
+
+/// Method 1: `$topdir/.Trash/$uid`, only if `$topdir/.Trash` exists, is a
+/// real directory (not a symlink -- a known spec attack/misconfiguration
+/// vector), and has the sticky bit set. `None` (fall through to method 2)
+/// for every way this can be unusable, per the spec and this task's own
+/// "fall through, don't error" directive -- only [`try_method_two`]
+/// failing is what produces a real, surfaced [`TrashError`].
+fn try_method_one(topdir: &Path, uid: u32) -> Option<PathBuf> {
+    let dot_trash = topdir.join(".Trash");
+    let lst = fs::statat(CWD, &dot_trash, AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    if FileType::from_raw_mode(lst.st_mode) != FileType::Directory {
+        return None; // missing, or not a directory at all
+    }
+    if lst.st_mode & STICKY_BIT == 0 {
+        return None; // sticky bit not set
+    }
+
+    let user_dir = dot_trash.join(uid.to_string());
+    if !existing_dir_is_safe_trash_root(&user_dir, uid) {
+        return None;
+    }
+    create_trash_root(&user_dir).ok()?;
+    Some(user_dir)
+}
+
+/// Method 2 (the fallback every real desktop actually uses in practice):
+/// `$topdir/.Trash-$uid`, created at mode `0700` if missing.
+fn try_method_two(topdir: &Path, uid: u32) -> Option<PathBuf> {
+    let user_dir = topdir.join(format!(".Trash-{uid}"));
+    if !existing_dir_is_safe_trash_root(&user_dir, uid) {
+        return None;
+    }
+    create_trash_root(&user_dir).ok()?;
+    Some(user_dir)
+}
+
+/// Creates `root`, `root/files`, and `root/info` (each idempotently, at
+/// exactly mode `0700` regardless of umask -- `mkdirat`'s own mode
+/// parameter is umask-modulated, so an explicit `chmodat` follows every
+/// creation to guarantee the spec's privacy requirement rather than
+/// hoping the caller's umask happens to cooperate).
+fn create_trash_root(root: &Path) -> Result<(), TrashError> {
+    ensure_dir_mode_0700(root)?;
+    ensure_dir_mode_0700(&root.join("files"))?;
+    ensure_dir_mode_0700(&root.join("info"))?;
+    Ok(())
+}
+
+fn ensure_dir_mode_0700(path: &Path) -> Result<(), TrashError> {
+    let mode = Mode::from_raw_mode(0o700);
+    match fs::mkdirat(CWD, path, mode) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(e) => return Err(io_err_at(path, e)),
+    }
+    fs::chmodat(CWD, path, mode, AtFlags::empty()).map_err(|e| io_err_at(path, e))
+}
+
+/// The bound on how many `name (N)` candidates [`unique_trash_name`] will
+/// try before giving up -- same generous, "something is genuinely wrong if
+/// we hit this" bound `duet_ops::executor::auto_rename_target` uses for
+/// the identical shape of search.
+const UNIQUE_NAME_MAX_ATTEMPTS: u32 = 1000;
+
+/// Finds the first name (`original_name` itself, or `stem (2).ext`, `stem
+/// (3).ext`, ...) with no existing entry in either `files_dir` or
+/// `info_dir` -- the plan-time equivalent of `executor::auto_rename_target`
+/// (see the module doc comment's "Why plan-time name resolution" section
+/// for why this runs here, at planning time, instead of live in the
+/// executor).
+fn unique_trash_name(
+    files_dir: &Path,
+    info_dir: &Path,
+    original_name: &str,
+    reservations: &TrashReservations,
+) -> io::Result<String> {
+    if !trash_name_taken(files_dir, info_dir, original_name, reservations) {
+        return Ok(original_name.to_string());
+    }
+    let (stem, ext) = split_stem_ext(original_name);
+    for n in 2..=UNIQUE_NAME_MAX_ATTEMPTS {
+        let candidate = match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        };
+        if !trash_name_taken(files_dir, info_dir, &candidate, reservations) {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not find a free trash name near {original_name:?} after \
+             {UNIQUE_NAME_MAX_ATTEMPTS} attempts"
+        ),
+    ))
+}
+
+fn trash_name_taken(
+    files_dir: &Path,
+    info_dir: &Path,
+    name: &str,
+    reservations: &TrashReservations,
+) -> bool {
+    let content = files_dir.join(name);
+    let info = info_dir.join(format!("{name}.trashinfo"));
+    reservations.0.contains(&content)
+        || fs::statat(CWD, &content, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+        || fs::statat(CWD, &info, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+}
+
+fn split_stem_ext(name: &str) -> (String, Option<String>) {
+    let p = Path::new(name);
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_string();
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
+    (stem, ext)
+}
+
+/// Standard URI percent-encoding (RFC 3986 unreserved bytes, plus `/` left
+/// literal as the path separator, left untouched; everything else --
+/// including a space, which becomes `%20`, never `+` -- escaped as
+/// `%XX`). Operates byte-wise on `s`'s UTF-8 representation, so a
+/// multi-byte UTF-8 sequence for a non-ASCII character is correctly
+/// escaped one byte at a time, exactly as RFC 3986 requires.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+fn format_trashinfo(path_field: &str, civil: (i32, u32, u32, u32, u32, u32)) -> String {
+    let (y, mo, d, hh, mm, ss) = civil;
+    format!(
+        "[Trash Info]\nPath={path_field}\nDeletionDate={y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}\n"
+    )
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    }
+}
+
+/// Mirrors glibc/musl's `struct tm` -- see the module doc comment's "Local
+/// time without a date/time crate dependency" section.
+#[repr(C)]
+struct CTm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const c_char,
+}
+
+unsafe extern "C" {
+    fn localtime_r(timep: *const i64, result: *mut CTm) -> *mut CTm;
+}
+
+/// `unix_secs` broken down into the local timezone's civil time (per
+/// `TZ`/`/etc/localtime`) as `(year, month, day, hour, minute, second)` --
+/// `month`/`day` are 1-based, matching `.trashinfo`'s own `Y-M-DTh:m:s`
+/// format directly.
+fn local_civil_time(unix_secs_value: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let mut tm: CTm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` (the reentrant variant -- unlike plain
+    // `localtime`, it never returns a pointer into thread-local/static
+    // storage this call doesn't own) writes into `tm`, a fully-owned,
+    // correctly-sized local, and both pointers are valid for the duration
+    // of this one call.
+    let ok = unsafe { !localtime_r(&unix_secs_value, &mut tm).is_null() };
+    if !ok {
+        // Should not happen on Linux -- `localtime_r` only fails if the
+        // year over/underflows `struct tm`'s `int` fields, far outside any
+        // real deletion date. Degrade to UTC rather than panicking.
+        return utc_civil_time(unix_secs_value);
+    }
+    (
+        tm.tm_year + 1900,
+        (tm.tm_mon + 1) as u32,
+        tm.tm_mday as u32,
+        tm.tm_hour as u32,
+        tm.tm_min as u32,
+        tm.tm_sec as u32,
+    )
+}
+
+/// UTC civil-time fallback for [`local_civil_time`]'s never-expected-in-
+/// practice error path -- Howard Hinnant's `civil_from_days` algorithm,
+/// the same one `duet-ui::file_table::civil_from_unix` uses (reimplemented
+/// independently here rather than shared: this crate doesn't depend on
+/// `duet-ui`, and it's a few lines of well-known public-domain algebra,
+/// matching this codebase's existing "small load-bearing primitives are
+/// duplicated per-crate rather than pulling in a cross-crate dependency
+/// for them" precedent -- see `duet_ops::executor::partial_file_name`'s
+/// own doc comment for another instance of the same convention).
+fn utc_civil_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let hour = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let second = (time_of_day % 60) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+
+    (y as i32, m, d, hour, minute, second)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    // -- percent-encoding ----------------------------------------------
+
+    #[test]
+    fn percent_encode_leaves_unreserved_bytes_and_slash_untouched() {
+        assert_eq!(
+            percent_encode_path("/home/u/docs/report-final_v2.txt"),
+            "/home/u/docs/report-final_v2.txt"
+        );
+    }
+
+    #[test]
+    fn percent_encode_escapes_spaces_as_percent_20_not_plus() {
+        let encoded = percent_encode_path("/home/u/my file (copy).txt");
+        assert!(encoded.contains("%20"), "{encoded}");
+        assert!(!encoded.contains('+'), "{encoded}");
+        assert!(encoded.contains("%28"), "{encoded}"); // '('
+        assert!(encoded.contains("%29"), "{encoded}"); // ')'
+    }
+
+    #[test]
+    fn percent_encode_round_trips_reserved_and_non_ascii_bytes() {
+        let original = "/home/u/déjà vu?.txt";
+        let encoded = percent_encode_path(original);
+        // Decode it back by hand (this module has no decoder of its own --
+        // GNOME/KDE's own trash readers are the real consumer -- so this
+        // test proves the encoding is reversible via the standard
+        // percent-decoding algorithm, not via a decoder this module
+        // happens to also implement).
+        let mut decoded = Vec::new();
+        let bytes = encoded.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                decoded.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+        assert_eq!(String::from_utf8(decoded).unwrap(), original);
+    }
+
+    // -- format_trashinfo -------------------------------------------------
+
+    #[test]
+    fn format_trashinfo_matches_the_exact_spec_shape() {
+        let content = format_trashinfo("/home/u/deleted.txt", (2026, 8, 30, 14, 22, 7));
+        assert_eq!(
+            content,
+            "[Trash Info]\nPath=/home/u/deleted.txt\nDeletionDate=2026-08-30T14:22:07\n"
+        );
+    }
+
+    #[test]
+    fn format_trashinfo_pads_single_digit_components() {
+        let content = format_trashinfo("rel/path.txt", (2026, 1, 2, 3, 4, 5));
+        assert!(
+            content.contains("DeletionDate=2026-01-02T03:04:05"),
+            "{content}"
+        );
+    }
+
+    // -- utc_civil_time / local_civil_time ---------------------------------
+
+    #[test]
+    fn utc_civil_time_matches_a_known_instant() {
+        // 2026-08-30T00:00:00Z, computed independently via `date -u -d
+        // 2026-08-30T00:00:00Z +%s` at the time this test was written.
+        let (y, mo, d, hh, mm, ss) = utc_civil_time(1_788_048_000);
+        assert_eq!((y, mo, d, hh, mm, ss), (2026, 8, 30, 0, 0, 0));
+    }
+
+    #[test]
+    fn utc_civil_time_round_trips_epoch() {
+        assert_eq!(utc_civil_time(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    /// Cross-checks [`local_civil_time`] against the real `date` binary,
+    /// independently of this module's own algorithm -- not verified if
+    /// `date` isn't available, per this codebase's "don't claim untested
+    /// results" convention (`duet-vfs::local::probe`'s own tests already
+    /// establish this precedent for environment-dependent checks).
+    #[test]
+    fn local_civil_time_matches_the_real_date_command() {
+        let secs = 1_788_048_000i64; // 2026-08-30T00:00:00Z
+        let output = std::process::Command::new("date")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg("+%Y-%m-%d %H:%M:%S")
+            .output();
+        let Ok(output) = output else {
+            eprintln!(
+                "local_civil_time_matches_the_real_date_command: `date` not available -- \
+                 not verified here"
+            );
+            return;
+        };
+        if !output.status.success() {
+            eprintln!(
+                "local_civil_time_matches_the_real_date_command: `date` exited non-zero -- \
+                 not verified here"
+            );
+            return;
+        }
+        let expected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let (y, mo, d, hh, mm, ss) = local_civil_time(secs);
+        let ours = format!("{y:04}-{mo:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
+        assert_eq!(ours, expected);
+    }
+
+    // -- topdir_of ----------------------------------------------------------
+
+    #[test]
+    fn topdir_of_a_path_entirely_within_one_tmpfs_tempdir_is_the_tempdir_itself() {
+        // Every path here shares one `st_dev` (the whole TempDir is one
+        // tmpfs mount in this test environment) up to `/tmp` itself, which
+        // is where the walk would naturally stop climbing -- so rather
+        // than assert a specific directory (fragile, environment-
+        // dependent), assert the *property* topdir_of exists to prove:
+        // walking from a nested path never crosses back below where it
+        // started, and never panics on a real path.
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let topdir = topdir_of(&file).unwrap();
+        assert!(
+            file.starts_with(&topdir),
+            "topdir {topdir:?} must be an ancestor of {file:?}"
+        );
+        // The nested tempdir itself is not a distinct mount, so climbing
+        // must go at least as far up as its own parent.
+        assert!(
+            topdir == Path::new("/") || dir.path().starts_with(&topdir) || topdir == dir.path(),
+            "topdir {topdir:?} unexpectedly sits *below* the tempdir {:?}",
+            dir.path()
+        );
+    }
+
+    /// The core `st_dev`-comparison logic in isolation, injected via a
+    /// synthetic device map rather than a real second mounted filesystem
+    /// (bind-mounts/loop devices need root or a container this test
+    /// environment cannot assume -- see this function's own doc comment
+    /// for why a real cross-filesystem integration test isn't included:
+    /// `duet-vfs`'s own cross-device tests, e.g.
+    /// `probe::tests::probes_real_btrfs_if_available`, hit the identical
+    /// constraint and handle it the same way, by dynamically discovering
+    /// a real second mount and skipping -- not failing -- when none is
+    /// available. That approach doesn't fit *this* specific check, though:
+    /// it needs a directory *boundary* at a controlled location, not just
+    /// "any filesystem of a given kind somewhere on the machine," which a
+    /// dynamically-discovered mount can't guarantee).
+    #[test]
+    fn topdir_walk_logic_stops_exactly_where_st_dev_changes() {
+        // A hand-written stand-in for the real walk, using an injectable
+        // "device of this path" function instead of a real `stat` --
+        // proves the walk-and-compare algorithm itself (stop climbing the
+        // instant the parent's device differs) independently of whether a
+        // real second filesystem is mounted anywhere on this machine.
+        fn topdir_of_with(path: &Path, dev_of: impl Fn(&Path) -> u64) -> PathBuf {
+            let target_dev = dev_of(path);
+            let mut topdir = path.parent().unwrap().to_path_buf();
+            loop {
+                if topdir == Path::new("/") {
+                    return topdir;
+                }
+                let Some(parent) = topdir.parent() else {
+                    return topdir;
+                };
+                if dev_of(parent) != target_dev {
+                    return topdir;
+                }
+                topdir = parent.to_path_buf();
+            }
+        }
+
+        // Simulated layout: "/mnt/other" is a distinct mount (dev 2) from
+        // its own parent "/mnt" (dev 1, same as everything above it).
+        let dev_of = |p: &Path| -> u64 {
+            if p == Path::new("/mnt/other") || p.starts_with("/mnt/other/") {
+                2
+            } else {
+                1
+            }
+        };
+
+        let topdir = topdir_of_with(Path::new("/mnt/other/a/b/file.txt"), dev_of);
+        assert_eq!(topdir, PathBuf::from("/mnt/other"));
+
+        let topdir_root = topdir_of_with(Path::new("/mnt/elsewhere/file.txt"), dev_of);
+        assert_eq!(
+            topdir_root,
+            PathBuf::from("/"),
+            "everything outside /mnt/other shares dev 1 all the way to /"
+        );
+    }
+
+    // -- method 1 vs method 2 fallback --------------------------------------
+
+    #[test]
+    fn method_one_is_used_when_dot_trash_has_the_sticky_bit_set() {
+        let topdir = TempDir::new().unwrap();
+        let dot_trash = topdir.path().join(".Trash");
+        std::fs::create_dir(&dot_trash).unwrap();
+        std::fs::set_permissions(&dot_trash, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let uid = rustix::process::getuid().as_raw();
+        let root = try_method_one(topdir.path(), uid).expect("method 1 should be usable");
+        assert_eq!(root, dot_trash.join(uid.to_string()));
+        assert!(root.join("files").is_dir());
+        assert!(root.join("info").is_dir());
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn method_one_falls_through_when_dot_trash_is_missing() {
+        let topdir = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        assert!(try_method_one(topdir.path(), uid).is_none());
+    }
+
+    #[test]
+    fn method_one_falls_through_when_dot_trash_lacks_the_sticky_bit() {
+        let topdir = TempDir::new().unwrap();
+        let dot_trash = topdir.path().join(".Trash");
+        std::fs::create_dir(&dot_trash).unwrap();
+        std::fs::set_permissions(&dot_trash, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let uid = rustix::process::getuid().as_raw();
+        assert!(try_method_one(topdir.path(), uid).is_none());
+    }
+
+    #[test]
+    fn method_one_falls_through_when_dot_trash_is_a_symlink() {
+        let topdir = TempDir::new().unwrap();
+        let real_dir = topdir.path().join("real-trash");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let dot_trash = topdir.path().join(".Trash");
+        std::os::unix::fs::symlink(&real_dir, &dot_trash).unwrap();
+
+        let uid = rustix::process::getuid().as_raw();
+        assert!(
+            try_method_one(topdir.path(), uid).is_none(),
+            "a symlinked .Trash is a known spec attack vector and must never be trusted"
+        );
+    }
+
+    #[test]
+    fn method_two_creates_dot_trash_dash_uid_at_mode_0700() {
+        let topdir = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let root = try_method_two(topdir.path(), uid).expect("method 2 must always be usable");
+        assert_eq!(root, topdir.path().join(format!(".Trash-{uid}")));
+        assert!(root.join("files").is_dir());
+        assert!(root.join("info").is_dir());
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn neither_method_usable_on_a_read_only_topdir_is_a_clear_per_target_failure() {
+        let topdir = TempDir::new().unwrap();
+        std::fs::set_permissions(topdir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let uid = rustix::process::getuid().as_raw();
+        let m1 = try_method_one(topdir.path(), uid);
+        let m2 = try_method_two(topdir.path(), uid);
+
+        // Restore write permission so TempDir's own Drop can clean up.
+        std::fs::set_permissions(topdir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Root (uid 0) can write anywhere regardless of mode bits, so this
+        // assertion only holds for a non-root test run -- consistent with
+        // this codebase's other permission-based tests (e.g.
+        // `deleter::tests::a_permission_denied_removal_surfaces_as_a_real_failure`)
+        // which carry the same implicit assumption.
+        if uid != 0 {
+            assert!(m1.is_none());
+            assert!(m2.is_none());
+        }
+    }
+
+    // -- unique_trash_name ---------------------------------------------------
+
+    #[test]
+    fn unique_trash_name_uses_the_original_name_when_free() {
+        let dir = TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        assert_eq!(
+            unique_trash_name(&files, &info, "a.txt", &TrashReservations::new()).unwrap(),
+            "a.txt"
+        );
+    }
+
+    #[test]
+    fn unique_trash_name_disambiguates_on_a_content_collision() {
+        let dir = TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(files.join("a.txt"), b"first").unwrap();
+        assert_eq!(
+            unique_trash_name(&files, &info, "a.txt", &TrashReservations::new()).unwrap(),
+            "a (2).txt"
+        );
+    }
+
+    #[test]
+    fn unique_trash_name_also_checks_the_info_sidecar_not_just_content() {
+        // A `.trashinfo` can exist with its content already gone (e.g. a
+        // crash between the two steps -- see the module doc comment) --
+        // the name is still "taken" and must not be reused.
+        let dir = TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("a.txt.trashinfo"), b"[Trash Info]\n").unwrap();
+        assert_eq!(
+            unique_trash_name(&files, &info, "a.txt", &TrashReservations::new()).unwrap(),
+            "a (2).txt"
+        );
+    }
+
+    #[test]
+    fn unique_trash_name_keeps_incrementing_past_multiple_collisions() {
+        let dir = TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(files.join("a.txt"), b"1").unwrap();
+        std::fs::write(files.join("a (2).txt"), b"2").unwrap();
+        std::fs::write(files.join("a (3).txt"), b"3").unwrap();
+        assert_eq!(
+            unique_trash_name(&files, &info, "a.txt", &TrashReservations::new()).unwrap(),
+            "a (4).txt"
+        );
+    }
+
+    #[test]
+    fn unique_trash_name_handles_a_name_with_no_extension() {
+        let dir = TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        let info = dir.path().join("info");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(files.join("Makefile"), b"x").unwrap();
+        assert_eq!(
+            unique_trash_name(&files, &info, "Makefile", &TrashReservations::new()).unwrap(),
+            "Makefile (2)"
+        );
+    }
+
+    // -- resolve_trash_destination_at (end to end within this module) -----
+
+    #[test]
+    fn home_trash_uses_an_absolute_percent_encoded_path() {
+        let data_home = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap(); // same tmpfs as data_home in this test env
+        let target = src_dir.path().join("my file.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let resolved = resolve_trash_destination_at(
+            &target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut TrashReservations::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.content_path,
+            data_home.path().join("Trash/files/my file.txt")
+        );
+        assert_eq!(
+            resolved.info_path,
+            data_home.path().join("Trash/info/my file.txt.trashinfo")
+        );
+        assert!(
+            resolved
+                .trashinfo
+                .contains(&percent_encode_path(&target.to_string_lossy())),
+            "{}",
+            resolved.trashinfo
+        );
+        assert!(resolved.trashinfo.starts_with("[Trash Info]\n"));
+        assert!(resolved.trashinfo.contains("DeletionDate=1970-01-01T"));
+    }
+
+    #[test]
+    fn a_second_same_named_target_gets_a_disambiguated_trashinfo_and_content_name() {
+        let data_home = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let target = src_dir.path().join("dup.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let first = resolve_trash_destination_at(
+            &target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut TrashReservations::new(),
+        )
+        .unwrap();
+        // Simulate the first target's content having actually landed (the
+        // real caller's Rename step would have done this) so the second
+        // resolution sees a genuine collision.
+        std::fs::write(&first.content_path, b"x").unwrap();
+
+        let second = resolve_trash_destination_at(
+            &target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut TrashReservations::new(),
+        )
+        .unwrap();
+        assert_ne!(first.content_path, second.content_path);
+        assert!(second.content_path.ends_with("dup (2).txt"));
+        assert!(second.info_path.ends_with("dup (2).txt.trashinfo"));
+    }
+
+    /// The bug [`TrashReservations`] exists to prevent: two same-named
+    /// targets resolved *in the same planning pass* (sharing one
+    /// `TrashReservations`, the way `duet_ops::deleter::plan_trash_delete`
+    /// uses it) must not both resolve to the identical destination just
+    /// because neither target's content has actually moved to disk yet --
+    /// planning and execution are separate phases, so a disk-only probe
+    /// (what [`a_second_same_named_target_gets_a_disambiguated_trashinfo_and_content_name`]
+    /// exercises, with a fresh `TrashReservations` per call and a real
+    /// write in between) can't see a sibling target's not-yet-executed
+    /// claim on its own.
+    #[test]
+    fn two_targets_resolved_in_one_planning_pass_share_reservations_and_do_not_collide() {
+        let data_home = TempDir::new().unwrap();
+        let src_dir_a = TempDir::new().unwrap();
+        let src_dir_b = TempDir::new().unwrap();
+        let target_a = src_dir_a.path().join("dup.txt");
+        let target_b = src_dir_b.path().join("dup.txt");
+        std::fs::write(&target_a, b"a").unwrap();
+        std::fs::write(&target_b, b"b").unwrap();
+
+        let mut reservations = TrashReservations::new();
+        let first = resolve_trash_destination_at(
+            &target_a,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut reservations,
+        )
+        .unwrap();
+        // Deliberately *not* performing the real Rename here -- disk state
+        // stays exactly as it was before this call, proving the second
+        // resolution's disambiguation comes from `reservations`, not from
+        // anything newly on disk.
+        let second = resolve_trash_destination_at(
+            &target_b,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut reservations,
+        )
+        .unwrap();
+
+        assert_ne!(first.content_path, second.content_path);
+        assert!(first.content_path.ends_with("dup.txt"));
+        assert!(second.content_path.ends_with("dup (2).txt"));
+    }
+}

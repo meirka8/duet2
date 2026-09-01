@@ -74,6 +74,22 @@ pub enum Step {
         source: VPath,
         dest: VPath,
         conflict: Option<ConflictPolicy>,
+        /// `step_index` this rename is contingent on, if any -- the same
+        /// dependency-gating mechanism `Link`/`SetMeta`/`Remove`/`Verify`'s
+        /// own fields document. `None` for every ordinary same-device
+        /// move/rename (the overwhelming majority of `Rename` steps, whose
+        /// ordering is purely positional and needs no gate at all).
+        ///
+        /// T-5.3.1 (freedesktop trash) is what actually needs this: a
+        /// trash content move is preceded by a barrier
+        /// [`Step::WriteTrashInfo`] (its `.trashinfo` sidecar must be
+        /// durable *before* the content moves — see that variant's own
+        /// doc comment), and this field is what stops the move from ever
+        /// running if the sidecar write failed or was never reached —
+        /// exactly the same "never unlink/move past a failed prerequisite"
+        /// guarantee `Step::Remove`'s own `depends_on` gives a cross-device
+        /// move's terminal removal.
+        depends_on: Option<u32>,
     },
     /// Hardlink `dest` to `source` — either an explicit "create hardlink"
     /// user operation, or the second-and-later occurrence of an
@@ -185,6 +201,28 @@ pub enum Step {
         algorithm: VerifyAlgorithm,
         depends_on: Option<u32>,
     },
+    /// Writes a freedesktop-trash-spec `.trashinfo` sidecar file to
+    /// `info_path` (T-5.3.1, design.md §9.10/FR-CFG-07) — `content` is the
+    /// already-formatted `[Trash Info]` block
+    /// (`duet_platform::trash::resolve_trash_destination`'s output),
+    /// written verbatim at mode `0600`.
+    ///
+    /// Carries no `depends_on` of its own — it runs first, unconditionally,
+    /// as the barrier the paired trash-content [`Step::Rename`] depends on
+    /// (see that field's own doc comment). Written *before* the content
+    /// move rather than after: design.md's own journal philosophy is
+    /// "declare intent before the side effect" (an `Intent` journal record
+    /// before every step's effect, a `Completion` after), and this
+    /// ordering extends the same principle one step further — if a crash
+    /// lands between the two, an orphaned `.trashinfo` pointing at content
+    /// still sitting at its original path is recoverable and inspectable
+    /// (T-5.2.5's resume can still complete the interrupted move), whereas
+    /// trashed content with no metadata at all would be functionally
+    /// unrestorable (the original path is lost). A single small metadata-
+    /// only write, closer in shape to [`Step::SetMeta`] than to
+    /// [`Step::CopyFile`] — no partial-file staging needed for a write
+    /// this small and atomic.
+    WriteTrashInfo { info_path: VPath, content: String },
 }
 
 impl Step {
@@ -203,6 +241,7 @@ impl Step {
             Step::SetMeta { .. } => StepKind::SetMeta,
             Step::Remove { .. } => StepKind::Remove,
             Step::Verify { .. } => StepKind::Verify,
+            Step::WriteTrashInfo { .. } => StepKind::WriteTrashInfo,
         }
     }
 
@@ -213,14 +252,16 @@ impl Step {
     /// *remap* when it rebuilds a subset of a plan's steps into a smaller
     /// re-run plan.
     ///
-    /// Only `Link`, `Symlink`, `SetMeta`, `Remove`, and `Verify` carry a
-    /// `depends_on` field; `CreateDir`, `CopyFile`, `Reflink`, and
-    /// `Rename` do not, and their `None` here is a genuine "there is no
-    /// dependency to express," not a missing one — their ordering is
-    /// *positional* instead. See [`crate::plan_mkdir`]'s own doc comment:
-    /// "`Step::CreateDir` has no `depends_on` field, and doesn't need
-    /// one... Position in `Plan::steps` therefore already guarantees
-    /// ordering."
+    /// `Link`, `Symlink`, `SetMeta`, `Remove`, `Verify`, and (since T-5.3.1)
+    /// `Rename` carry a `depends_on` field; `CreateDir`, `CopyFile`,
+    /// `Reflink`, and `WriteTrashInfo` do not, and their `None` here is a
+    /// genuine "there is no dependency to express," not a missing one —
+    /// their ordering is *positional* instead (`WriteTrashInfo` in
+    /// particular is *itself* always the barrier something else depends
+    /// on, never the dependent — see its own doc comment). See
+    /// [`crate::plan_mkdir`]'s own doc comment: "`Step::CreateDir` has no
+    /// `depends_on` field, and doesn't need one... Position in
+    /// `Plan::steps` therefore already guarantees ordering."
     ///
     /// Every variant is matched explicitly (no wildcard arm), same
     /// reasoning as [`Step::kind`]'s: a future `Step` variant that carries
@@ -232,11 +273,10 @@ impl Step {
             | Step::Symlink { depends_on, .. }
             | Step::SetMeta { depends_on, .. }
             | Step::Remove { depends_on, .. }
-            | Step::Verify { depends_on, .. } => *depends_on,
-            Step::CreateDir { .. }
-            | Step::CopyFile { .. }
-            | Step::Reflink { .. }
-            | Step::Rename { .. } => None,
+            | Step::Verify { depends_on, .. }
+            | Step::Rename { depends_on, .. } => *depends_on,
+            Step::CreateDir { .. } | Step::CopyFile { .. } | Step::Reflink { .. } => None,
+            Step::WriteTrashInfo { .. } => None,
         }
     }
 
@@ -265,6 +305,7 @@ pub enum StepKind {
     SetMeta,
     Remove,
     Verify,
+    WriteTrashInfo,
 }
 
 /// Which removal semantics a [`Step::Remove`] uses.
