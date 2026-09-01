@@ -574,6 +574,11 @@ pub(crate) fn describe_kind(kind: JobKind) -> &'static str {
         JobKind::CreateSymlink => "Create symlink",
         JobKind::CreateHardlink => "Create hardlink",
         JobKind::ChangeAttributes => "Change attributes",
+        // T-5.3.2 phase 1: plain descriptive strings only -- the actual
+        // trash browser dialog (phase 2) owns any richer UI-facing
+        // presentation of these job kinds.
+        JobKind::RestoreFromTrash => "Restore from trash",
+        JobKind::PurgeTrash => "Delete from trash",
     }
 }
 

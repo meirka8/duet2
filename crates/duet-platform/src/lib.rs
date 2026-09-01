@@ -9,6 +9,8 @@
 //! T-5.3.1 is the first tenant: [`trash`], the full freedesktop trash-spec
 //! implementation (design.md §9.10, FR-CFG-07) `duet_ops::deleter` calls
 //! into to decide where a trashed file's content and `.trashinfo` sidecar
-//! actually go.
+//! actually go. T-5.3.2 phase 1 adds the read side to the same module:
+//! `trash::list_trash_entries` enumerates what's already there, for
+//! `duet_ops::trash_restore`'s restore/purge planners.
 
 pub mod trash;

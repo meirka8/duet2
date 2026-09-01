@@ -38,6 +38,42 @@
 //! has and already mitigates the same way: fail loudly rather than
 //! silently pick a second name `.trashinfo` was never written for).
 //!
+//! # T-5.3.2 phase 1: the read side
+//!
+//! [`list_trash_entries`] is the inverse of everything above: given
+//! `$XDG_DATA_HOME`, enumerate every `.trashinfo` sidecar this module (or
+//! any other freedesktop-spec-compliant tool) has ever written, parsing
+//! each one's `Path=`/`DeletionDate=` fields back into a real
+//! [`TrashEntry`] — percent-decoding, and undoing [`local_civil_time`] via
+//! the standard `mktime(3)` inverse. `duet_ops::trash_restore` (T-5.3.2's
+//! own planner module) is the one caller, turning each entry into a
+//! restore or permanent-purge `Plan`.
+//!
+//! **Scope: home trash only, no opportunistic per-mount discovery.** A
+//! per-mount `$topdir/.Trash{,-$uid}` genuinely exists and
+//! [`list_trash_root`] (this function's own internal, per-root worker) can
+//! read one correctly — proven directly by this module's own tests, which
+//! exercise a topdir-relative `Path=` resolving back to the right absolute
+//! `original_path` — but [`list_trash_entries`] itself only ever calls it
+//! against `$XDG_DATA_HOME/Trash`. Discovering *which* other mounts might
+//! have a per-mount trash worth scanning needs walking
+//! `/proc/self/mountinfo` once and probing each mount point for an
+//! existing `.Trash{,-$uid}` — real, disclosed extra scope this phase
+//! deliberately doesn't take on, to keep phase 1 to "the API phase 2's
+//! dialog needs," not "the most complete trash browser imaginable." A
+//! later task can add that scan as a pure addition to
+//! [`list_trash_entries`]'s own body without touching anything else here.
+//!
+//! **A malformed `.trashinfo` is skipped, not propagated as an error for
+//! the whole listing.** A hand-edited, truncated, or third-party-tool-
+//! written sidecar that doesn't parse per this module's own writer's shape
+//! must not hide every *other*, legitimate entry in the same directory —
+//! [`list_trash_root`] treats a per-entry parse failure as "not a trash
+//! entry, move on," the same "tolerate garbage, don't propagate it"
+//! philosophy `try_method_one`/`try_method_two`'s own "fall through, don't
+//! error" convention already established for this module, just applied to
+//! parsing instead of directory-safety checks.
+//!
 //! # Local time without a date/time crate dependency
 //!
 //! `.trashinfo`'s `DeletionDate` must be local time, no timezone suffix.
@@ -60,7 +96,7 @@ use std::collections::HashSet;
 use std::ffi::c_char;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use rustix::fs::{self, AtFlags, CWD, FileType, Mode};
 use rustix::io::Errno;
@@ -546,6 +582,16 @@ struct CTm {
 
 unsafe extern "C" {
     fn localtime_r(timep: *const i64, result: *mut CTm) -> *mut CTm;
+    /// [`local_civil_time_to_unix`]'s own backend -- the standard, POSIX-
+    /// specified inverse of `localtime_r`: takes a `struct tm` (local civil
+    /// time, per `TZ`/`/etc/localtime` — the same zone database
+    /// `localtime_r` itself already reads), fills in `tm_wday`/`tm_yday`,
+    /// normalises out-of-range fields, and returns the corresponding
+    /// `time_t`. `tm_isdst = -1` (set by every caller here) tells `mktime`
+    /// to determine DST itself rather than trust a caller-supplied guess —
+    /// exactly right for a `.trashinfo` `DeletionDate=`, which carries no
+    /// DST flag of its own to round-trip.
+    fn mktime(tm: *mut CTm) -> i64;
 }
 
 /// `unix_secs` broken down into the local timezone's civil time (per
@@ -604,6 +650,257 @@ fn utc_civil_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as i32, m, d, hour, minute, second)
+}
+
+/// The exact inverse of [`local_civil_time`], via `mktime(3)` -- see the
+/// `unsafe extern "C"` block's own doc comment on `tm_isdst = -1`. Returns
+/// `None` only in the practically-unreachable case `mktime` itself signals
+/// failure (`(time_t) -1`; per POSIX this also happens to be a legitimate
+/// return value for one second in 1969, a date no real `.trashinfo` will
+/// ever carry, so this function does not try to disambiguate that case
+/// specially).
+fn local_civil_time_to_unix(y: i32, mo: u32, d: u32, hh: u32, mm: u32, ss: u32) -> Option<i64> {
+    let mut tm: CTm = unsafe { std::mem::zeroed() };
+    tm.tm_sec = ss as i32;
+    tm.tm_min = mm as i32;
+    tm.tm_hour = hh as i32;
+    tm.tm_mday = d as i32;
+    tm.tm_mon = mo as i32 - 1;
+    tm.tm_year = y - 1900;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is a fully-owned, correctly-sized local; `mktime` only
+    // reads/writes through the one valid pointer we hand it, for the
+    // duration of this one call.
+    let secs = unsafe { mktime(&mut tm) };
+    if secs == -1 { None } else { Some(secs) }
+}
+
+fn system_time_from_unix(secs: i64) -> SystemTime {
+    if secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_secs((-secs) as u64)
+    }
+}
+
+/// One entry [`list_trash_entries`] found -- a `.trashinfo` sidecar plus
+/// its paired content, with `Path=`/`DeletionDate=` already parsed back
+/// into structured data. `duet_ops::trash_restore` is the intended
+/// consumer: `content_path`/`info_path` are exactly what a restore or
+/// permanent-purge `Step::Rename`/`Step::Remove` needs, and `original_path`
+/// is where a restore puts the content back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashEntry {
+    /// `$trash/files/<name>` -- where the trashed content itself currently
+    /// lives.
+    pub content_path: PathBuf,
+    /// `$trash/info/<name>.trashinfo` -- the sidecar this entry was parsed
+    /// from.
+    pub info_path: PathBuf,
+    /// The path this entry should be restored to -- `.trashinfo`'s own
+    /// `Path=` field, percent-decoded and, for a per-mount trash entry,
+    /// resolved against that root's own topdir (see the module doc
+    /// comment's "T-5.3.2 phase 1" section).
+    pub original_path: PathBuf,
+    /// `.trashinfo`'s own `DeletionDate=` field, parsed back from local
+    /// civil time via [`local_civil_time_to_unix`] -- the exact inverse of
+    /// what [`resolve_trash_destination_at`] wrote via [`local_civil_time`].
+    pub deleted_at: SystemTime,
+}
+
+/// Enumerates every trash entry `duet` (or any other freedesktop-spec tool)
+/// has left under `xdg_data_home`'s own home trash
+/// (`$xdg_data_home/Trash`). See the module doc comment's "T-5.3.2 phase 1"
+/// section for why this is scoped to home trash only, and for the
+/// "tolerate garbage, don't propagate it" per-entry parse-failure
+/// convention.
+///
+/// An `xdg_data_home` with no `Trash` directory at all (nothing has ever
+/// been trashed there) is not an error -- it produces an empty `Vec`,
+/// mirroring [`resolve_trash_destination`]'s own "create on demand" stance
+/// on the same directory from the write side.
+///
+/// # Errors
+/// [`TrashError::Io`] if `$xdg_data_home/Trash/info` exists but can't be
+/// read at all (a genuine, surfaced failure -- a real permission problem on
+/// a directory this module's own writer always creates at mode `0700`
+/// owned by the current user, so a read failure here means something
+/// outside `duet`'s own control changed it).
+pub fn list_trash_entries(xdg_data_home: &Path) -> Result<Vec<TrashEntry>, TrashError> {
+    list_trash_root(&xdg_data_home.join("Trash"), None)
+}
+
+/// [`list_trash_entries`]'s per-root worker: reads every `*.trashinfo` file
+/// directly under `root/info`, parses it, and pairs it with its content
+/// under `root/files`. `topdir` is `None` for home trash (`Path=` is
+/// already absolute) or `Some(topdir)` for a per-mount trash root
+/// (`Path=` is relative to `topdir` -- see [`resolve_trash_destination_at`]'s
+/// own `path_field` construction, which this is the exact inverse of).
+///
+/// Not exposed publicly: [`list_trash_entries`] itself only ever calls this
+/// with `topdir: None` today (see the module doc comment's scope note), but
+/// the `Some` path is real, load-bearing code -- exercised directly by this
+/// module's own tests -- not dead weight kept "for later."
+fn list_trash_root(root: &Path, topdir: Option<&Path>) -> Result<Vec<TrashEntry>, TrashError> {
+    let info_dir = root.join("info");
+    let files_dir = root.join("files");
+    let read_dir = match std::fs::read_dir(&info_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(TrashError::Io {
+                path: info_dir,
+                source: e,
+            });
+        }
+    };
+
+    let mut entries = Vec::new();
+    for dir_entry in read_dir {
+        // A single unreadable directory entry (rare -- a concurrent
+        // deletion mid-scan, e.g.) is skipped, not fatal to the whole
+        // listing -- same "tolerate garbage" stance as a malformed
+        // `.trashinfo` file below.
+        let Ok(dir_entry) = dir_entry else { continue };
+        let info_path = dir_entry.path();
+        if info_path.extension().and_then(|e| e.to_str()) != Some("trashinfo") {
+            continue;
+        }
+        let Some(name) = info_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(parsed) = parse_trash_info_file(&info_path) else {
+            continue;
+        };
+        let original_path = match topdir {
+            None => PathBuf::from(&parsed.decoded_path),
+            Some(topdir) => topdir.join(&parsed.decoded_path),
+        };
+        entries.push(TrashEntry {
+            content_path: files_dir.join(name),
+            info_path,
+            original_path,
+            deleted_at: parsed.deleted_at,
+        });
+    }
+    Ok(entries)
+}
+
+/// A `.trashinfo` file's two fields, already decoded/parsed -- see
+/// [`parse_trash_info_file`].
+struct ParsedTrashInfo {
+    decoded_path: String,
+    deleted_at: SystemTime,
+}
+
+/// Reads and parses one `.trashinfo` file, returning `None` for absolutely
+/// any way it can fail to be a well-formed, understandable entry (missing
+/// file, not UTF-8, no `[Trash Info]` header, missing/unparseable `Path=`
+/// or `DeletionDate=`, an out-of-range date `mktime` itself rejects) --
+/// [`list_trash_root`]'s caller treats every one of these identically:
+/// skip this entry, keep scanning. Deliberately not a `Result`: there is
+/// exactly one caller, and it never needs to distinguish *why* a
+/// `.trashinfo` didn't parse, only *whether* it did.
+fn parse_trash_info_file(info_path: &Path) -> Option<ParsedTrashInfo> {
+    let content = std::fs::read_to_string(info_path).ok()?;
+    let (path_field, date_field) = parse_trashinfo_fields(&content)?;
+    let decoded_path = percent_decode_path(&path_field)?;
+    let (y, mo, d, hh, mm, ss) = parse_deletion_date(&date_field)?;
+    let secs = local_civil_time_to_unix(y, mo, d, hh, mm, ss)?;
+    Some(ParsedTrashInfo {
+        decoded_path,
+        deleted_at: system_time_from_unix(secs),
+    })
+}
+
+/// A small, honest `[Trash Info]`/`Path=`/`DeletionDate=` line parser --
+/// not a general INI parser (this format has exactly one section and two
+/// keys; a real config-parsing dependency would be solving a much bigger
+/// problem than this module has), and not tolerant of anything the spec
+/// doesn't actually require: a `.trashinfo` written by this module's own
+/// [`format_trashinfo`] always starts with the `[Trash Info]` header line,
+/// so a file missing it is either not a trash sidecar at all or corrupted
+/// enough not to trust -- [`parse_trash_info_file`] treats both the same
+/// way (skip).
+///
+/// Lines are matched by exact key prefix (`Path=`/`DeletionDate=`); a
+/// `Path=` value containing `=` (legal -- `=` isn't percent-encoded by
+/// [`percent_encode_path`] since it's an RFC 3986 unreserved... actually it
+/// is escaped, being outside the allowed set -- so this never actually
+/// arises for a sidecar this module wrote, but the prefix-match approach
+/// handles it correctly regardless, taking everything after the first `=`
+/// as the value) is read whole, not truncated at a later `=`.
+fn parse_trashinfo_fields(content: &str) -> Option<(String, String)> {
+    let mut saw_header = false;
+    let mut path_field = None;
+    let mut date_field = None;
+    for line in content.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line == "[Trash Info]" {
+            saw_header = true;
+        } else if let Some(rest) = line.strip_prefix("Path=") {
+            path_field = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("DeletionDate=") {
+            date_field = Some(rest.to_string());
+        }
+    }
+    if !saw_header {
+        return None;
+    }
+    Some((path_field?, date_field?))
+}
+
+/// The exact inverse of [`percent_encode_path`]: standard `%XX` percent-
+/// decoding, byte-wise, with the decoded bytes re-assembled as UTF-8 at the
+/// end (matching the encoder's own byte-wise treatment of a UTF-8 source
+/// string). `None` for a truncated `%` escape, an invalid hex pair, or a
+/// decoded byte sequence that isn't valid UTF-8 -- any of which means this
+/// wasn't a `Path=` value this module (or any correctly-percent-encoding
+/// tool) actually wrote.
+fn percent_decode_path(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Parses `.trashinfo`'s `DeletionDate=` value, `Y-M-DTh:m:s` (ISO 8601,
+/// no timezone suffix -- the exact shape [`format_trashinfo`] writes), into
+/// `(year, month, day, hour, minute, second)` -- the same tuple shape
+/// [`local_civil_time`] produces, so it feeds
+/// [`local_civil_time_to_unix`] directly. `None` for anything that isn't
+/// exactly this shape (extra/missing components, non-numeric fields) --
+/// this module makes no attempt to also accept other ISO 8601 variants
+/// (fractional seconds, a `Z`/offset suffix) that `.trashinfo` never
+/// carries and this module's own writer never produces.
+fn parse_deletion_date(s: &str) -> Option<(i32, u32, u32, u32, u32, u32)> {
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let y: i32 = date_parts.next()?.parse().ok()?;
+    let mo: u32 = date_parts.next()?.parse().ok()?;
+    let d: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hh: u32 = time_parts.next()?.parse().ok()?;
+    let mm: u32 = time_parts.next()?.parse().ok()?;
+    let ss: u32 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    Some((y, mo, d, hh, mm, ss))
 }
 
 #[cfg(test)]
@@ -1087,5 +1384,181 @@ mod tests {
         assert_ne!(first.content_path, second.content_path);
         assert!(first.content_path.ends_with("dup.txt"));
         assert!(second.content_path.ends_with("dup (2).txt"));
+    }
+
+    // -- list_trash_entries (T-5.3.2 phase 1: the read side) ---------------
+
+    /// The strongest test: a real entry [`resolve_trash_destination_at`]
+    /// itself wrote, read back by [`list_trash_entries`] -- proves
+    /// percent-decode and the `mktime`-based local-time-parse-back are
+    /// genuine inverses of the encoder/`localtime_r`, not just
+    /// independently-plausible-looking. `now` is a whole-seconds
+    /// `SystemTime` (`.trashinfo` has no sub-second resolution to lose), so
+    /// `deleted_at` must come back byte-for-byte identical.
+    #[test]
+    fn list_trash_entries_round_trips_a_real_home_trash_entry() {
+        let data_home = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let target = src_dir.path().join("déjà vu report (final).txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        // An arbitrary fixed instant, deliberately not "now" -- so a test
+        // that happened to pass by accident (e.g. a timezone bug that only
+        // manifests for certain times of day) can't hide behind whatever
+        // moment the test happened to run.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_775_000_000);
+        let mut reservations = TrashReservations::new();
+        let resolved =
+            resolve_trash_destination_at(&target, data_home.path(), now, &mut reservations)
+                .unwrap();
+        // Simulate the real job: WriteTrashInfo, then Rename.
+        std::fs::write(&resolved.info_path, &resolved.trashinfo).unwrap();
+        std::fs::rename(&target, &resolved.content_path).unwrap();
+
+        let entries = list_trash_entries(data_home.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content_path, resolved.content_path);
+        assert_eq!(entries[0].info_path, resolved.info_path);
+        assert_eq!(
+            entries[0].original_path, target,
+            "percent-decode must exactly reverse percent_encode_path"
+        );
+        assert_eq!(
+            entries[0].deleted_at, now,
+            "the mktime-based inverse must exactly reverse local_civil_time"
+        );
+    }
+
+    /// [`percent_decode_path`] is the exact inverse of
+    /// [`percent_encode_path`] for non-ASCII bytes and spaces -- the AC's
+    /// own "non-ASCII / space-containing original paths round-trip
+    /// correctly" clause, isolated from the rest of the parsing pipeline.
+    #[test]
+    fn percent_decode_reverses_percent_encode_for_non_ascii_and_spaces() {
+        let original = "/home/u/déjà vu (final) report.txt";
+        let encoded = percent_encode_path(original);
+        assert_eq!(percent_decode_path(&encoded).unwrap(), original);
+    }
+
+    #[test]
+    fn percent_decode_rejects_a_truncated_escape() {
+        assert!(percent_decode_path("abc%2").is_none());
+    }
+
+    /// A per-mount trash entry's `Path=` is stored *relative to its own
+    /// trash root's topdir*, not absolute -- [`list_trash_root`]'s `Some`
+    /// branch (exercised directly here, since [`list_trash_entries`]
+    /// itself only ever scans home trash -- see the module doc comment's
+    /// scope note) must join it back onto `topdir` to recover the real
+    /// absolute `original_path`, mirroring
+    /// [`resolve_trash_destination_at`]'s own `target.strip_prefix(topdir)`
+    /// on the write side.
+    #[test]
+    fn list_trash_root_resolves_a_topdir_relative_path_for_a_per_mount_entry() {
+        let topdir = TempDir::new().unwrap();
+        let root = topdir.path().join(".Trash-1000");
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::write(
+            root.join("info/a.txt.trashinfo"),
+            "[Trash Info]\nPath=sub/dir/a.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("files/a.txt"), b"x").unwrap();
+
+        let entries = list_trash_root(&root, Some(topdir.path())).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].original_path,
+            topdir.path().join("sub/dir/a.txt")
+        );
+        assert_eq!(entries[0].content_path, root.join("files/a.txt"));
+    }
+
+    /// The AC's own "tolerate garbage" clause: one corrupted `.trashinfo`
+    /// must not hide the other, legitimate entries in the same directory.
+    #[test]
+    fn list_trash_entries_skips_a_malformed_trashinfo_without_hiding_others() {
+        let data_home = TempDir::new().unwrap();
+        let trash_root = data_home.path().join("Trash");
+        std::fs::create_dir_all(trash_root.join("info")).unwrap();
+        std::fs::create_dir_all(trash_root.join("files")).unwrap();
+
+        std::fs::write(
+            trash_root.join("info/good.txt.trashinfo"),
+            "[Trash Info]\nPath=/home/u/good.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(trash_root.join("files/good.txt"), b"kept").unwrap();
+
+        // Missing the `[Trash Info]` header entirely.
+        std::fs::write(
+            trash_root.join("info/no-header.txt.trashinfo"),
+            "Path=/home/u/no-header.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        // Missing DeletionDate=.
+        std::fs::write(
+            trash_root.join("info/no-date.txt.trashinfo"),
+            "[Trash Info]\nPath=/home/u/no-date.txt\n",
+        )
+        .unwrap();
+        // Garbage, not a trashinfo file at all.
+        std::fs::write(
+            trash_root.join("info/garbage.txt.trashinfo"),
+            "not a trashinfo file at all",
+        )
+        .unwrap();
+        // A file in `info/` that isn't even named `*.trashinfo`.
+        std::fs::write(trash_root.join("info/stray.txt"), "ignore me").unwrap();
+
+        let entries = list_trash_entries(data_home.path()).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the one well-formed entry should have survived: {entries:?}"
+        );
+        assert_eq!(entries[0].original_path, PathBuf::from("/home/u/good.txt"));
+    }
+
+    /// No `Trash` directory at all (nothing has ever been trashed here) is
+    /// success with nothing found, not an error -- mirrors
+    /// [`resolve_trash_destination`]'s own "create on demand" stance on the
+    /// same directory from the write side.
+    #[test]
+    fn list_trash_entries_on_a_data_home_with_no_trash_directory_is_an_empty_list_not_an_error() {
+        let data_home = TempDir::new().unwrap();
+        let entries = list_trash_entries(data_home.path()).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_deletion_date_parses_the_exact_trashinfo_shape() {
+        assert_eq!(
+            parse_deletion_date("2026-08-30T14:22:07"),
+            Some((2026, 8, 30, 14, 22, 7))
+        );
+    }
+
+    #[test]
+    fn parse_deletion_date_rejects_a_malformed_value() {
+        assert!(parse_deletion_date("not-a-date").is_none());
+        assert!(parse_deletion_date("2026-08-30").is_none());
+        assert!(parse_deletion_date("2026-08-30T14:22").is_none());
+    }
+
+    /// [`local_civil_time_to_unix`] is the exact inverse of
+    /// [`local_civil_time`] -- cross-checked here independently of
+    /// `list_trash_entries`'s own end-to-end round-trip test above, across
+    /// a handful of distinct instants (not just one) so a bug that only
+    /// shows up near a DST transition or a month/year boundary can't hide.
+    #[test]
+    fn local_civil_time_to_unix_is_the_exact_inverse_of_local_civil_time() {
+        for secs in [0i64, 1, 1_000_000_000, 1_700_000_000, 1_800_000_000, -100] {
+            let civil = local_civil_time(secs);
+            let (y, mo, d, hh, mm, ss) = civil;
+            let back = local_civil_time_to_unix(y, mo, d, hh, mm, ss).unwrap();
+            assert_eq!(back, secs, "{civil:?} did not round-trip back to {secs}");
+        }
     }
 }
