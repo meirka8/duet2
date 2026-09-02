@@ -53,6 +53,20 @@ pub enum JobKind {
     /// steps the plan has and which `MetaPatch` fields are `Some`, not in
     /// what the queue manager should call the job.
     ChangeAttributes,
+    /// T-5.3.2 phase 1's `trash.restore` — moves one or more trashed
+    /// entries back to their original paths (recreating a deleted parent
+    /// directory if needed) and removes their now-stale `.trashinfo`
+    /// sidecars. See [`crate::trash_restore::plan_trash_restore`].
+    RestoreFromTrash,
+    /// T-5.3.2 phase 1's `trash.empty` and `trash.delete_selected` —
+    /// permanently removes one or more trashed entries' content and
+    /// `.trashinfo` sidecar. One variant covers both commands: they differ
+    /// only in which entries [`crate::trash_restore::plan_trash_purge`] was
+    /// given (every entry in the trash, or a caller-chosen subset), not in
+    /// what the queue manager should call the job — the same "one variant,
+    /// several closely-related shapes" precedent `ChangeAttributes` above
+    /// already set.
+    PurgeTrash,
 }
 
 /// A queued job: a `Plan` plus its current lifecycle state and queue

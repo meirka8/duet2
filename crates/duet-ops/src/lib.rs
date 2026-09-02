@@ -30,8 +30,16 @@
 //!   resolves each target's own trash destination (home trash, or the
 //!   correct per-mount `$topdir/.Trash{,-$uid}` for a target on another
 //!   filesystem) and this module turns that into a `Step::WriteTrashInfo`
-//!   and `Step::Rename` pair per target. T-5.3.2 (a browsable/restorable
-//!   trash view) is still later, separate scope.
+//!   and `Step::Rename` pair per target.
+//! - [`trash_restore`] — T-5.3.2 phase 1: the other half of the trash
+//!   story. [`trash_restore::plan_trash_restore`] (`trash.restore`) turns
+//!   `duet_platform::trash::list_trash_entries`' own output back into a
+//!   restore `Plan` — recreating a deleted parent directory if needed, then
+//!   the reverse of `deleter`'s own write-ordering (move the content back
+//!   first, remove the `.trashinfo` sidecar only once that's durable).
+//!   [`trash_restore::plan_trash_purge`] backs both `trash.empty` and
+//!   `trash.delete_selected`. The actual browsable dialog UI is a separate,
+//!   later phase 2, in `duet-ui`.
 //! - [`creators`] — T-5.2.7's four "create one thing" planners
 //!   ([`creators::plan_mkdir`], [`creators::plan_rename_in_place`],
 //!   [`creators::plan_symlink`], [`creators::plan_hardlink`]): the
@@ -114,6 +122,7 @@ mod queue;
 mod recovery;
 mod rerun;
 mod step;
+mod trash_restore;
 
 pub use attributes::plan_attributes;
 pub use conflict::{
@@ -121,6 +130,13 @@ pub use conflict::{
 };
 pub use creators::{plan_hardlink, plan_mkdir, plan_rename_in_place, plan_symlink};
 pub use deleter::{DeleteMode, plan_delete};
+// T-5.3.2 phase 1: re-exported here (rather than making `duet-ui` add its
+// own direct `duet-platform` dependency) since every other trash-planning
+// type already crosses this same `duet-ops` boundary -- `duet-ui` already
+// depends on `duet-ops`, not on `duet-platform` directly, matching the
+// crate-graph shape `documentation/design.md` §8.1 lays out (`duet-ops`
+// sits between `duet-platform`/`duet-vfs` and `duet-ui`).
+pub use duet_platform::trash::{TrashEntry, TrashError, list_trash_entries};
 pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
 pub use job::{Job, JobId, JobKind, JobOutcome, JobReport, JobState, SkipEntry, StepFailure};
@@ -132,3 +148,4 @@ pub use queue::{QueueError, QueueManager};
 pub use recovery::{orphaned_partial_path, plan_from_recovery};
 pub use rerun::plan_from_report;
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
+pub use trash_restore::{plan_trash_purge, plan_trash_restore};
