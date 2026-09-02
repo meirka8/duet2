@@ -49,20 +49,37 @@
 //! own planner module) is the one caller, turning each entry into a
 //! restore or permanent-purge `Plan`.
 //!
-//! **Scope: home trash only, no opportunistic per-mount discovery.** A
-//! per-mount `$topdir/.Trash{,-$uid}` genuinely exists and
-//! [`list_trash_root`] (this function's own internal, per-root worker) can
-//! read one correctly — proven directly by this module's own tests, which
-//! exercise a topdir-relative `Path=` resolving back to the right absolute
-//! `original_path` — but [`list_trash_entries`] itself only ever calls it
-//! against `$XDG_DATA_HOME/Trash`. Discovering *which* other mounts might
-//! have a per-mount trash worth scanning needs walking
-//! `/proc/self/mountinfo` once and probing each mount point for an
-//! existing `.Trash{,-$uid}` — real, disclosed extra scope this phase
-//! deliberately doesn't take on, to keep phase 1 to "the API phase 2's
-//! dialog needs," not "the most complete trash browser imaginable." A
-//! later task can add that scan as a pure addition to
-//! [`list_trash_entries`]'s own body without touching anything else here.
+//! # T-5.3.2 phase 2: per-mount trash discovery
+//!
+//! Phase 1 left a real, disclosed gap: [`list_trash_entries`] only ever
+//! scanned `$XDG_DATA_HOME/Trash`, so a target trashed from a different
+//! mounted filesystem (its content and `.trashinfo` correctly written by
+//! [`resolve_trash_destination`] to `$topdir/.Trash{,-$uid}`, per the
+//! write side above) never showed up in the browser at all — confirmed
+//! live: the write path was always correct, only discovery was missing.
+//!
+//! [`list_trash_entries`] now also walks `/proc/self/mountinfo`
+//! ([`parse_mountinfo`] is the pure, independently-testable line parser),
+//! filters out pseudo/virtual filesystem types that could never hold a
+//! per-mount trash ([`is_probeable_fstype`]), and probes each surviving
+//! mount point for an *already-existing* trash root
+//! ([`list_entries_from_candidate_topdirs`], reusing
+//! [`find_method_one_root`]/[`find_method_two_root`] — the read-only,
+//! never-creates-anything counterparts to [`try_method_one`]/
+//! [`try_method_two`]) — merging whatever it finds with home trash's own
+//! entries. A candidate whose device matches `$XDG_DATA_HOME`'s own (a
+//! bind mount, or `$XDG_DATA_HOME` itself showing up as a "mount point")
+//! is skipped, via [`dedup_and_exclude_home_dev`], so home-trash entries
+//! are never double-counted; candidates that share a device with each
+//! other (two mount-point paths onto the same underlying filesystem) are
+//! also deduplicated there. A failure reading `/proc/self/mountinfo`
+//! itself degrades to home-trash-only rather than failing the whole call
+//! — home trash always working is the load-bearing guarantee, per-mount
+//! discovery is enhancement on top.
+//!
+//! This is a one-shot scan per [`list_trash_entries`] call, same as phase
+//! 1 — no live mount-table tracking (that is design.md's separate,
+//! unbuilt "Mounts" concern, T-6.1.1).
 //!
 //! **A malformed `.trashinfo` is skipped, not propagated as an error for
 //! the whole listing.** A hand-edited, truncated, or third-party-tool-
@@ -387,33 +404,55 @@ fn dev_of(path: &Path) -> io::Result<u64> {
         .map_err(io_err)
 }
 
+/// The core of "does this existing directory entry qualify as a per-user
+/// trash root" per the spec: it must be a real directory (not a symlink),
+/// owned by `uid`, and not group/other readable or writable. Shared by
+/// [`existing_dir_is_safe_trash_root`] (the write side's "not there yet is
+/// fine, the caller will create it" variant) and
+/// [`find_existing_safe_trash_root`] (the read side's "must already exist"
+/// variant) so the sticky-bit/symlink/ownership safety logic itself lives
+/// in exactly one place.
+fn is_safe_trash_root_dir(st: &fs::Stat, uid: u32) -> bool {
+    FileType::from_raw_mode(st.st_mode) == FileType::Directory
+        && st.st_uid == uid
+        && st.st_mode & 0o077 == 0
+}
+
 /// Bytes that make an existing directory entry unsafe to reuse as a
-/// per-user trash root, per the spec: it must be a real directory (not a
-/// symlink), owned by `uid`, and not group/other readable or writable.
-/// Shared by [`try_method_one`]/[`try_method_two`]'s "does an existing
-/// entry still qualify" check.
+/// per-user trash root -- see [`is_safe_trash_root_dir`]. Shared by
+/// [`try_method_one`]/[`try_method_two`]'s "does an existing entry still
+/// qualify" check.
 fn existing_dir_is_safe_trash_root(path: &Path, uid: u32) -> bool {
     match fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => {
-            FileType::from_raw_mode(st.st_mode) == FileType::Directory
-                && st.st_uid == uid
-                && st.st_mode & 0o077 == 0
-        }
+        Ok(st) => is_safe_trash_root_dir(&st, uid),
         // Doesn't exist (or can't be stat'd) -- not "unsafe", just "not
         // there yet", which the caller creates fresh.
         Err(_) => true,
     }
 }
 
+/// The read-only counterpart to [`existing_dir_is_safe_trash_root`]: `true`
+/// only if `path` *already exists* and qualifies -- used by
+/// [`find_method_one_root`]/[`find_method_two_root`] (T-5.3.2 phase 2's
+/// per-mount trash *browser*, which must never create anything -- see
+/// those functions' own doc comments), where "doesn't exist" means "no
+/// trash here to read", not "safe to go ahead and create".
+fn find_existing_safe_trash_root(path: &Path, uid: u32) -> bool {
+    match fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => is_safe_trash_root_dir(&st, uid),
+        Err(_) => false,
+    }
+}
+
 const STICKY_BIT: u32 = 0o1000;
 
-/// Method 1: `$topdir/.Trash/$uid`, only if `$topdir/.Trash` exists, is a
-/// real directory (not a symlink -- a known spec attack/misconfiguration
-/// vector), and has the sticky bit set. `None` (fall through to method 2)
-/// for every way this can be unusable, per the spec and this task's own
-/// "fall through, don't error" directive -- only [`try_method_two`]
-/// failing is what produces a real, surfaced [`TrashError`].
-fn try_method_one(topdir: &Path, uid: u32) -> Option<PathBuf> {
+/// The shared "is `$topdir/.Trash` itself usable as method 1's base at
+/// all" check: must exist, be a real directory (not a symlink -- a known
+/// spec attack/misconfiguration vector), and have the sticky bit set.
+/// `None` for any way this fails, letting both [`try_method_one`] (which
+/// then creates `$topdir/.Trash/$uid` on demand) and [`find_method_one_root`]
+/// (which only looks) fall through identically.
+fn method_one_dot_trash_dir(topdir: &Path) -> Option<PathBuf> {
     let dot_trash = topdir.join(".Trash");
     let lst = fs::statat(CWD, &dot_trash, AtFlags::SYMLINK_NOFOLLOW).ok()?;
     if FileType::from_raw_mode(lst.st_mode) != FileType::Directory {
@@ -422,7 +461,17 @@ fn try_method_one(topdir: &Path, uid: u32) -> Option<PathBuf> {
     if lst.st_mode & STICKY_BIT == 0 {
         return None; // sticky bit not set
     }
+    Some(dot_trash)
+}
 
+/// Method 1: `$topdir/.Trash/$uid`, only if `$topdir/.Trash` exists, is a
+/// real directory (not a symlink), and has the sticky bit set. `None`
+/// (fall through to method 2) for every way this can be unusable, per the
+/// spec and this task's own "fall through, don't error" directive -- only
+/// [`try_method_two`] failing is what produces a real, surfaced
+/// [`TrashError`].
+fn try_method_one(topdir: &Path, uid: u32) -> Option<PathBuf> {
+    let dot_trash = method_one_dot_trash_dir(topdir)?;
     let user_dir = dot_trash.join(uid.to_string());
     if !existing_dir_is_safe_trash_root(&user_dir, uid) {
         return None;
@@ -439,6 +488,33 @@ fn try_method_two(topdir: &Path, uid: u32) -> Option<PathBuf> {
         return None;
     }
     create_trash_root(&user_dir).ok()?;
+    Some(user_dir)
+}
+
+/// The read-only counterpart to [`try_method_one`]: `Some(root)` only if
+/// `$topdir/.Trash/$uid` *already exists* and is safe -- never creates
+/// `.Trash/$uid` (or anything else) as a side effect of merely looking,
+/// unlike the write side. Used by [`list_entries_from_candidate_topdirs`],
+/// T-5.3.2 phase 2's per-mount trash *browse* pass -- a filesystem with no
+/// trash on it yet must come back with nothing found, not a freshly
+/// created empty trash directory.
+fn find_method_one_root(topdir: &Path, uid: u32) -> Option<PathBuf> {
+    let dot_trash = method_one_dot_trash_dir(topdir)?;
+    let user_dir = dot_trash.join(uid.to_string());
+    if !find_existing_safe_trash_root(&user_dir, uid) {
+        return None;
+    }
+    Some(user_dir)
+}
+
+/// The read-only counterpart to [`try_method_two`] -- see
+/// [`find_method_one_root`]'s own doc comment for why this never creates
+/// `$topdir/.Trash-$uid`.
+fn find_method_two_root(topdir: &Path, uid: u32) -> Option<PathBuf> {
+    let user_dir = topdir.join(format!(".Trash-{uid}"));
+    if !find_existing_safe_trash_root(&user_dir, uid) {
+        return None;
+    }
     Some(user_dir)
 }
 
@@ -709,25 +785,259 @@ pub struct TrashEntry {
 }
 
 /// Enumerates every trash entry `duet` (or any other freedesktop-spec tool)
-/// has left under `xdg_data_home`'s own home trash
-/// (`$xdg_data_home/Trash`). See the module doc comment's "T-5.3.2 phase 1"
-/// section for why this is scoped to home trash only, and for the
-/// "tolerate garbage, don't propagate it" per-entry parse-failure
-/// convention.
+/// has left under `xdg_data_home`'s own home trash (`$xdg_data_home/Trash`)
+/// *and* under every other mounted filesystem's own per-mount trash --
+/// see the module doc comment's "T-5.3.2 phase 2" section for the full
+/// design, and its "tolerate garbage, don't propagate it" per-entry
+/// parse-failure convention (unchanged from phase 1).
 ///
 /// An `xdg_data_home` with no `Trash` directory at all (nothing has ever
-/// been trashed there) is not an error -- it produces an empty `Vec`,
-/// mirroring [`resolve_trash_destination`]'s own "create on demand" stance
-/// on the same directory from the write side.
+/// been trashed there) is not an error -- it produces an empty `Vec` for
+/// the home-trash half, mirroring [`resolve_trash_destination`]'s own
+/// "create on demand" stance on the same directory from the write side. A
+/// failure reading or parsing `/proc/self/mountinfo` (shouldn't happen on
+/// a real Linux system, but handled honestly) is likewise not an error --
+/// it degrades to home-trash-only, since home trash is real, useful data
+/// on its own even when the per-mount discovery pass can't run at all.
 ///
 /// # Errors
 /// [`TrashError::Io`] if `$xdg_data_home/Trash/info` exists but can't be
 /// read at all (a genuine, surfaced failure -- a real permission problem on
 /// a directory this module's own writer always creates at mode `0700`
 /// owned by the current user, so a read failure here means something
-/// outside `duet`'s own control changed it).
+/// outside `duet`'s own control changed it). A per-mount trash root that
+/// exists but can't be read is *not* surfaced this way -- see
+/// [`list_entries_from_candidate_topdirs`]'s own doc comment.
 pub fn list_trash_entries(xdg_data_home: &Path) -> Result<Vec<TrashEntry>, TrashError> {
-    list_trash_root(&xdg_data_home.join("Trash"), None)
+    let mut entries = list_trash_root(&xdg_data_home.join("Trash"), None)?;
+    let candidates = dedup_and_exclude_home_dev(xdg_data_home, &real_mountinfo_candidates());
+    entries.extend(list_entries_from_candidate_topdirs(&candidates));
+    Ok(entries)
+}
+
+/// [`list_trash_entries`] with an explicit candidate topdir list instead of
+/// reading real `/proc/self/mountinfo` -- exists purely so tests can prove
+/// the home-trash-scan-plus-per-mount-merge wiring works without needing a
+/// real second mounted filesystem, the same shape of seam
+/// [`resolve_trash_destination_at`] already provides for injecting
+/// `SystemTime::now()`.
+///
+/// Deliberately does *not* re-run [`dedup_and_exclude_home_dev`] on
+/// `candidates` -- that dev-comparison filter is its own, independently
+/// and deterministically tested unit (real `TempDir`s under the same `/tmp`
+/// share one `st_dev` in most sandboxes, which would make a filter re-run
+/// here nondeterministically swallow a test's deliberately-distinct
+/// "per-mount" `TempDir`); callers of this test-only seam are expected to
+/// pass an already-appropriate candidate list, exactly as
+/// [`list_entries_from_candidate_topdirs`] itself (which this delegates
+/// to) is documented not to know about the exclusion rule at all.
+#[cfg(test)]
+fn list_trash_entries_with_candidates(
+    xdg_data_home: &Path,
+    candidates: &[PathBuf],
+) -> Result<Vec<TrashEntry>, TrashError> {
+    let mut entries = list_trash_root(&xdg_data_home.join("Trash"), None)?;
+    entries.extend(list_entries_from_candidate_topdirs(candidates));
+    Ok(entries)
+}
+
+/// Given a list of candidate topdir paths, finds which ones already have a
+/// usable, *already-existing* trash root (via [`find_method_one_root`]/
+/// [`find_method_two_root`] -- the read-only, never-creates-anything
+/// counterparts to [`try_method_one`]/[`try_method_two`]) and returns every
+/// entry found in each, merged into one `Vec`. A candidate with no usable
+/// trash root at all -- nothing has ever been trashed there, or the safety
+/// checks fail -- contributes nothing and is not an error: a read-only
+/// browse pass over a filesystem that happens to have no trash on it yet
+/// must find nothing, not create an empty trash directory as a side effect
+/// of merely looking (unlike [`resolve_trash_location`]'s write-side
+/// on-demand creation).
+///
+/// Pure and injectable: does not itself read or parse
+/// `/proc/self/mountinfo` (see [`real_mountinfo_candidates`], the one real
+/// caller building the list this is fed in production) and does not know
+/// about [`dedup_and_exclude_home_dev`]'s exclusion rule at all -- only
+/// [`list_trash_entries`]'s own orchestration does, matching
+/// `topdir_walk_logic_stops_exactly_where_st_dev_changes`'s own precedent
+/// of testing a walk/probe against an injectable input rather than a real
+/// mount table.
+///
+/// A per-mount trash root that exists (passes the safety checks above) but
+/// whose `info` directory can't actually be read for some other reason is
+/// tolerated the same way a single malformed `.trashinfo` is: that one
+/// root contributes nothing, the rest of the candidates are unaffected.
+fn list_entries_from_candidate_topdirs(candidates: &[PathBuf]) -> Vec<TrashEntry> {
+    let uid = rustix::process::getuid().as_raw();
+    let mut entries = Vec::new();
+    for topdir in candidates {
+        let root = find_method_one_root(topdir, uid).or_else(|| find_method_two_root(topdir, uid));
+        let Some(root) = root else { continue };
+        if let Ok(found) = list_trash_root(&root, Some(topdir)) {
+            entries.extend(found);
+        }
+    }
+    entries
+}
+
+/// [`list_trash_entries`]'s dev-based hygiene pass over a raw candidate
+/// topdir list: drops whichever candidate's device matches
+/// `xdg_data_home`'s own (already covered by the home-trash scan one layer
+/// up -- scanning it again as a "per-mount" trash would double-count every
+/// home-trash entry), and deduplicates the rest by [`dev_of`] (a bind mount
+/// reachable via two different mount-point paths must not be scanned
+/// twice). A candidate that can't even be `stat`'d (gone by the time this
+/// runs, e.g.) is silently dropped -- the same "tolerate garbage" stance as
+/// everything else in this module.
+fn dedup_and_exclude_home_dev(xdg_data_home: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
+    let home_dev = dev_of(xdg_data_home).ok();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        let Ok(dev) = dev_of(candidate) else { continue };
+        if Some(dev) == home_dev {
+            continue;
+        }
+        if !seen.insert(dev) {
+            continue;
+        }
+        out.push(candidate.clone());
+    }
+    out
+}
+
+/// Filesystem types that can never meaningfully hold a per-mount trash and
+/// would just be wasted probing -- pseudo/virtual filesystems
+/// (`proc`, `sysfs`, `cgroup`, ...) that have no real on-disk `.Trash{,-
+/// $uid}` concept at all, plus `tmpfs`/`overlay`/`squashfs` specifically to
+/// avoid probing inside every snap/flatpak package mount, which can number
+/// in the dozens on a real desktop and would never have user-trashed
+/// content. Not an exhaustive enumeration -- see [`is_probeable_fstype`].
+const NON_PROBEABLE_FSTYPES: &[&str] = &[
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "devpts",
+    "devtmpfs",
+    "securityfs",
+    "debugfs",
+    "tracefs",
+    "pstore",
+    "bpf",
+    "mqueue",
+    "hugetlbfs",
+    "autofs",
+    "binfmt_misc",
+    "tmpfs",
+    "overlay",
+    "squashfs",
+    // Not real on-disk filesystems either: a network-namespace handle
+    // (containers/`docker network` create one per namespace) and a
+    // pseudo-fs exposing kernel config -- neither can hold a trash.
+    "nsfs",
+    "configfs",
+    "fusectl",
+];
+
+fn is_probeable_fstype(fstype: &str) -> bool {
+    !NON_PROBEABLE_FSTYPES.contains(&fstype)
+}
+
+/// [`list_trash_entries`]'s real, production candidate source: reads
+/// `/proc/self/mountinfo`, parses it via [`parse_mountinfo`], and returns
+/// every surviving mount point after [`is_probeable_fstype`] filters out
+/// pseudo-filesystems. A read failure (shouldn't happen on a real Linux
+/// system) degrades to an empty list rather than propagating an error --
+/// see the module doc comment's "T-5.3.2 phase 2" section.
+fn real_mountinfo_candidates() -> Vec<PathBuf> {
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    parse_mountinfo(&content)
+        .into_iter()
+        .filter(|line| is_probeable_fstype(&line.fstype))
+        .map(|line| line.mount_point)
+        .collect()
+}
+
+/// One `/proc/self/mountinfo` line's two facts this module actually needs
+/// -- see [`parse_mountinfo`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfoLine {
+    mount_point: PathBuf,
+    fstype: String,
+}
+
+/// Parses `/proc/self/mountinfo`'s own text content (`man 5
+/// proc_pid_mountinfo`) into one [`MountInfoLine`] per well-formed line,
+/// silently skipping any line that doesn't parse -- the same "tolerate
+/// garbage, don't propagate it" convention this module already applies to
+/// a malformed `.trashinfo` (see [`parse_trash_info_file`]'s own doc
+/// comment). Takes the file's already-read text content, rather than
+/// reading `/proc/self/mountinfo` itself, so it can be unit-tested against
+/// literal fixture strings without needing a real `/proc` at all (see
+/// [`real_mountinfo_candidates`] for the one real caller that does the
+/// actual file read).
+///
+/// Each line's fixed-position fields (mount ID, parent ID, `major:minor`,
+/// root, mount point, mount options) sit *before* a literal `" - "` token;
+/// the fields between the mount options and that separator are a
+/// variable-length list of optional fields (a `master:N`/`shared:N`/etc.
+/// peer-group tag) -- exactly why the separator exists at all, so this
+/// parser does not assume any particular count of them: it splits on the
+/// separator first, and only then reads fixed-position fields out of each
+/// side (mount point is always index 4, 0-indexed, in the part before the
+/// separator; filesystem type is the first field after it).
+fn parse_mountinfo(content: &str) -> Vec<MountInfoLine> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue; // malformed -- no separator at all
+        };
+        let before_fields: Vec<&str> = before.split(' ').collect();
+        let Some(raw_mount_point) = before_fields.get(4) else {
+            continue;
+        };
+        let Some(mount_point) = unescape_octal(raw_mount_point) else {
+            continue;
+        };
+        let Some(fstype) = after.split(' ').next().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        out.push(MountInfoLine {
+            mount_point: PathBuf::from(mount_point),
+            fstype: fstype.to_string(),
+        });
+    }
+    out
+}
+
+/// Undoes `/proc/self/mountinfo`'s octal escaping of whitespace and
+/// backslash in a path field (` ` -> `\040`, tab -> `\011`, newline ->
+/// `\012`, `\\` -> `\134`) -- a real-world mount point (removable media
+/// with a space in its volume label, e.g.) actually contains these, so a
+/// literal space-split at the field level (already done by
+/// [`parse_mountinfo`]) is not enough on its own; each field's own content
+/// must also be unescaped. `None` for a trailing/truncated `\` escape or a
+/// `\NNN` sequence that isn't valid octal -- [`parse_mountinfo`] skips the
+/// whole line in that case, the same "tolerate garbage" stance as
+/// everywhere else in this module.
+fn unescape_octal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let digits = bytes.get(i + 1..i + 4)?;
+            let digits = std::str::from_utf8(digits).ok()?;
+            out.push(u8::from_str_radix(digits, 8).ok()?);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// [`list_trash_entries`]'s per-root worker: reads every `*.trashinfo` file
@@ -737,10 +1047,11 @@ pub fn list_trash_entries(xdg_data_home: &Path) -> Result<Vec<TrashEntry>, Trash
 /// (`Path=` is relative to `topdir` -- see [`resolve_trash_destination_at`]'s
 /// own `path_field` construction, which this is the exact inverse of).
 ///
-/// Not exposed publicly: [`list_trash_entries`] itself only ever calls this
-/// with `topdir: None` today (see the module doc comment's scope note), but
-/// the `Some` path is real, load-bearing code -- exercised directly by this
-/// module's own tests -- not dead weight kept "for later."
+/// Not exposed publicly: [`list_trash_entries`] itself calls this once with
+/// `topdir: None` for home trash, and again (via
+/// [`list_entries_from_candidate_topdirs`]) with `topdir: Some(_)` once per
+/// discovered per-mount trash root (see the module doc comment's "T-5.3.2
+/// phase 2" section) -- both branches are real, load-bearing code paths.
 fn list_trash_root(root: &Path, topdir: Option<&Path>) -> Result<Vec<TrashEntry>, TrashError> {
     let info_dir = root.join("info");
     let files_dir = root.join("files");
@@ -1415,16 +1726,24 @@ mod tests {
         std::fs::write(&resolved.info_path, &resolved.trashinfo).unwrap();
         std::fs::rename(&target, &resolved.content_path).unwrap();
 
+        // list_trash_entries now also scans real per-mount trash roots
+        // discovered via /proc/self/mountinfo (T-5.3.2 phase 2), so on a
+        // real machine with its own real trash elsewhere the result can
+        // legitimately contain more than this one entry -- find the entry
+        // this test actually wrote rather than assuming it is the only
+        // one / at index 0.
         let entries = list_trash_entries(data_home.path()).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].content_path, resolved.content_path);
-        assert_eq!(entries[0].info_path, resolved.info_path);
+        let entry = entries
+            .iter()
+            .find(|e| e.content_path == resolved.content_path)
+            .unwrap_or_else(|| panic!("the entry just written must be found in {entries:?}"));
+        assert_eq!(entry.info_path, resolved.info_path);
         assert_eq!(
-            entries[0].original_path, target,
+            entry.original_path, target,
             "percent-decode must exactly reverse percent_encode_path"
         );
         assert_eq!(
-            entries[0].deleted_at, now,
+            entry.deleted_at, now,
             "the mktime-based inverse must exactly reverse local_civil_time"
         );
     }
@@ -1512,24 +1831,45 @@ mod tests {
         // A file in `info/` that isn't even named `*.trashinfo`.
         std::fs::write(trash_root.join("info/stray.txt"), "ignore me").unwrap();
 
+        // Scoped to this test's own home trash (content_path under
+        // data_home) -- list_trash_entries now also scans real per-mount
+        // trash roots (T-5.3.2 phase 2), which on a real machine can
+        // legitimately contribute their own, unrelated entries.
         let entries = list_trash_entries(data_home.path()).unwrap();
+        let home_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.content_path.starts_with(data_home.path()))
+            .collect();
         assert_eq!(
-            entries.len(),
+            home_entries.len(),
             1,
             "only the one well-formed entry should have survived: {entries:?}"
         );
-        assert_eq!(entries[0].original_path, PathBuf::from("/home/u/good.txt"));
+        assert_eq!(
+            home_entries[0].original_path,
+            PathBuf::from("/home/u/good.txt")
+        );
     }
 
     /// No `Trash` directory at all (nothing has ever been trashed here) is
-    /// success with nothing found, not an error -- mirrors
+    /// success with nothing found *for home trash specifically* -- mirrors
     /// [`resolve_trash_destination`]'s own "create on demand" stance on the
-    /// same directory from the write side.
+    /// same directory from the write side. Not asserted as "the whole
+    /// result is empty": list_trash_entries now also scans real per-mount
+    /// trash roots (T-5.3.2 phase 2), which on a real machine can
+    /// legitimately be non-empty regardless of this test's own
+    /// (freshly created, definitely-empty) `data_home`.
     #[test]
     fn list_trash_entries_on_a_data_home_with_no_trash_directory_is_an_empty_list_not_an_error() {
         let data_home = TempDir::new().unwrap();
         let entries = list_trash_entries(data_home.path()).unwrap();
-        assert!(entries.is_empty());
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.content_path.starts_with(data_home.path())),
+            "a data_home with no Trash directory must contribute no home-trash \
+             entries of its own: {entries:?}"
+        );
     }
 
     #[test]
@@ -1560,5 +1900,392 @@ mod tests {
             let back = local_civil_time_to_unix(y, mo, d, hh, mm, ss).unwrap();
             assert_eq!(back, secs, "{civil:?} did not round-trip back to {secs}");
         }
+    }
+
+    // -- parse_mountinfo (T-5.3.2 phase 2) -----------------------------------
+
+    #[test]
+    fn parse_mountinfo_parses_a_normal_line() {
+        let content =
+            "36 35 98:0 / /mnt/data rw,noatime master:1 - ext4 /dev/sda1 rw,errors=remount-ro\n";
+        let lines = parse_mountinfo(content);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].mount_point, PathBuf::from("/mnt/data"));
+        assert_eq!(lines[0].fstype, "ext4");
+    }
+
+    #[test]
+    fn parse_mountinfo_unescapes_octal_sequences_in_the_mount_point() {
+        // A real removable-media mount point with a space in its volume
+        // label -- `/proc/self/mountinfo` renders the space as `\040`, not
+        // a literal space, precisely so the field-splitting-on-space above
+        // stays unambiguous.
+        let content = "50 35 8:3 / /media/USB\\040DRIVE rw - vfat /dev/sdc1 rw\n";
+        let lines = parse_mountinfo(content);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].mount_point, PathBuf::from("/media/USB DRIVE"));
+        assert_eq!(lines[0].fstype, "vfat");
+    }
+
+    #[test]
+    fn parse_mountinfo_handles_zero_optional_fields() {
+        let content = "25 30 8:1 / /boot rw - ext4 /dev/sda2 rw\n";
+        let lines = parse_mountinfo(content);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].mount_point, PathBuf::from("/boot"));
+        assert_eq!(lines[0].fstype, "ext4");
+    }
+
+    #[test]
+    fn parse_mountinfo_handles_two_or_more_optional_fields() {
+        let content = "40 35 8:2 / /mnt/backup rw shared:2 master:3 - xfs /dev/sdb1 rw\n";
+        let lines = parse_mountinfo(content);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].mount_point, PathBuf::from("/mnt/backup"));
+        assert_eq!(lines[0].fstype, "xfs");
+    }
+
+    #[test]
+    fn parse_mountinfo_skips_a_malformed_line_without_panicking_or_hiding_good_lines() {
+        let content = "36 35 98:0 / /mnt/data rw,noatime master:1 - ext4 /dev/sda1 rw\n\
+                        this is not a valid mountinfo line at all\n\
+                        60 35 8:4 / /mnt/x rw\n\
+                        25 30 8:1 / /boot rw - ext4 /dev/sda2 rw\n";
+        let lines = parse_mountinfo(content);
+        assert_eq!(
+            lines.len(),
+            2,
+            "the two malformed lines (no ' - ' separator at all) must be \
+             skipped, not panic or hide the two well-formed lines: {lines:?}"
+        );
+        assert_eq!(lines[0].mount_point, PathBuf::from("/mnt/data"));
+        assert_eq!(lines[1].mount_point, PathBuf::from("/boot"));
+    }
+
+    #[test]
+    fn parse_mountinfo_on_empty_content_is_an_empty_list() {
+        assert!(parse_mountinfo("").is_empty());
+    }
+
+    // -- is_probeable_fstype --------------------------------------------------
+
+    #[test]
+    fn is_probeable_fstype_excludes_pseudo_and_package_mount_filesystems() {
+        for fstype in ["proc", "sysfs", "tmpfs", "overlay", "squashfs", "cgroup2"] {
+            assert!(!is_probeable_fstype(fstype), "{fstype} should be excluded");
+        }
+    }
+
+    #[test]
+    fn is_probeable_fstype_allows_real_on_disk_filesystems() {
+        for fstype in ["ext4", "btrfs", "xfs", "vfat", "ntfs3"] {
+            assert!(is_probeable_fstype(fstype), "{fstype} should be probeable");
+        }
+    }
+
+    // -- list_entries_from_candidate_topdirs (T-5.3.2 phase 2's pure merge) --
+
+    #[test]
+    fn list_entries_from_candidate_topdirs_finds_a_dot_trash_dash_uid_root() {
+        let topdir = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let root = topdir.path().join(format!(".Trash-{uid}"));
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            root.join("info/a.txt.trashinfo"),
+            "[Trash Info]\nPath=a.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("files/a.txt"), b"x").unwrap();
+
+        let entries = list_entries_from_candidate_topdirs(&[topdir.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, topdir.path().join("a.txt"));
+        assert_eq!(entries[0].content_path, root.join("files/a.txt"));
+    }
+
+    #[test]
+    fn list_entries_from_candidate_topdirs_finds_a_sticky_bit_dot_trash_root() {
+        let topdir = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let dot_trash = topdir.path().join(".Trash");
+        std::fs::create_dir(&dot_trash).unwrap();
+        std::fs::set_permissions(&dot_trash, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let user_dir = dot_trash.join(uid.to_string());
+        std::fs::create_dir_all(user_dir.join("info")).unwrap();
+        std::fs::create_dir_all(user_dir.join("files")).unwrap();
+        std::fs::set_permissions(&user_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            user_dir.join("info/b.txt.trashinfo"),
+            "[Trash Info]\nPath=b.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(user_dir.join("files/b.txt"), b"y").unwrap();
+
+        let entries = list_entries_from_candidate_topdirs(&[topdir.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, topdir.path().join("b.txt"));
+    }
+
+    #[test]
+    fn list_entries_from_candidate_topdirs_finds_nothing_and_creates_nothing_when_absent() {
+        let topdir = TempDir::new().unwrap();
+        let entries = list_entries_from_candidate_topdirs(&[topdir.path().to_path_buf()]);
+        assert!(entries.is_empty());
+        // The whole point of the read-only find_method_one_root/
+        // find_method_two_root variants: a browse pass over a filesystem
+        // with no trash on it yet must not create one as a side effect of
+        // merely looking, unlike the write side's try_method_one/
+        // try_method_two.
+        let created: Vec<_> = std::fs::read_dir(topdir.path()).unwrap().collect();
+        assert!(
+            created.is_empty(),
+            "a read-only browse must not create anything on disk: {created:?}"
+        );
+    }
+
+    #[test]
+    fn list_entries_from_candidate_topdirs_still_works_if_xdg_data_home_is_included() {
+        // Per the module doc comment, this pure function doesn't know
+        // about (and doesn't need to know about) the home-device exclusion
+        // rule at all -- only `dedup_and_exclude_home_dev`, tested
+        // separately below, does. Feeding it a path that happens to *be*
+        // `xdg_data_home` should still behave correctly on its own terms.
+        let data_home = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        let root = data_home.path().join(format!(".Trash-{uid}"));
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        // Mode 0700 -- required by find_existing_safe_trash_root's own
+        // safety check (no group/other read/write/execute bits at all).
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            root.join("info/c.txt.trashinfo"),
+            "[Trash Info]\nPath=c.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("files/c.txt"), b"z").unwrap();
+
+        let entries = list_entries_from_candidate_topdirs(&[data_home.path().to_path_buf()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, data_home.path().join("c.txt"));
+    }
+
+    // -- dedup_and_exclude_home_dev -------------------------------------------
+
+    #[test]
+    fn dedup_and_exclude_home_dev_drops_a_candidate_matching_xdg_data_homes_own_device() {
+        let data_home = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let candidates = [data_home.path().to_path_buf(), other.path().to_path_buf()];
+
+        let filtered = dedup_and_exclude_home_dev(data_home.path(), &candidates);
+
+        assert!(
+            !filtered.contains(&data_home.path().to_path_buf()),
+            "xdg_data_home's own path must never survive the filter, since \
+             it is by definition on xdg_data_home's own device: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_and_exclude_home_dev_deduplicates_two_candidates_on_the_same_device() {
+        // Deliberately constructed rather than incidental: the exact same
+        // directory listed three times always shares one st_dev by
+        // definition, regardless of what /tmp happens to be mounted as in
+        // whatever environment this test runs in.
+        //
+        // `xdg_data_home` is deliberately a nonexistent path here (so
+        // `dev_of` fails and the home-device-exclusion half of this
+        // function's job is a no-op via `None`) -- this test's only
+        // concern is the *dedup* half; the exclusion half has its own
+        // dedicated test above. Real `TempDir`s (both under the same
+        // `/tmp` in most sandboxes -- see this module's own tests
+        // elsewhere for the same, already-established fact) would
+        // otherwise make this test's outcome depend on whether the
+        // sandbox's `/tmp` and this fake home happen to share a device.
+        let mount = TempDir::new().unwrap();
+        let candidates = [
+            mount.path().to_path_buf(),
+            mount.path().to_path_buf(),
+            mount.path().to_path_buf(),
+        ];
+        let nonexistent_home = Path::new("/definitely/does/not/exist/xdg-data-home");
+
+        let filtered = dedup_and_exclude_home_dev(nonexistent_home, &candidates);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "three candidates on the identical device must collapse to one: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_and_exclude_home_dev_drops_a_candidate_that_cannot_be_stated() {
+        let data_home = TempDir::new().unwrap();
+        let candidates = [PathBuf::from("/definitely/does/not/exist/anywhere")];
+        let filtered = dedup_and_exclude_home_dev(data_home.path(), &candidates);
+        assert!(filtered.is_empty());
+    }
+
+    // -- list_trash_entries_with_candidates (T-5.3.2 phase 2's end-to-end) ---
+
+    /// The strongest phase-2 test: real content trashed via
+    /// [`resolve_trash_destination_at`] into a home-trash-shaped `TempDir`,
+    /// plus a second, separately-rooted `TempDir` standing in for a
+    /// per-mount trash (built with the same real [`format_trashinfo`]/
+    /// [`percent_encode_path`] primitives [`resolve_trash_destination_at`]
+    /// itself uses, since this sandbox has no way to force a genuinely
+    /// different `st_dev` without root -- see `topdir_of`'s own tests for
+    /// the same, already-established constraint) -- proving entries from
+    /// *both* roots show up in one [`list_trash_entries_with_candidates`]
+    /// call. This is the bug from live UAT, fixed: a target trashed onto a
+    /// separate mounted filesystem must actually show up in the browser.
+    #[test]
+    fn list_trash_entries_with_candidates_merges_home_and_per_mount_entries() {
+        let data_home = TempDir::new().unwrap();
+        let mount_topdir = TempDir::new().unwrap();
+
+        // Home trash entry, via the real public write-side API.
+        let src_home = TempDir::new().unwrap();
+        let home_target = src_home.path().join("home-file.txt");
+        std::fs::write(&home_target, b"h").unwrap();
+        let mut reservations = TrashReservations::new();
+        let home_resolved = resolve_trash_destination_at(
+            &home_target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut reservations,
+        )
+        .unwrap();
+        std::fs::write(&home_resolved.info_path, &home_resolved.trashinfo).unwrap();
+        std::fs::rename(&home_target, &home_resolved.content_path).unwrap();
+
+        // Per-mount trash entry: `$mount_topdir/.Trash-$uid/{files,info}`,
+        // the exact layout try_method_two/find_method_two_root use, with a
+        // real .trashinfo written via this module's own format_trashinfo +
+        // percent_encode_path (topdir-relative Path=, matching
+        // resolve_trash_destination_at's own Some(topdir) branch).
+        let uid = rustix::process::getuid().as_raw();
+        let mount_root = mount_topdir.path().join(format!(".Trash-{uid}"));
+        std::fs::create_dir_all(mount_root.join("files")).unwrap();
+        std::fs::create_dir_all(mount_root.join("info")).unwrap();
+        // Mode 0700 -- required by find_existing_safe_trash_root's own
+        // safety check (no group/other read/write/execute bits at all).
+        std::fs::set_permissions(&mount_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mount_src = mount_topdir.path().join("sub/mount-file.txt");
+        std::fs::create_dir_all(mount_src.parent().unwrap()).unwrap();
+        std::fs::write(&mount_src, b"m").unwrap();
+        let relative = mount_src.strip_prefix(mount_topdir.path()).unwrap();
+        let path_field = percent_encode_path(&relative.to_string_lossy());
+        let civil = local_civil_time(unix_secs(SystemTime::UNIX_EPOCH));
+        let trashinfo = format_trashinfo(&path_field, civil);
+        std::fs::write(mount_root.join("info/mount-file.txt.trashinfo"), &trashinfo).unwrap();
+        std::fs::rename(&mount_src, mount_root.join("files/mount-file.txt")).unwrap();
+
+        let entries = list_trash_entries_with_candidates(
+            data_home.path(),
+            &[mount_topdir.path().to_path_buf()],
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.original_path == home_target
+                    && e.content_path == home_resolved.content_path),
+            "home-trash entry missing: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.original_path == mount_topdir.path().join("sub/mount-file.txt")),
+            "per-mount entry missing: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn list_trash_entries_with_candidates_with_no_usable_per_mount_trash_is_home_only() {
+        let data_home = TempDir::new().unwrap();
+        let src_home = TempDir::new().unwrap();
+        let home_target = src_home.path().join("only-file.txt");
+        std::fs::write(&home_target, b"h").unwrap();
+        let mut reservations = TrashReservations::new();
+        let resolved = resolve_trash_destination_at(
+            &home_target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut reservations,
+        )
+        .unwrap();
+        std::fs::write(&resolved.info_path, &resolved.trashinfo).unwrap();
+        std::fs::rename(&home_target, &resolved.content_path).unwrap();
+
+        // A candidate topdir with no trash on it at all.
+        let empty_mount = TempDir::new().unwrap();
+
+        let entries = list_trash_entries_with_candidates(
+            data_home.path(),
+            &[empty_mount.path().to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].original_path, home_target);
+    }
+
+    /// The "defense in depth" edge case: `xdg_data_home` itself showing up
+    /// in the *candidate* list must not double-count every home-trash
+    /// entry. Exercised at [`dedup_and_exclude_home_dev`]'s own level (the
+    /// function [`list_trash_entries`]'s real orchestration relies on for
+    /// exactly this exclusion) rather than through
+    /// [`list_trash_entries_with_candidates`], which deliberately skips
+    /// that filter -- see that function's own doc comment for why.
+    #[test]
+    fn xdg_data_home_appearing_in_the_candidate_list_does_not_double_count_home_entries() {
+        let data_home = TempDir::new().unwrap();
+        let uid = rustix::process::getuid().as_raw();
+        // If xdg_data_home's own path were (incorrectly) treated as a
+        // separate per-mount candidate, this .Trash-$uid layout sitting
+        // directly inside it would let a bug double-count -- but
+        // dedup_and_exclude_home_dev must filter it out before it ever
+        // reaches list_entries_from_candidate_topdirs.
+        let shadow_root = data_home.path().join(format!(".Trash-{uid}"));
+        std::fs::create_dir_all(shadow_root.join("info")).unwrap();
+        std::fs::create_dir_all(shadow_root.join("files")).unwrap();
+        std::fs::write(
+            shadow_root.join("info/shadow.txt.trashinfo"),
+            "[Trash Info]\nPath=shadow.txt\nDeletionDate=2026-01-02T03:04:05\n",
+        )
+        .unwrap();
+        std::fs::write(shadow_root.join("files/shadow.txt"), b"s").unwrap();
+
+        let candidates = [data_home.path().to_path_buf()];
+        let filtered = dedup_and_exclude_home_dev(data_home.path(), &candidates);
+        assert!(
+            filtered.is_empty(),
+            "xdg_data_home's own path must be excluded from the candidate \
+             list before list_entries_from_candidate_topdirs ever sees it: \
+             {filtered:?}"
+        );
+
+        // The real public entry point, end to end: this must not surface
+        // the shadow root's entry (list_trash_entries never scans
+        // $xdg_data_home/.Trash-$uid as its own home trash -- only
+        // $xdg_data_home/Trash). Checked by content rather than requiring
+        // the whole result to be empty, since the real
+        // /proc/self/mountinfo this exercises may legitimately have other,
+        // unrelated real trash entries on whatever machine runs this test.
+        let entries = list_trash_entries(data_home.path()).unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.original_path == data_home.path().join("shadow.txt")),
+            "a .Trash-$uid living directly inside xdg_data_home is not \
+             $xdg_data_home/Trash and must not appear: {entries:?}"
+        );
     }
 }
