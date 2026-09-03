@@ -23,10 +23,11 @@ use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
     input::{Input, InputState},
-    layout::{Root, TitleBar, WindowExt, h_flex, v_flex},
+    layout::{Root, WindowExt, h_flex, v_flex},
     list::{IndexPath, List, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel},
     theme::{ActiveTheme as _, TokenPalette},
+    titlebar::DuetTitleBar,
     toast::Notification,
 };
 use futures_util::StreamExt;
@@ -299,15 +300,15 @@ pub fn run() {
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         // The window's own titlebar text/traffic-light metadata --
-        // `TitleBar::title_bar_options()`'s own defaults
+        // `DuetTitleBar::title_bar_options()`'s own defaults
         // (`appears_transparent`/`traffic_light_position`) are tuned to
-        // match the `duet_widgets::layout::TitleBar` element this window
-        // renders as its own root child below; only `title` is overridden
-        // here since that default is deliberately `None` (a bare-bones
-        // titlebar embedder has nowhere to put a title string, so the
-        // element itself renders one instead -- see this window's root
-        // `TitleBar::new().child(...)` call).
-        let mut titlebar = TitleBar::title_bar_options();
+        // match the `duet_widgets::titlebar::DuetTitleBar` element this
+        // window renders as its own root child below; only `title` is
+        // overridden here since that default is deliberately `None` (a
+        // bare-bones titlebar embedder has nowhere to put a title string,
+        // so the element itself renders one instead -- see this window's
+        // root `DuetTitleBar::new().child(...)` call).
+        let mut titlebar = DuetTitleBar::title_bar_options();
         titlebar.title = Some(SharedString::from("Duet"));
         cx.open_window(
             WindowOptions {
@@ -3190,13 +3191,14 @@ impl Render for Workspace {
             // window to *client* decorations unless the compositor
             // explicitly negotiates server-side ones (most Wayland
             // compositors don't) -- without this, there is no drag-to-
-            // move, minimize, or maximize at all, and the window can only
-            // be resized via `Root`'s own already-decoration-aware
-            // `window_border()` edge hit-testing (`duet_widgets::layout`'s
-            // own doc comment has the full story). `TitleBar::new()`'s own
-            // `WindowControls` no-ops into native traffic lights on macOS
-            // and is Linux-only in practice for this project.
-            .child(TitleBar::new().child(gpui::div().px_2().child("Duet")))
+            // move or minimize at all, and the window can only be resized
+            // via `Root`'s own already-decoration-aware `window_border()`
+            // edge hit-testing (`duet_widgets::layout`'s own doc comment
+            // has the full story). No maximize control here deliberately
+            // -- `duet_widgets::titlebar`'s own doc comment has the full
+            // story on the reproduced vendored-engine freeze/crash that
+            // motivated leaving it out.
+            .child(DuetTitleBar::new().child(gpui::div().px_2().child("Duet")))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))

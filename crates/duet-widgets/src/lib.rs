@@ -26,6 +26,7 @@ pub mod resizable;
 pub mod select;
 pub mod table;
 pub mod theme;
+pub mod titlebar;
 pub mod toast;
 
 /// Initialise `gpui-component`'s global state for this process.
