@@ -17,7 +17,7 @@ use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
 use duet_ops::{
     ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, JournalReader,
-    ProgressSnapshot, QueueManager, RecoveryReport,
+    ProgressSnapshot, QueueManager, RecoveryReport, TrashEntry, list_trash_entries,
 };
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
@@ -60,6 +60,7 @@ use crate::panel::{Panel, bind_panel_keys};
 use crate::recovery_dialog::{RecoveryDialogState, bind_recovery_dialog_keys};
 use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
+use crate::trash_dialog::{TrashDialogState, bind_trash_dialog_keys};
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
 // splitter ratio without touching the mouse. Bound below to `ctrl-left`/
@@ -219,6 +220,19 @@ actions!(
 // timestamp fields), not separate top-level commands.
 actions!(duet_workspace, [AttributesDialog]);
 
+// T-5.3.2 phase 2's trash browser (`trash.open_browser`, `docs/commands.md`'s
+// `app`-context row -- no panel focus required, same reasoning `Ctrl+D`
+// (`OpenHotlist`)/`Ctrl+Shift+P` (`OpenCommandPalette`) already establish
+// for a Workspace-scoped trigger that must fire regardless of which panel
+// currently holds focus). `Alt+T` is this module's own disclosed default:
+// Total Commander has no comparable trash-browser feature, so
+// `docs/keymap-tc.csv` has no row to follow, and `Alt+T` is unclaimed by
+// every `KeyBinding::new` call site in this crate at *any* scope (checked
+// directly, not just at `"Workspace"`) -- unlike, say, `Ctrl+T` (`Panel`'s
+// own "new tab"), which would silently never fire here while a panel holds
+// focus, since the nearer context's binding always wins first.
+actions!(duet_workspace, [OpenTrashDialog]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -249,6 +263,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SymlinkDialog, Some("Workspace")),
         KeyBinding::new("ctrl-shift-h", HardlinkDialog, Some("Workspace")),
         KeyBinding::new("ctrl-a", AttributesDialog, Some("Workspace")),
+        KeyBinding::new("alt-t", OpenTrashDialog, Some("Workspace")),
     ]);
 }
 
@@ -280,6 +295,7 @@ pub fn run() {
         bind_conflict_dialog_keys(cx);
         bind_attributes_dialog_keys(cx);
         bind_recovery_dialog_keys(cx);
+        bind_trash_dialog_keys(cx);
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         cx.open_window(
@@ -614,6 +630,16 @@ pub struct Workspace {
     /// no `_deferred` sibling; see `crate::recovery_dialog`'s module doc
     /// comment for why its own async continuations never need one.
     recovery_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.3.2 phase 2's trash browser is open. See
+    /// `crate::trash_dialog`'s module doc comment for the full
+    /// architecture, including why (unlike `recovery_dialog` above) it has
+    /// no `_deferred` close sibling.
+    trash_dialog: Option<Entity<TrashDialogState>>,
+    /// Saved by `open_trash_dialog`'s continuation on the path that
+    /// actually shows the dialog, restored and cleared by
+    /// `close_trash_dialog`.
+    trash_dialog_previous_focus: Option<FocusHandle>,
 
     /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
     /// `"never"`), read once at startup the same way every other
@@ -1178,6 +1204,8 @@ impl Workspace {
             attributes_dialog_previous_focus: None,
             recovery_dialog,
             recovery_dialog_previous_focus,
+            trash_dialog: None,
+            trash_dialog_previous_focus: None,
             confirm_delete,
             delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
@@ -2490,6 +2518,118 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `trash.open_browser` (`Alt+T`): scans the real trash
+    /// (`duet_ops::list_trash_entries`) off the UI thread and, once that
+    /// succeeds, shows T-5.3.2 phase 2's browser dialog. See
+    /// `crate::trash_dialog`'s module doc comment for why this is
+    /// asynchronous (unlike `open_delete_dialog`'s synchronous directory
+    /// check) and for why an empty scan still opens the dialog rather than
+    /// silently declining to.
+    ///
+    /// A no-op if the dialog is already open, or if `$XDG_DATA_HOME` can't
+    /// even be resolved (the same rare XDG-resolution failure every other
+    /// path in this file tolerates) -- both surfaced the same way every
+    /// sibling "can't even start" case is: a toast, not a panic.
+    fn open_trash_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trash_dialog.is_some() {
+            return;
+        }
+        let xdg_data_home = match duet_config::paths::xdg_data_home() {
+            Ok(dir) => dir,
+            Err(err) => {
+                window.push_notification(
+                    Notification::error(format!("Can't locate the trash: {err}")),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tokio_handle.spawn(async move {
+            let result = list_trash_entries(&xdg_data_home);
+            let _ = tx.send(result);
+        });
+        let weak_workspace = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let outcome = rx.await;
+                let _ =
+                    weak_workspace.update_in(
+                        cx,
+                        |this: &mut Workspace, window, cx| match outcome {
+                            Ok(Ok(mut entries)) => {
+                                entries.sort_by_key(|e| std::cmp::Reverse(e.deleted_at));
+                                this.show_trash_dialog(entries, window, cx);
+                            }
+                            Ok(Err(err)) => {
+                                this.push_pending_notice(
+                                    NoticeLevel::Error,
+                                    format!("Couldn't read the trash: {err}"),
+                                    cx,
+                                );
+                            }
+                            Err(_) => {
+                                this.push_pending_notice(
+                                    NoticeLevel::Error,
+                                    "The trash scan task was dropped before completing."
+                                        .to_string(),
+                                    cx,
+                                );
+                            }
+                        },
+                    );
+            })
+            .detach();
+    }
+
+    /// Constructs, stores and focuses the trash dialog --
+    /// [`Self::open_trash_dialog`]'s one "actually show it" path, reached
+    /// only from that method's own scan continuation (which always has a
+    /// live `Window` -- see `crate::trash_dialog`'s module doc comment).
+    fn show_trash_dialog(
+        &mut self,
+        entries: Vec<TrashEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.trash_dialog.is_some() {
+            return;
+        }
+        self.trash_dialog_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let queue = self.queue.clone();
+        let state_dir = self.state_dir.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let state = cx.new(|cx| {
+            TrashDialogState::new(
+                entries,
+                workspace,
+                tokio_handle,
+                queue,
+                state_dir,
+                conflict_resolver,
+                window,
+                cx,
+            )
+        });
+        self.trash_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// Closes T-5.3.2 phase 2's trash browser -- Escape's path. There is
+    /// deliberately no `close_trash_dialog_deferred`; see
+    /// `crate::trash_dialog`'s module doc comment for why nothing in that
+    /// dialog ever needs one.
+    pub(crate) fn close_trash_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.trash_dialog = None;
+        if let Some(handle) = self.trash_dialog_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
     /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
     /// "does `parent` match either panel's already-loaded directory" half
     /// -- see that method's own doc comment for the full picture (T-5.2.1's
@@ -3035,6 +3175,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenOperationManager, window, cx| {
                 this.open_operation_manager(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenTrashDialog, window, cx| {
+                this.open_trash_dialog(window, cx);
+            }))
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
@@ -3074,6 +3217,9 @@ impl Render for Workspace {
             })
             .when_some(self.recovery_dialog.clone(), |this, state| {
                 this.child(recovery_dialog_overlay(&state, cx))
+            })
+            .when_some(self.trash_dialog.clone(), |this, state| {
+                this.child(trash_dialog_overlay(&state, cx))
             })
     }
 }
@@ -3450,6 +3596,43 @@ fn recovery_dialog_overlay(
                 .child(state.clone())
                 .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
                     this.close_recovery_dialog(window, cx);
+                })),
+        )
+}
+
+/// T-5.3.2 phase 2's trash browser overlay -- same `.occlude()`-backdrop/
+/// card chrome as [`recovery_dialog_overlay`] (see `command_palette_overlay`'s
+/// own doc comment for the full reasoning). A click on the backdrop closes
+/// the dialog exactly like Escape does; unlike escaping the recovery
+/// dialog, there is nothing this ever "resolves nothing" about -- see
+/// `crate::trash_dialog`'s module doc comment.
+fn trash_dialog_overlay(
+    state: &Entity<TrashDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("trash-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("trash-dialog-card")
+                .occlude()
+                .w(px(560.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_trash_dialog(window, cx);
                 })),
         )
 }
@@ -4238,6 +4421,12 @@ mod tests {
         CloseRecoveryDialog, RecoveryDialogCursorDown, RecoveryDialogCursorUp,
         RecoveryDialogDiscard, RecoveryDialogResume, RecoveryDialogToggleInspect,
     };
+    // T-5.3.2 phase 2's own overlay-internal actions -- same reasoning as
+    // the imports above: declared in `crate::trash_dialog`, not here.
+    use crate::trash_dialog::{
+        TrashDialogCursorDown, TrashDialogDeleteSelected, TrashDialogEmpty, TrashDialogRestore,
+        TrashDialogToggleMark,
+    };
     use duet_ops::{
         ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictScope, Journal, JournalRecord,
         StepOutcome,
@@ -4368,6 +4557,7 @@ mod tests {
             bind_conflict_dialog_keys(cx);
             bind_attributes_dialog_keys(cx);
             bind_recovery_dialog_keys(cx);
+            bind_trash_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -9003,5 +9193,370 @@ mod tests {
                 );
             },
         );
+    }
+
+    // -- T-5.3.2 phase 2: trash browser ------------------------------------
+
+    fn trash_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<TrashDialogState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.trash_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.trash_dialog.clone())
+            .expect("the trash dialog must be open by now")
+    }
+
+    /// Writes `name` under `dir`, trashes it end-to-end through the real
+    /// F8 delete dialog (trash mode -- the caller is expected to have
+    /// configured `delete_settings("trash", "always", true)` or
+    /// equivalent), and returns its real on-disk path once it's confirmed
+    /// gone. The shared seeding step every trash-browser test below needs,
+    /// per this task's own instruction to seed through a real
+    /// `duet_ops::plan_delete`/`DeleteMode::Trash` job run through the real
+    /// executor rather than hand-writing `.trashinfo` files.
+    fn seed_trashed_file(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        dir: &Path,
+        name: &str,
+    ) -> PathBuf {
+        let victim = dir.join(name);
+        std::fs::write(&victim, name.as_bytes()).unwrap();
+        focus_left_panel_at(workspace, vcx, dir);
+        vcx.dispatch_action(DeleteDialog);
+        let _ = open_delete_dialog_state(workspace, vcx);
+        vcx.dispatch_action(ConfirmDelete);
+        wait_until(vcx, |vcx| {
+            !victim.exists() && workspace.read_with(vcx, |ws, _| ws.delete_dialog.is_none())
+        });
+        victim
+    }
+
+    /// Real trashed entries on disk (seeded via the real F8-trash path),
+    /// `Alt+T` opens the browser, and it lists them sorted newest-first --
+    /// the two seeds are separated by a real >1s sleep since `.trashinfo`'s
+    /// own `DeletionDate` only has one-second resolution.
+    #[gpui::test]
+    fn opening_the_trash_browser_shows_real_entries_sorted_newest_first(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                seed_trashed_file(&workspace, vcx, dir.path(), "old.txt");
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+                seed_trashed_file(&workspace, vcx, dir.path(), "new.txt");
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                state.read_with(vcx, |state, _| {
+                    let entries = state.entries();
+                    assert_eq!(entries.len(), 2, "{entries:?}");
+                    assert_eq!(
+                        entries[0].original_path.file_name().unwrap(),
+                        "new.txt",
+                        "the more recently deleted entry must sort first"
+                    );
+                    assert_eq!(entries[1].original_path.file_name().unwrap(), "old.txt");
+                });
+            },
+        );
+    }
+
+    /// Restoring the cursor entry (nothing marked) moves the real content
+    /// back to `original_path` on real disk and removes it from the
+    /// dialog's own list.
+    #[gpui::test]
+    fn restoring_the_cursor_entry_moves_it_back_and_removes_it_from_the_list(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let victim = seed_trashed_file(&workspace, vcx, dir.path(), "a.txt");
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(TrashDialogRestore);
+                wait_until(vcx, |vcx| {
+                    victim.exists() && state.read_with(vcx, |s, _| s.entries().is_empty())
+                });
+                assert_eq!(std::fs::read(&victim).unwrap(), b"a.txt");
+            },
+        );
+    }
+
+    /// A marked multi-entry restore restores every marked entry and leaves
+    /// every unmarked one alone -- `docs/commands.md`'s own
+    /// `selection.nonempty` precondition for `trash.restore`.
+    #[gpui::test]
+    fn restoring_a_marked_set_restores_every_marked_entry_and_leaves_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let a = seed_trashed_file(&workspace, vcx, dir.path(), "a.txt");
+                let b = seed_trashed_file(&workspace, vcx, dir.path(), "b.txt");
+                let c = seed_trashed_file(&workspace, vcx, dir.path(), "c.txt");
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                // Mark the cursor row and the one right after it, leaving
+                // the third entry unmarked -- which two that ends up being
+                // (deletion order can tie within the same second) doesn't
+                // matter: the assertions below check every path against
+                // the dialog's own recorded marked set, not a hard-coded
+                // name.
+                vcx.dispatch_action(TrashDialogToggleMark);
+                vcx.dispatch_action(TrashDialogCursorDown);
+                state.read_with(vcx, |s, _| assert_eq!(s.cursor(), 1));
+                vcx.dispatch_action(TrashDialogToggleMark);
+
+                let marked_names: std::collections::HashSet<String> =
+                    state.read_with(vcx, |s, _| {
+                        (0..s.entries().len())
+                            .filter(|&ix| s.is_marked(ix))
+                            .map(|ix| {
+                                s.entries()[ix]
+                                    .original_path
+                                    .file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                            .collect()
+                    });
+                assert_eq!(marked_names.len(), 2, "{marked_names:?}");
+
+                vcx.dispatch_action(TrashDialogRestore);
+                wait_until(vcx, |vcx| {
+                    state.read_with(vcx, |s, _| s.entries().len() == 1)
+                });
+
+                for path in [&a, &b, &c] {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    if marked_names.contains(&name) {
+                        assert!(path.exists(), "{name} should have been restored");
+                    } else {
+                        assert!(!path.exists(), "{name} should still be in the trash");
+                    }
+                }
+            },
+        );
+    }
+
+    /// The AC's own "recreates it" clause, end to end through the dialog:
+    /// restoring into a path whose parent directory no longer exists
+    /// recreates that parent and still lands the file at the right place.
+    #[gpui::test]
+    fn restoring_into_a_deleted_parent_recreates_it(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                let sub = dir.path().join("sub");
+                std::fs::create_dir(&sub).unwrap();
+                let victim = seed_trashed_file(&workspace, vcx, &sub, "a.txt");
+                std::fs::remove_dir(&sub).unwrap();
+                assert!(!sub.exists());
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(TrashDialogRestore);
+                wait_until(vcx, |vcx| {
+                    victim.exists() && state.read_with(vcx, |s, _| s.entries().is_empty())
+                });
+                assert!(sub.is_dir(), "the deleted parent must have been recreated");
+            },
+        );
+    }
+
+    /// The AC's other clause -- "...or reports clearly": when the parent
+    /// genuinely can't be recreated (a permission-denied ancestor), the
+    /// entry must survive in the dialog's own list rather than vanishing
+    /// as if it had been restored. The job's own `JobEvent::Finished`
+    /// failure toast is this app's general "reports clearly" mechanism
+    /// (already exercised directly, without a GPUI dialog in the loop, by
+    /// `duet_ops::trash_restore`'s own
+    /// `restore_reports_clearly_when_parent_recreation_fails` test) -- this
+    /// test's own job is only to prove the *dialog* doesn't optimistically
+    /// drop the entry.
+    #[gpui::test]
+    fn restoring_when_parent_recreation_fails_keeps_the_entry_in_the_list(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let dir = tempfile::tempdir().unwrap();
+                let locked = dir.path().join("locked");
+                std::fs::create_dir(&locked).unwrap();
+                let sub = locked.join("newdir");
+                std::fs::create_dir(&sub).unwrap();
+                let victim = seed_trashed_file(&workspace, vcx, &sub, "a.txt");
+                std::fs::remove_dir(&sub).unwrap();
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(TrashDialogRestore);
+                wait_until(vcx, |vcx| !state.read_with(vcx, |s, _| s.busy()));
+
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+                state.read_with(vcx, |s, _| {
+                    assert_eq!(
+                        s.entries().len(),
+                        1,
+                        "a genuinely failed restore must not vanish from the list"
+                    );
+                });
+                assert!(!victim.exists(), "content must never have moved");
+            },
+        );
+    }
+
+    /// `trash.empty` requires its own confirmation: a single `E` only arms
+    /// it (nothing destroyed yet); a second `E` within the confirmation
+    /// window actually empties the trash.
+    #[gpui::test]
+    fn empty_requires_pressing_e_twice_before_purging_anything(cx: &mut TestAppContext) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                seed_trashed_file(&workspace, vcx, dir.path(), "a.txt");
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(TrashDialogEmpty);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                state.read_with(vcx, |s, _| {
+                    assert!(s.confirm_armed(), "the first E must only arm, not fire");
+                    assert_eq!(s.entries().len(), 1, "arming must not delete anything");
+                });
+
+                vcx.dispatch_action(TrashDialogEmpty);
+                wait_until(vcx, |vcx| {
+                    state.read_with(vcx, |s, _| s.entries().is_empty())
+                });
+            },
+        );
+    }
+
+    /// Same confirmation gate, `trash.delete_selected`'s own `D` this time,
+    /// scoped to the marked-or-cursor target set rather than the whole
+    /// trash.
+    #[gpui::test]
+    fn delete_selected_requires_pressing_d_twice_before_purging_the_target(
+        cx: &mut TestAppContext,
+    ) {
+        with_configured_workspace(
+            cx,
+            Some(&delete_settings("trash", "always", true)),
+            |workspace, vcx, _data_dir| {
+                let dir = tempfile::tempdir().unwrap();
+                seed_trashed_file(&workspace, vcx, dir.path(), "a.txt");
+                seed_trashed_file(&workspace, vcx, dir.path(), "b.txt");
+
+                vcx.dispatch_action(OpenTrashDialog);
+                let state = trash_dialog_state(&workspace, vcx);
+
+                vcx.dispatch_action(TrashDialogDeleteSelected);
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                state.read_with(vcx, |s, _| {
+                    assert!(s.confirm_armed(), "the first D must only arm, not fire");
+                    assert_eq!(s.entries().len(), 2, "arming must not delete anything");
+                });
+
+                vcx.dispatch_action(TrashDialogDeleteSelected);
+                wait_until(vcx, |vcx| {
+                    state.read_with(vcx, |s, _| s.entries().len() == 1)
+                });
+            },
+        );
+    }
+
+    /// An empty trash still opens the browser (rather than the keypress
+    /// silently doing nothing), showing an empty list -- see
+    /// `crate::trash_dialog`'s module doc comment for why this dialog
+    /// chooses that over declining to open at all.
+    #[gpui::test]
+    fn opening_the_browser_on_an_empty_trash_still_opens_it(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            focus_left_panel(&workspace, vcx);
+            vcx.dispatch_action(OpenTrashDialog);
+            let state = trash_dialog_state(&workspace, vcx);
+            state.read_with(vcx, |s, _| assert!(s.entries().is_empty()));
+        });
+    }
+
+    /// A genuine `duet_ops::TrashError` from the scan (the trash `info`
+    /// directory exists but can't be read at all, per `duet_platform::
+    /// trash::list_trash_entries`'s own documented error case -- distinct
+    /// from a single malformed `.trashinfo`, which phase 1's own
+    /// `list_trash_entries` already tolerates and skips, not something this
+    /// test re-proves) surfaces a notice rather than crashing, and the
+    /// dialog does not open with whatever partial/garbage data.
+    #[gpui::test]
+    fn a_trash_scan_failure_surfaces_a_notice_and_does_not_open_the_dialog(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let data_dir = duet_config::paths::xdg_data_home().unwrap();
+            let info_dir = data_dir.join("Trash").join("info");
+            std::fs::create_dir_all(&info_dir).unwrap();
+            std::fs::set_permissions(&info_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            if std::fs::read_dir(&info_dir).is_ok() {
+                // Running as a user (root, e.g.) that can read a mode-000
+                // directory regardless -- this environment can't verify
+                // the failure path, so this test degrades to a no-op
+                // rather than asserting something false. Same "don't claim
+                // untested results" convention `duet_platform::trash`'s own
+                // permission-dependent tests already follow.
+                eprintln!(
+                    "a_trash_scan_failure_surfaces_a_notice_and_does_not_open_the_dialog: \
+                     running as a user that can read a mode-000 directory -- not verified here"
+                );
+                std::fs::set_permissions(&info_dir, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                return;
+            }
+
+            focus_left_panel(&workspace, vcx);
+            vcx.dispatch_action(OpenTrashDialog);
+            wait_until(vcx, |vcx| {
+                vcx.update(|window, cx| window.notifications(cx).len()) > 0
+            });
+
+            std::fs::set_permissions(&info_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.trash_dialog.is_none(),
+                    "a scan that fails outright must not open the dialog"
+                );
+            });
+        });
     }
 }

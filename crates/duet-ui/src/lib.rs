@@ -34,6 +34,7 @@ pub mod panel;
 mod recovery_dialog;
 mod rename_dialog;
 mod theme_controller;
+mod trash_dialog;
 mod workspace;
 
 pub use workspace::run;
