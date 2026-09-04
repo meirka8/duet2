@@ -131,3 +131,17 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Vendored, patched copies of two crates.io dependencies (ADR-007) -- see
+# vendor/README.md for the why, the exact patch, and the re-apply recipe.
+# Both are the *same versions* the pins resolve to anyway (gpui 0.2.2 via
+# duet-widgets/duet-ui, blade-graphics 0.7.1 via gpui), so this changes no
+# API surface: it only adds the missing "recreate the swapchain when Vulkan
+# reports it out of date" handling, without which the window freezes on
+# GNOME/Mutter Wayland after maximize/fullscreen (a compositor dmabuf-
+# feedback change makes Mesa retire the swapchain). Bumping either crate
+# is its own deliberate task (ADR-003) and must re-apply or retire these
+# patches -- vendor/README.md has the verification recipe.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
+blade-graphics = { path = "vendor/blade-graphics" }
