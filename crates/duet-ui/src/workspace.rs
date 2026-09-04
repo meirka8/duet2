@@ -348,6 +348,8 @@ pub fn run() {
                 let handle = left_panel.read(cx).active_focus_handle(cx);
                 window.focus(&handle);
 
+                spawn_window_chrome_cycle_if_requested(window, cx);
+
                 // `gpui-component` widgets (the command-line `Input` among
                 // them -- see `duet_widgets::layout::Root`'s doc comment)
                 // call into `Root::read`/`Root::update` internally and
@@ -359,6 +361,58 @@ pub fn run() {
         )
         .expect("failed to open the Duet window");
     });
+}
+
+/// Diagnostics-only hook for the Wayland out-of-date swapchain freeze
+/// (ADR-007, `vendor/README.md`'s verification recipe): when
+/// `DUET_DEBUG_CHROME_CYCLE_MS=<ms>` is set, the window toggles fullscreen
+/// on, off, then maximize, restore, every `<ms>` milliseconds for the life
+/// of the process. Each of those transitions makes GNOME/Mutter re-send
+/// the surface's dmabuf feedback, which is what retires the swapchain --
+/// the actual trigger otherwise depends on pointer/focus timing that is
+/// awkward to drive by hand, so this exists to make the bump gate (ADR-003)
+/// reproducible without clicking. Inert unless the variable is set; the
+/// value is parsed leniently (anything unparsable means 4000ms) because a
+/// diagnostics switch that panics on a typo helps nobody.
+fn spawn_window_chrome_cycle_if_requested(window: &mut Window, cx: &mut App) {
+    let Ok(raw) = std::env::var("DUET_DEBUG_CHROME_CYCLE_MS") else {
+        return;
+    };
+    let period = Duration::from_millis(raw.trim().parse().unwrap_or(4000));
+    tracing::warn!(
+        ?period,
+        "DUET_DEBUG_CHROME_CYCLE_MS set: cycling fullscreen/maximize for diagnostics"
+    );
+    window
+        .spawn(cx, async move |cx| {
+            let mut step: u32 = 0;
+            loop {
+                cx.background_executor().timer(period).await;
+                let fullscreen = step % 4 < 2;
+                tracing::warn!(
+                    step,
+                    action = if fullscreen {
+                        "toggle_fullscreen"
+                    } else {
+                        "zoom_window"
+                    },
+                    "DEBUG: step {step}: window chrome cycle"
+                );
+                let updated = cx.update(|window, _cx| {
+                    if fullscreen {
+                        window.toggle_fullscreen();
+                    } else {
+                        window.zoom_window();
+                    }
+                });
+                if updated.is_err() {
+                    // The window is gone; nothing left to cycle.
+                    return;
+                }
+                step = step.wrapping_add(1);
+            }
+        })
+        .detach();
 }
 
 /// The splitter ratio never collapses a panel entirely -- keeps at least
