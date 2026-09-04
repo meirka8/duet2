@@ -5602,14 +5602,15 @@ mod tests {
             // served_not_dropped` hung this way for the full nextest
             // timeout on 2026-09-04 (thread dump: the test thread mid-
             // draw under `run_until_parked`, both Tokio workers parked
-            // in `ConflictResolver::resolve`). A bounded tick makes
-            // progress on the test's own terms regardless of how fast
-            // the machine draws.
-            for _ in 0..32 {
-                if !vcx.background_executor.tick() {
-                    break;
-                }
-            }
+            // in `ConflictResolver::resolve`). The bound is a *time*
+            // budget, not a tick count: on a slow machine every tick can
+            // be a full draw, and a fixed count of those blew straight
+            // through the 5s deadline before `condition` was checked
+            // even once (6/6 failures pinned to 4 cores). This way the
+            // condition is re-checked at least every ~50ms of executor
+            // work regardless of how fast the machine draws.
+            let budget = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            while std::time::Instant::now() < budget && vcx.background_executor.tick() {}
             // T-5.2.1 (post-UAT): `Workspace::render`-only state (e.g.
             // `pending_panel_refresh`) only actually gets drained by a
             // real draw pass, not merely by `run_until_parked` letting
@@ -6268,11 +6269,15 @@ mod tests {
             });
             let fs: Arc<dyn FileSystem> = Arc::new(SlowLocalFs {
                 inner: LocalFs,
-                delay: Duration::from_millis(400),
+                // Wide enough that a draw or two on a slow machine cannot
+                // eat the whole first file's delay before the manager gets
+                // to observe `Running`; small enough that the Pause/Resume
+                // round trip (resume restarts the interrupted file) still
+                // finishes well inside the 5s `wait_until` deadlines.
+                delay: Duration::from_millis(700),
             });
             let src = crate::file_table::local_vpath(source_dir.path()).unwrap();
             let dst = crate::file_table::local_vpath(dest_dir.path()).unwrap();
-            let job_id = enqueue_slow_copy(&tokio_handle, queue.clone(), fs, src, dst, state_dir);
 
             focus_left_panel(&workspace, vcx);
             vcx.dispatch_action(OpenOperationManager);
@@ -6280,6 +6285,16 @@ mod tests {
             let state = workspace
                 .read_with(vcx, |ws, _| ws.operation_manager.clone())
                 .expect("Ctrl+O must open the manager");
+            // Enqueue only now, with the manager already open: everything
+            // above draws at least twice, and on a slow machine (a 4-core
+            // CI runner; this workstation pinned to 4 cores) those draws
+            // alone take longer than the fixture's whole artificial
+            // delay, so a job enqueued first was already `Terminal` by the
+            // first check below (instrumented 2026-09-04: `Completed, 3
+            // files` at t=75ms). The manager reads the live queue snapshot
+            // on every render, so a job that appears after it opened is
+            // observed exactly the same way.
+            let job_id = enqueue_slow_copy(&tokio_handle, queue.clone(), fs, src, dst, state_dir);
 
             // The manager must observe the job actually `Running` ...
             wait_until(vcx, |vcx| {
@@ -6326,7 +6341,20 @@ mod tests {
             });
 
             // And `job_progress` must have evicted this job's entry once
-            // it finished -- see that field's own doc comment.
+            // it finished -- see that field's own doc comment. Waited for,
+            // not asserted outright: the two waits above observe the
+            // *queue* (updated synchronously on the Tokio side), while the
+            // eviction happens when the workspace's own event consumer
+            // gets to the `Finished` event -- one event per executor tick,
+            // behind whatever `Progress` samples are still queued ahead of
+            // it. Once the UI has caught up, the entry must be gone and
+            // must stay gone (the executor now awaits its aborted sampler
+            // before sending `Finished`, so no trailing sample can
+            // resurrect it).
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.job_progress_snapshot(job_id).is_none())
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
             workspace.read_with(vcx, |ws, _| {
                 assert!(
                     ws.job_progress_snapshot(job_id).is_none(),
