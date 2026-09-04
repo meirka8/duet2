@@ -258,14 +258,20 @@ mod tests {
         // MAX_BATCH_HOLD + slack, counting how many coalesced batches it
         // took and confirming we're nowhere near "one update per file".
         let mut batches = 0usize;
-        let mut total_paths = 0usize;
+        // A *set*, not a running count: `fs::write` is create + write +
+        // close, and when a batch boundary falls between those events the
+        // same path legitimately appears in two consecutive batches (each
+        // batch is deduplicated, the stream as a whole is not). Observed
+        // on a GitHub runner on 2026-09-04; never on a fast workstation,
+        // where all 10k complete inside one hold window.
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
         let mut saw_rescan = false;
         let drain_start = Instant::now();
         loop {
             match watcher.recv_timeout(MAX_BATCH_HOLD + Duration::from_millis(200)) {
                 Some(WatchUpdate::Changed(paths)) => {
                     batches += 1;
-                    total_paths += paths.len();
+                    seen_paths.extend(paths);
                 }
                 Some(WatchUpdate::RescanNeeded) => {
                     // A busy CI box's inotify queue overflowing under
@@ -289,8 +295,9 @@ mod tests {
         );
         if !saw_rescan {
             assert_eq!(
-                total_paths, N,
-                "every created path should be observed exactly once across all batches"
+                seen_paths.len(),
+                N,
+                "every created path should be observed at least once across all batches"
             );
         }
         // The whole drain (from first write to quiescence) must complete

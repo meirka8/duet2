@@ -474,12 +474,23 @@ mod tests {
         );
     }
 
+    /// `$TMPDIR` is tmpfs on a workstation but the ext4 root disk on a CI
+    /// runner, so this probes `/dev/shm` (tmpfs on every mainstream Linux)
+    /// and skips loudly if even that isn't one -- same helper as
+    /// `probe::tests::tmpfs_tempdir`.
     #[test]
     fn probe_fs_properties_reports_tmpfs() {
-        let dir = TempDir::new().unwrap();
+        let Ok(dir) = TempDir::new_in("/dev/shm") else {
+            eprintln!("skipping probe_fs_properties_reports_tmpfs: no /dev/shm");
+            return;
+        };
         let root = VPath::local(UnixPathBuf::new(dir.path().to_str().unwrap()).unwrap());
         let fs = LocalFs;
         let props = fs.probe_fs_properties(&root).unwrap();
+        if props.kind != crate::local::FsKind::Tmpfs {
+            eprintln!("skipping probe_fs_properties_reports_tmpfs: /dev/shm is not tmpfs here");
+            return;
+        }
         assert_eq!(props.kind, crate::local::FsKind::Tmpfs);
     }
 }

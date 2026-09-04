@@ -467,7 +467,7 @@ impl JournalReader {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use duet_types::{UnixPathBuf, VPath};
     use tempfile::TempDir;
@@ -908,7 +908,22 @@ mod tests {
             .spawn()
             .expect("failed to spawn crash-test child");
 
-        std::thread::sleep(Duration::from_millis(30));
+        // Kill only once the child has demonstrably written *something*:
+        // a fixed delay is a race against process start-up plus one
+        // fsync per record, which on a CI runner's ext4 root disk can
+        // exceed 30ms before the first Intent lands (observed 2026-09-04:
+        // an empty journal, `reports.len() == 0`). Waiting for the file
+        // to pass a few KiB guarantees the kill hits the intents-only
+        // phase -- 10 million records lie ahead of it -- on any machine.
+        let journal_path = dir.path().join("jobs").join("99.journal");
+        let wait_start = Instant::now();
+        while std::fs::metadata(&journal_path).map_or(0, |m| m.len()) < 4096 {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(10),
+                "the crash-test child wrote fewer than 4 KiB of journal in 10s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         child
             .kill()
             .expect("failed to SIGKILL the crash-test child");
