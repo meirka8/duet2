@@ -3250,7 +3250,26 @@ impl Render for Workspace {
             // own doc comment has the full story). `TitleBar::new()`'s own
             // `WindowControls` no-ops into native traffic lights on macOS
             // and is Linux-only in practice for this project.
-            .child(TitleBar::new().child(gpui::div().px_2().child("Duet")))
+            // UAT regression: this root's own `.track_focus(..)` above makes
+            // GPUI register an automatic "focus me on mouse-down" listener
+            // for the whole root, and the titlebar is a plain child of it
+            // with no focus story of its own -- so every click on the drag
+            // region (a window move, or the double-click that maximizes on
+            // Linux) bubbled up and handed keyboard focus to the workspace
+            // root, silently deactivating whichever panel had it. GPUI's
+            // documented opt-out is `prevent_default()` from a mouse-down
+            // listener that runs before the root's (bubble phase runs
+            // innermost-first, so this wrapper's listener does). It only
+            // suppresses that focus transfer: `TitleBar`'s own listeners
+            // (drag-to-move, double-click-to-maximize) and its control
+            // icons' `on_click` handlers are explicit listeners, unaffected.
+            .child(
+                gpui::div()
+                    .on_mouse_down(gpui::MouseButton::Left, |_event, window, _cx| {
+                        window.prevent_default();
+                    })
+                    .child(TitleBar::new().child(gpui::div().px_2().child("Duet"))),
+            )
             .child(gpui::div().flex_1().p_2().child(self.dual_pane(window, cx)))
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
@@ -4747,6 +4766,45 @@ mod tests {
             });
         });
     }
+
+    /// UAT regression (window chrome): a click on the titlebar's drag
+    /// region -- what starts a window move, and what a double-click
+    /// maximizes through on Linux -- must not move keyboard focus off the
+    /// active panel. `Workspace`'s root `.track_focus(..)` makes GPUI
+    /// register an automatic "focus me on mouse-down" listener for the
+    /// whole root, and the titlebar is a child of that root with no focus
+    /// story of its own, so without an explicit opt-out every titlebar
+    /// click bubbled up and handed focus to the workspace root instead.
+    #[gpui::test]
+    fn clicking_the_titlebar_drag_region_keeps_panel_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            focus_left_panel(&workspace, vcx);
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+
+            // Well inside the bar (34px tall), far from the control icons
+            // at its right edge.
+            vcx.simulate_click(gpui::point(px(300.), px(17.)), gpui::Modifiers::default());
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "a titlebar click must leave keyboard focus on the panel that had it"
+                );
+            });
+        });
+    }
+
+    // The maximize/minimize control icons themselves are deliberately not
+    // clicked here: GPUI's test platform leaves `TestWindow::zoom` and
+    // `::minimize` as `unimplemented!()`, so a simulated click on either
+    // panics inside gpui rather than exercising anything of ours. Their
+    // focus story is covered by reading, not by test: `gpui-component`'s
+    // `ControlIcon` calls `window.prevent_default()` from its own
+    // mouse-down listener (the same opt-out the wrapper in
+    // `Workspace::render` uses for the drag region), so those clicks never
+    // reached the root's focus-transfer listener even before this fix.
 
     #[gpui::test]
     fn dispatch_palette_command_for_a_wired_id_runs_the_real_panel_method(cx: &mut TestAppContext) {
