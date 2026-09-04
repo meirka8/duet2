@@ -1,0 +1,43 @@
+# cargo-nextest configuration (https://nexte.st/docs/configuration/).
+#
+# Why nextest: every test runs in its own process, so a hung or leaky
+# `duet-ui` test (each spins a real GPUI test platform and a real Tokio
+# runtime) is isolated, timed out, and reported individually instead of
+# stalling the whole `cargo test` binary. Doctests are not supported by
+# nextest and are still run with `cargo test --workspace --doc`.
+
+[profile.default]
+# A test that is still running after 60s is flagged as slow; one that is
+# still running after 3 such periods (3 minutes) is killed and reported as
+# a failure. The slowest legitimate tests in the workspace are the
+# `duet-ui` end-to-end ones at a few seconds each, and the ignored timing
+# benchmarks are opted out by `#[ignore]` anyway.
+slow-timeout = { period = "60s", terminate-after = 3 }
+# One retry masks a flake from a report but still surfaces it: nextest
+# marks retried-then-passed tests as FLAKY in the summary, which is the
+# signal to go fix the test rather than to ignore it.
+retries = 1
+fail-fast = false
+
+# `duet-ui`'s tests each start a real GPUI test platform plus a real
+# multi-thread Tokio runtime, and many of them wait on wall-clock deadlines
+# (`wait_until`, 5s). Run as one process per test at nextest's default
+# parallelism on a many-core machine, they oversubscribe the CPU badly
+# enough that timing tests fail and one end-to-end test hit the 3-minute
+# kill -- both pass in isolation (verified 2026-09-04). Charging each of
+# them four scheduler slots caps the concurrency at (cores / 4) and keeps
+# the rest of the workspace fully parallel.
+[[profile.default.overrides]]
+filter = 'package(duet-ui)'
+threads-required = 4
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Three `duet-ops` tests assert wall-clock behaviour (a 900 MiB tmpfs copy
+# reporting progress across 100ms sampler ticks; planning 100k files in
+# under two seconds; an ETA becoming available before a mixed-corpus copy
+# finishes). They pass alone and fail under a full-parallel run, so they
+# get the machine to themselves. The right long-term fix is to make them
+# measure work, not time; until then this keeps them honest.
+[[profile.default.overrides]]
+filter = 'package(duet-ops) & (test(accelerated_copy_reports_incremental_progress_and_survives_pause_resume) | test(plans_100k_files_within_two_seconds_with_accurate_totals) | test(copying_a_mixed_corpus_reports_a_real_eta_before_finishing))'
+threads-required = "num-cpus"

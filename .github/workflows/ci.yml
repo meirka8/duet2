@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same branch/PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Keep in lockstep with [workspace.package].rust-version in the root Cargo.toml.
@@ -29,6 +34,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install gpui's Linux link-time dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -38,18 +45,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # gpui links libxkbcommon(-x11) and libxcb(-xkb) at build time; its
+      # Wayland, fontconfig and Vulkan bindings are dlopen'd at runtime and
+      # need nothing here (checked with `ldd target/debug/duet`).
+      - name: Install gpui's Linux link-time dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
       - uses: Swatinem/rust-cache@v2
+      # nextest: one process per test, per-test timeouts, flaky-test
+      # reporting -- see .config/nextest.toml. It cannot run doctests, so
+      # those still go through `cargo test --doc`.
+      - uses: taiki-e/install-action@nextest
       - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo nextest run --workspace
+      - run: cargo test --workspace --doc
+
+  supply-chain:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Configuration in deny.toml at the repo root. Covers what a separate
+      # `cargo audit` job would (the RustSec advisory database) plus the
+      # license allow-list and the crates.io/vendor-only source policy.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
 
   msrv:
-    name: MSRV (${{ env.RUST_MSRV }})
+    # The `env` context is not available in a job's `name` (GitHub rejects
+    # the whole workflow file for it -- which is exactly what silently kept
+    # every run on `main` at zero jobs from 2026-08-11 to 2026-09-04), so the
+    # version is spelled out here and read from `env` only in the step.
+    name: MSRV (1.97)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.97"
+          toolchain: ${{ env.RUST_MSRV }}
+      - name: Install gpui's Linux link-time dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
 
@@ -66,15 +101,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Fail if any crate outside duet-widgets references gpui_component:: directly
+      # Quoted: an unquoted `:: ` inside a plain YAML scalar is a mapping
+      # separator, which made the whole workflow file unparseable (the
+      # second of the two defects that kept every run on `main` at zero jobs).
+      - name: "Fail if any crate outside duet-widgets references gpui_component:: directly"
         run: ./scripts/check-gpui-component-facade.sh
 
   perf-gate:
-    name: performance regression gate (T-3.3.5)
+    name: performance regression gate (T-3.3.5, advisory until CI-recorded baselines exist)
     runs-on: ubuntu-latest
+    # Advisory, not blocking: the committed baselines under benches/baselines/
+    # main/ were recorded on the author's workstation (2026-08-12), and a
+    # GitHub runner is different hardware with different noise -- comparing
+    # the two produces "regressions" that have nothing to do with the code.
+    # Even on the recording machine the gate trips under CPU contention
+    # (verified 2026-09-04). Making it blocking again needs baselines
+    # recorded on the runner type itself (a scheduled job storing them as
+    # an artifact and comparing run-to-run) -- tracked in
+    # documentation/review-2026-09-04.md. Until then the job runs, reports,
+    # and never fails the check suite.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install gpui's Linux link-time dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
       - uses: Swatinem/rust-cache@v2
       # The recorded baseline lives in git (benches/baselines/main/, committed
       # criterion output) rather than being regenerated on every run: CI
