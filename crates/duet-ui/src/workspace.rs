@@ -16,8 +16,8 @@ use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
 use duet_ops::{
-    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, JournalReader,
-    ProgressSnapshot, QueueManager, RecoveryReport, TrashEntry, list_trash_entries,
+    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, JournalReader, MountScan,
+    ProgressSnapshot, QueueManager, RecoveryReport, TrashEntry, list_trash_entries_with_mounts,
 };
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
@@ -454,6 +454,15 @@ const COPY_MOVE_QUEUE_MAX_CONCURRENT: usize = 2;
 pub struct Workspace {
     demo: DemoState,
     focus_handle: FocusHandle,
+    /// Where the trash browser (`Alt+T`, [`Self::open_trash_dialog`]) looks
+    /// for per-mount trash roots. `MountScan::System` -- the real mount
+    /// table -- everywhere except tests, which set `MountScan::Explicit`
+    /// (see `with_configured_workspace_inner`) for the same reason they
+    /// redirect `$XDG_DATA_HOME`: a test must never see, let alone act on,
+    /// the developer's real trash. This can't be an environment redirect
+    /// like the XDG ones because there is no environment knob for
+    /// `/proc/self/mountinfo`; it has to be an explicit policy.
+    trash_mount_scan: MountScan,
 
     /// The dual-pane splitter's current left-panel fraction of the
     /// workspace width, `[SPLITTER_MIN_RATIO, SPLITTER_MAX_RATIO]`.
@@ -1232,6 +1241,7 @@ impl Workspace {
         Self {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
+            trash_mount_scan: MountScan::System,
             splitter_ratio,
             resizable_state: cx.new(|_| ResizableState::default()),
             left_panel,
@@ -2608,8 +2618,9 @@ impl Workspace {
         };
 
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let mounts = self.trash_mount_scan.clone();
         self.tokio_handle.spawn(async move {
-            let result = list_trash_entries(&xdg_data_home);
+            let result = list_trash_entries_with_mounts(&xdg_data_home, &mounts);
             let _ = tx.send(result);
         });
         let weak_workspace = cx.entity().downgrade();
@@ -4659,6 +4670,15 @@ mod tests {
             Root::new(workspace, window, cx)
         });
         let workspace = workspace_cell.expect("the window-build closure always constructs one");
+        // The per-mount half of the trash browser's scan reads the real
+        // mount table, which no `$XDG_*` redirect above can touch -- so
+        // it's switched off explicitly, the same way and for the same
+        // reason the home-trash half is pointed at `data_dir`. Without
+        // this, every trash-browser test picks up whatever the developer
+        // actually has in a second drive's `.Trash-<uid>`.
+        workspace.update(vcx, |ws, _cx| {
+            ws.trash_mount_scan = MountScan::Explicit(Vec::new());
+        });
 
         f(workspace, vcx, data_dir.path());
 
