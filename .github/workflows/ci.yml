@@ -118,9 +118,10 @@ jobs:
     # (verified 2026-09-04). Making it blocking again needs baselines
     # recorded on the runner type itself (a scheduled job storing them as
     # an artifact and comparing run-to-run) -- tracked in
-    # documentation/review-2026-09-04.md. Until then the job runs, reports,
-    # and never fails the check suite.
-    continue-on-error: true
+    # documentation/review-2026-09-04.md. Until then the comparison step
+    # below is marked continue-on-error: the numbers are in the job log,
+    # and the job itself stays green so a reviewer isn't trained to ignore
+    # a red X.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -147,5 +148,6 @@ jobs:
           cp -r benches/baselines/main/* target/criterion/ 2>/dev/null || true
       - name: Run benchmarks
         run: cargo bench -p duet-bench --bench entry_store --bench local_listing
-      - name: Check for regressions (fails the job on any >10% regression)
+      - name: Compare against the committed baselines (advisory, see job comment)
+        continue-on-error: true
         run: cargo run -p duet-bench --bin bench_gate --release -- --baseline main --threshold 10

@@ -420,7 +420,7 @@ impl Panel {
             return;
         }
         let keep = self.tabs.remove(self.active);
-        let removed: Vec<TabEntry> = self.tabs.drain(..).collect();
+        let removed: Vec<TabEntry> = std::mem::take(&mut self.tabs);
         for t in removed {
             self.closed_stack.push(ClosedTab {
                 dir: t.table.read(cx).current_dir().to_path_buf(),
