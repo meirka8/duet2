@@ -415,6 +415,25 @@ fn spawn_window_chrome_cycle_if_requested(window: &mut Window, cx: &mut App) {
         .detach();
 }
 
+/// A one-shot cooperative yield: returns `Pending` exactly once (waking
+/// itself immediately), so a long-running async loop hands control back to
+/// its executor between iterations. See `Workspace::new`'s queue-event
+/// consumer for the concrete case this exists for. GPUI's executors have
+/// no `yield_now` of their own; this is the minimal, executor-agnostic
+/// equivalent.
+fn yield_once() -> impl std::future::Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+}
+
 /// The splitter ratio never collapses a panel entirely -- keeps at least
 /// 15% of the workspace width visible on either side, mirroring the
 /// underlying widget's own `PANEL_MIN_SIZE` floor in spirit (a fixed pixel
@@ -1234,6 +1253,21 @@ impl Workspace {
                 if updated.is_err() {
                     return;
                 }
+                // Hand the executor back between events. `recv().await`
+                // resolves immediately while events are queued, so without
+                // this the loop above runs every queued event inside a
+                // single poll -- harmless in the real app (a notify is
+                // cheap; the platform draws once per frame), but GPUI's
+                // test-mode `flush_effects` draws the whole window on
+                // every `update`, and a progress sample lands every 100ms
+                // while a job runs. On a machine where a debug-build draw
+                // takes longer than that, the poll never ends, the test
+                // executor never returns to the test, and anything
+                // waiting on the UI (a conflict answer, say) waits
+                // forever: `two_concurrent_conflicts_are_both_served_not_
+                // dropped` hung this way on a 4-core CI runner and on this
+                // workstation pinned to 2 cores (2026-09-04, thread dump).
+                yield_once().await;
             }
         })
         .detach();
@@ -5553,7 +5587,29 @@ mod tests {
     ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            vcx.run_until_parked();
+            // A *bounded* drain of GPUI's test executor, deliberately not
+            // `run_until_parked()`: that keeps ticking for as long as any
+            // task is runnable, and while a job is running the queue's
+            // event consumer (`Workspace::new`'s `queue_events_rx` loop)
+            // is re-woken by a progress sample every 100ms, each of which
+            // ends in a full window draw (gpui's test-mode
+            // `flush_effects` draws every dirty window). On a machine
+            // where a debug-build draw takes longer than that -- a 4-core
+            // CI runner, or this workstation pinned to 2 cores -- the
+            // executor never parks, `condition` is never re-checked, the
+            // conflict dialog is never answered, and the jobs keep
+            // sampling forever: `two_concurrent_conflicts_are_both_
+            // served_not_dropped` hung this way for the full nextest
+            // timeout on 2026-09-04 (thread dump: the test thread mid-
+            // draw under `run_until_parked`, both Tokio workers parked
+            // in `ConflictResolver::resolve`). A bounded tick makes
+            // progress on the test's own terms regardless of how fast
+            // the machine draws.
+            for _ in 0..32 {
+                if !vcx.background_executor.tick() {
+                    break;
+                }
+            }
             // T-5.2.1 (post-UAT): `Workspace::render`-only state (e.g.
             // `pending_panel_refresh`) only actually gets drained by a
             // real draw pass, not merely by `run_until_parked` letting
