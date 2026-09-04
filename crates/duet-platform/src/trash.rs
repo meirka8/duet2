@@ -81,6 +81,16 @@
 //! 1 — no live mount-table tracking (that is design.md's separate,
 //! unbuilt "Mounts" concern, T-6.1.1).
 //!
+//! The mount-table read is the one piece of global machine state in this
+//! module's read side, and the only one a caller's `$XDG_DATA_HOME`
+//! redirect can't reach — so [`list_trash_entries_with_mounts`] takes the
+//! candidate source as an explicit [`MountScan`] (`System`, the real table,
+//! or `Explicit(paths)`, which touches nothing outside the paths named).
+//! [`list_trash_entries`] is simply the `System` shorthand. `duet-ui`'s
+//! tests are the motivating caller: with only the XDG redirect, every
+//! trash-browser test on a machine with a real trashed file on a second
+//! drive found that file mixed into its own fixtures.
+//!
 //! **A malformed `.trashinfo` is skipped, not propagated as an error for
 //! the whole listing.** A hand-edited, truncated, or third-party-tool-
 //! written sidecar that doesn't parse per this module's own writer's shape
@@ -809,8 +819,50 @@ pub struct TrashEntry {
 /// exists but can't be read is *not* surfaced this way -- see
 /// [`list_entries_from_candidate_topdirs`]'s own doc comment.
 pub fn list_trash_entries(xdg_data_home: &Path) -> Result<Vec<TrashEntry>, TrashError> {
+    list_trash_entries_with_mounts(xdg_data_home, &MountScan::System)
+}
+
+/// Where [`list_trash_entries_with_mounts`] looks for *per-mount* trash
+/// roots, on top of the home trash it always scans.
+///
+/// Exists because the per-mount pass is the one part of trash listing that
+/// reads global machine state (`/proc/self/mountinfo`): a caller that has
+/// redirected `$XDG_DATA_HOME` into a scratch directory is still, under
+/// [`MountScan::System`], going to see every real mounted filesystem's own
+/// trash -- exactly what made `duet-ui`'s trash-browser tests fail on any
+/// developer machine with a real trashed file on a second drive. Tests
+/// (and any future sandboxed/embedded use) pass [`MountScan::Explicit`]
+/// instead, which touches nothing outside the paths named.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MountScan {
+    /// Discover candidates from the real `/proc/self/mountinfo` -- the
+    /// production behaviour, and [`list_trash_entries`]'s.
+    #[default]
+    System,
+    /// Probe exactly these mount points (the same safety checks and the
+    /// same "never create anything" rule apply) and nothing else. An empty
+    /// list means home trash only.
+    Explicit(Vec<PathBuf>),
+}
+
+/// [`list_trash_entries`] with the per-mount candidate source chosen by the
+/// caller -- see [`MountScan`]. [`MountScan::Explicit`] candidates go
+/// through the same [`dedup_and_exclude_home_dev`] filter as the real
+/// mount table does, so the two variants differ only in where the list
+/// comes from, never in what is done with it.
+///
+/// # Errors
+/// Same as [`list_trash_entries`].
+pub fn list_trash_entries_with_mounts(
+    xdg_data_home: &Path,
+    mounts: &MountScan,
+) -> Result<Vec<TrashEntry>, TrashError> {
     let mut entries = list_trash_root(&xdg_data_home.join("Trash"), None)?;
-    let candidates = dedup_and_exclude_home_dev(xdg_data_home, &real_mountinfo_candidates());
+    let raw_candidates = match mounts {
+        MountScan::System => real_mountinfo_candidates(),
+        MountScan::Explicit(paths) => paths.clone(),
+    };
+    let candidates = dedup_and_exclude_home_dev(xdg_data_home, &raw_candidates);
     entries.extend(list_entries_from_candidate_topdirs(&candidates));
     Ok(entries)
 }
@@ -2205,6 +2257,43 @@ mod tests {
                 .iter()
                 .any(|e| e.original_path == mount_topdir.path().join("sub/mount-file.txt")),
             "per-mount entry missing: {entries:?}"
+        );
+    }
+
+    /// The public seam `duet-ui`'s tests rely on: an explicit, empty mount
+    /// list must yield exactly the home trash and nothing else, no matter
+    /// what the machine running the test really has mounted (this is the
+    /// one variant that reads no global state at all).
+    #[test]
+    fn list_trash_entries_with_mounts_explicit_empty_is_home_only_and_reads_no_mount_table() {
+        let data_home = TempDir::new().unwrap();
+        let src_home = TempDir::new().unwrap();
+        let target = src_home.path().join("only.txt");
+        std::fs::write(&target, b"h").unwrap();
+        let mut reservations = TrashReservations::new();
+        let resolved = resolve_trash_destination_at(
+            &target,
+            data_home.path(),
+            SystemTime::UNIX_EPOCH,
+            &mut reservations,
+        )
+        .unwrap();
+        std::fs::write(&resolved.info_path, &resolved.trashinfo).unwrap();
+        std::fs::rename(&target, &resolved.content_path).unwrap();
+
+        let entries =
+            list_trash_entries_with_mounts(data_home.path(), &MountScan::Explicit(Vec::new()))
+                .unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].original_path, target);
+
+        // And the two spellings of "production" agree with each other.
+        assert_eq!(MountScan::default(), MountScan::System);
+        assert_eq!(
+            list_trash_entries(data_home.path()).unwrap().len(),
+            list_trash_entries_with_mounts(data_home.path(), &MountScan::System)
+                .unwrap()
+                .len()
         );
     }
 

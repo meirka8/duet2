@@ -136,7 +136,9 @@ pub use deleter::{DeleteMode, plan_delete};
 // depends on `duet-ops`, not on `duet-platform` directly, matching the
 // crate-graph shape `documentation/design.md` §8.1 lays out (`duet-ops`
 // sits between `duet-platform`/`duet-vfs` and `duet-ui`).
-pub use duet_platform::trash::{TrashEntry, TrashError, list_trash_entries};
+pub use duet_platform::trash::{
+    MountScan, TrashEntry, TrashError, list_trash_entries, list_trash_entries_with_mounts,
+};
 pub use event::{JobEvent, ProgressSnapshot};
 pub use executor::{ControlState, ExecutionControl, execute, suggested_concurrency};
 pub use job::{Job, JobId, JobKind, JobOutcome, JobReport, JobState, SkipEntry, StepFailure};
