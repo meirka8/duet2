@@ -1,0 +1,10 @@
+# One toolchain everywhere: the workstation, CI, and the declared MSRV
+# (`[workspace.package].rust-version`) are the same version, so a lint
+# that fires in CI fires locally too. Before this file, CI ran whatever
+# `stable` was that day and caught a clippy 1.98 lint the 1.97 workstation
+# never saw (2026-09-04). Bump all three together, as a deliberate change
+# with the full gate run (`.github/workflows/ci.yml` reads the same value
+# from its `RUST_TOOLCHAIN` env).
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]

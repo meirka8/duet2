@@ -12,8 +12,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep in lockstep with [workspace.package].rust-version in the root Cargo.toml.
-  RUST_MSRV: "1.97"
+  # One toolchain everywhere: this value, rust-toolchain.toml at the repo
+  # root, and [workspace.package].rust-version are the same version and are
+  # bumped together. Every job below therefore builds with the declared
+  # MSRV -- there is no separate MSRV job because there is nothing else to
+  # compare against.
+  RUST_TOOLCHAIN: "1.97"
 
 jobs:
   fmt:
@@ -21,8 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -31,8 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - name: Install gpui's Linux link-time dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
@@ -44,7 +50,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       # gpui links libxkbcommon(-x11) and libxcb(-xkb) at build time; its
       # Wayland, fontconfig and Vulkan bindings are dlopen'd at runtime and
       # need nothing here (checked with `ldd target/debug/duet`).
@@ -70,23 +78,6 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
-
-  msrv:
-    # The `env` context is not available in a job's `name` (GitHub rejects
-    # the whole workflow file for it -- which is exactly what silently kept
-    # every run on `main` at zero jobs from 2026-08-11 to 2026-09-04), so the
-    # version is spelled out here and read from `env` only in the step.
-    name: MSRV (1.97)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_MSRV }}
-      - name: Install gpui's Linux link-time dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
 
   dep-graph-lint:
     name: gpui isolation lint (ADR-002, T-2.1.2)
@@ -124,7 +115,9 @@ jobs:
     # a red X.
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install gpui's Linux link-time dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-xkb-dev
       - uses: Swatinem/rust-cache@v2
