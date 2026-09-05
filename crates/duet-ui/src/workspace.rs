@@ -269,6 +269,18 @@ fn bind_workspace_keys(cx: &mut App) {
 
 /// Opens the Duet application window.
 pub fn run() {
+    // T-3.1.6's UI-thread blocking guard, armed. `duet-vfs`'s every
+    // `LocalFs` syscall wrapper `debug_assert!`s that it is *not* on the
+    // thread flagged here, so a directory listing, `stat`, or copy that
+    // accidentally runs on the GPUI thread panics in a debug build
+    // instead of silently stalling the UI (zero cost in release). This is
+    // the one call the guard's own doc comment says "lands wherever the
+    // GPUI shell boots" -- and until 2026-09-04 it never had: the 28
+    // assertion sites existed, nothing ever armed them. `Application::run`
+    // drives the UI on this same thread, so marking it here is marking
+    // the UI thread.
+    duet_vfs::local::mark_ui_thread();
+
     // Kept alive for the whole process lifetime by living in this
     // function's stack frame, which does not return until
     // `Application::run` does (i.e. until the app quits).
