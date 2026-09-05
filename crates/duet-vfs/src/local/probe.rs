@@ -609,9 +609,22 @@ mod tests {
         None
     }
 
+    /// A `TempDir` that is actually on tmpfs: `/dev/shm` (tmpfs on every
+    /// mainstream Linux, GitHub's runners included), *not* `$TMPDIR` --
+    /// which is tmpfs on a typical workstation but the ext4 root disk on a
+    /// CI runner (this is what failed the first ever CI run, 2026-09-04).
+    /// `None` when even `/dev/shm` isn't tmpfs; callers skip, loudly.
+    fn tmpfs_tempdir() -> Option<TempDir> {
+        let dir = TempDir::new_in("/dev/shm").ok()?;
+        (probe(&vp(&dir)).ok()?.kind == FsKind::Tmpfs).then_some(dir)
+    }
+
     #[test]
     fn probes_tmpfs_correctly() {
-        let dir = TempDir::new().unwrap();
+        let Some(dir) = tmpfs_tempdir() else {
+            eprintln!("skipping probes_tmpfs_correctly: /dev/shm is not a tmpfs on this machine");
+            return;
+        };
         let props = probe(&vp(&dir)).unwrap();
         assert_eq!(props.kind, FsKind::Tmpfs);
         // tmpfs has no backing block device.

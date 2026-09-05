@@ -42,7 +42,13 @@ while IFS= read -r -d '' rs_file; do
     case "$rs_file" in
         "$ALLOWED_DIR"/*) continue ;;
     esac
-    if grep -q 'gpui_component::' "$rs_file"; then
+    # Comment lines are stripped first: a doc comment is allowed to *talk
+    # about* `gpui_component::` (e.g. to explain why a façade wrapper
+    # exists), it just can't be a `use`/path reference in code. Only
+    # whole-line `//`/`///`/`//!` comments are stripped -- a trailing
+    # comment after code is rare enough not to special-case, and a false
+    # positive there fails loudly rather than letting a violation through.
+    if grep -v -E '^[[:space:]]*//' "$rs_file" | grep -q 'gpui_component::'; then
         echo "VIOLATION: $rs_file references gpui_component:: directly."
         echo "  Only crates/duet-widgets may name the gpui_component crate; every other"
         echo "  crate (including crates/duet-ui) must go through duet-widgets's façade (R-G7)."

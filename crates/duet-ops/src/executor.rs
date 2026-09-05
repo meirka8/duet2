@@ -797,7 +797,17 @@ pub async fn execute(
         index += 1;
     }
 
+    // Abort *and await*: `abort()` alone returns before the sampler has
+    // actually stopped, and a sampler already past its interval wait
+    // still completes its in-flight `Progress` send -- which then lands
+    // on the events channel *after* the `Finished` sent below, so a
+    // consumer that evicts progress on `Finished` sees it resurrected and
+    // the finished job's sample lingers forever (observed on a CI runner,
+    // 2026-09-04: `operation_manager_end_to_end_pause_resume_via_keyboard`).
+    // Awaiting the aborted handle (it resolves to `Err(cancelled)`) is
+    // the ordering guarantee: nothing the sampler does can follow it.
     sampler.abort();
+    let _ = sampler.await;
 
     let job_outcome = if cancelled {
         JobOutcome::Cancelled
