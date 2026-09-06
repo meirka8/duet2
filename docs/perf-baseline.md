@@ -81,7 +81,16 @@ For a 4 GiB file (two records, ~3 ms on btrfs against a 2–30 s copy) the overh
 
 The job writes **40 006 journal records for 10 000 files** (four per file: intent and completion for the copy step and again for the deferred `SetMeta` step; 11 MB of JSON), and every record is written and fsync'd on its own by one serial journal thread whose reply the executor awaits before the next side effect. On the home filesystem that is ~4.5 ms per record, so the executor is capped at roughly 55 files/s regardless of what the copy itself costs; on a rotational home disk it would be ~2 files/s (extrapolated, not run). Even with the fsyncs made free (journal on tmpfs), the per-file pipeline is 3–5× `cp -r` (~70 µs/file of channel round-trips, temp-file + rename, and `SetMeta`).
 
-This is the most important performance finding to date and is not a tuning problem: fsync-per-record is the design. The fix is group commit at minimum (drain every queued record, one fsync, then reply to all — bounded by the executor's concurrency, so ≤ 4–8× on its own), and realistically **batched intents** (journal the next N steps' intents in one fsync, execute them, journal their completions in one fsync), plus folding `SetMeta` into its copy step's records to halve the count. Tracked in `documentation/review-2026-09-04.md`.
+This was the most important performance finding to date and was not a tuning problem: fsync-per-record was the design.
+
+**Fixed the same day** (`docs/crash-safety.md`, "Batching"): the journal thread group-commits (one `write` + one `fsync` per batch), redo-safe steps (`CreateDir`, `CopyFile`, `Reflink`, `SetMeta`, `Verify`) have their intents journaled 64 at a time ahead of execution and their completions queued without waiting, and everything else keeps the strict protocol. Same corpus, same machine, same 40 006 records:
+
+| Destination | `cp -r` (+ `sync`) | duet, journal on tmpfs | duet, journal on `$HOME` (production) |
+|---|---|---|---|
+| tmpfs | 0.14 s (+0.05) | 0.30 s (was 0.70) | **0.82–0.93 s (was 178 s)** |
+| btrfs (NVMe) | 0.42 s (+0.08) | 0.91–1.12 s (was 1.37) | **1.56–2.43 s (was 211 s)** |
+
+That is a 100–200× improvement where it mattered, and it puts the whole per-file pipeline at 3–6× `cp -r` with the journal fully durable, against `cp -r`'s no-durability-at-all. The large-file path is unchanged (4 GiB on tmpfs: 1.75 s, `cp` 1.90 s; six journal records). Remaining per-file cost is now the temp-file + rename write path and the four records per file; folding `SetMeta` into its copy step's records would halve the latter and is the next step if small-file throughput is ever the bottleneck again.
 
 ### T-5.1.1 — planning 100k files ≤ 2 s: **met**
 
