@@ -141,3 +141,54 @@ Read-only content/size comparison of `source` against `dest`. Never mutates eith
 | **Total rows** | **45** |
 
 Every row names a distinct T-10.2.1 test. T-10.2.1's AC ("Every injection point satisfies the §9.3 invariant... 100%, no exceptions") is therefore, as of this document, a checklist of exactly 45 named tests — not an open-ended fuzz target. New `Step` variants added after T-2.3.1 (there are none currently planned) must extend this table before T-10.2.1 can claim its release-gate coverage is still complete.
+
+## Batching (2026-09-06): what changed in the mechanism and why every row above still holds
+
+Measured on a real home filesystem (`docs/perf-baseline.md`), the original
+one-`write`-one-`fsync`-per-record protocol cost ~4.5 ms per record and
+four records per copied file, so a 10 000-file copy spent ~200 s in the
+journal against ~0.5 s of actual copying. Three changes, each argued
+against the rows above:
+
+1. **Group commit** (`Journal::append_batch`, the executor's
+   `JournalHandle`). Records queued while the writer thread is busy are
+   written with one `write` and one `fsync` and answered together. A
+   record's reply still means "durable now"; the *ordering* rows above
+   (intent durable before the side effect, completion after) are
+   unchanged because a step only proceeds when its own reply arrives.
+   Crash artifact: a torn *tail* of the last batch. `SIGKILL` cannot tear
+   a batch at all (one `write`; the page cache outlives the process);
+   power loss can leave a prefix ending in garbage. `JournalReader::scan`
+   drops a trailing run of unparseable lines and rejects an unparseable
+   line followed by a valid one, which an append-only file cannot produce
+   by crashing.
+
+2. **Intent windows** (`INTENT_WINDOW = 64`) for *redo-safe* steps only
+   (`CreateDir`, `CopyFile`, `Reflink`, `SetMeta`, `Verify`): up to 64
+   consecutive such steps have their `Intent`s journaled in one awaited
+   batch before any of them runs. Every step that starts still has a
+   durable intent (the row invariant). The new artifact is an intent for a
+   step that *never started* before the crash; recovery lists it as
+   incomplete and redoes it, and for these kinds a redo is a no-op or a
+   conflict-policy decision (`CreateDir` on an existing directory,
+   `SetMeta`/`Verify` applied again, a copy whose destination already
+   exists). The partial-file name is chosen when the intent is journaled
+   and handed to the step, so `orphaned_partials` stays exact.
+
+3. **Fire-and-forget `Completion`** for the same redo-safe kinds. The
+   record is queued in order and becomes durable with the next batch --
+   at the latest with the awaited `JobFinished`. A crash in between costs
+   a redundant redo of a finished step, never data: the `CopyFile` row's
+   "destination renamed into place, completion not yet durable" case is
+   now merely more likely, and its outcome (recovery re-plans the step,
+   finds the destination present, applies the job's conflict policy --
+   `Skip` by default) is unchanged.
+
+Everything not redo-safe (`Rename`, `Remove`, `Link`, `Symlink`,
+`WriteTrashInfo`) keeps the strict per-record awaited protocol: a redo of
+a finished rename or delete fails on a missing source and would surface
+a phantom error at recovery time, and deletes are journaled before
+execution so the undo stack can trust the record. A batch write that
+fails poisons the writer -- every later record, awaited or not, fails
+with that error -- and `execute` reports it as a job error when the
+awaited `JobFinished` append fails.

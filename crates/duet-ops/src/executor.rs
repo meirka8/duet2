@@ -758,7 +758,7 @@ pub async fn execute(
     let mut cancelled = false;
 
     let mut index = 0usize;
-    while index < plan.steps.len() {
+    'steps: while index < plan.steps.len() {
         if wait_out_pause(&ctx).await == ControlState::Cancelled {
             cancelled = true;
             break;
@@ -779,13 +779,67 @@ pub async fn execute(
             continue;
         }
 
-        // A single barrier step.
-        if wait_out_pause(&ctx).await == ControlState::Cancelled {
-            cancelled = true;
-            break;
+        // A run of consecutive redo-safe barrier steps (`CreateDir`s at the
+        // front of a plan, the deferred `SetMeta`s at its end): journal up
+        // to `INTENT_WINDOW` of their intents with one awaited batch, then
+        // run them one at a time. Same crash-safety story as a single
+        // awaited intent -- every step that runs has a durable intent
+        // before it starts -- at a fraction of the fsyncs.
+        let window_end = index
+            + plan.steps[index..]
+                .iter()
+                .take(INTENT_WINDOW)
+                .take_while(|step| !is_copy_class(step) && redo_safe(step))
+                .count();
+        if window_end > index {
+            let mut intents = Vec::with_capacity(window_end - index);
+            let mut partials = Vec::with_capacity(window_end - index);
+            for (i, step) in plan.steps[index..window_end].iter().enumerate() {
+                let partial_name = copy_partial_name(step);
+                intents.push(JournalRecord::Intent {
+                    step_index: (index + i) as u32,
+                    step: step.clone(),
+                    partial_name: partial_name.clone(),
+                });
+                partials.push(partial_name);
+            }
+            if let Err(e) = ctx.journal.append_all(intents).await {
+                for (i, step) in plan.steps[index..window_end].iter().enumerate() {
+                    let step_index = (index + i) as u32;
+                    apply_outcome(
+                        &mut report,
+                        step_index,
+                        step,
+                        StepOutcome::Failed(StepFailure {
+                            step_index,
+                            path: step_primary_path(step),
+                            kind: e.kind(),
+                            message: format!("failed to journal Intent: {e}"),
+                        }),
+                    );
+                }
+                index = window_end;
+                continue;
+            }
+            for (i, partial_name) in partials.into_iter().enumerate() {
+                let step_index = (index + i) as u32;
+                let step = &plan.steps[index + i];
+                match run_step_with_retry(&ctx, step_index, step, Some(partial_name)).await {
+                    StepRun::Done(outcome) => apply_outcome(&mut report, step_index, step, outcome),
+                    StepRun::Cancelled => {
+                        cancelled = true;
+                        break 'steps;
+                    }
+                }
+            }
+            index = window_end;
+            continue;
         }
+
+        // A single barrier step of a kind that must keep the strict
+        // one-awaited-fsync-per-record protocol (see `redo_safe`).
         let step_index = index as u32;
-        match run_step_with_retry(&ctx, step_index, &plan.steps[index]).await {
+        match run_step_with_retry(&ctx, step_index, &plan.steps[index], None).await {
             StepRun::Done(outcome) => {
                 apply_outcome(&mut report, step_index, &plan.steps[index], outcome)
             }
@@ -821,13 +875,24 @@ pub async fn execute(
     let finished_at = Timestamp::from(SystemTime::now());
     report.finished_at = Some(finished_at);
 
-    let _ = ctx
+    // Awaited: this is also what makes every fire-and-forget `Completion`
+    // before it durable (the writer is FIFO). A failure here is the one
+    // place a poisoned journal (a batch that failed to write) surfaces.
+    if let Err(e) = ctx
         .journal
         .append(JournalRecord::JobFinished {
             outcome: job_outcome,
             finished_at,
         })
-        .await;
+        .await
+    {
+        report.errors.push(StepFailure {
+            step_index: plan.steps.len() as u32,
+            path: None,
+            kind: e.kind(),
+            message: format!("failed to journal JobFinished: {e}"),
+        });
+    }
     let _ = ctx.events.send(JobEvent::Finished {
         job_id,
         outcome: job_outcome,
@@ -884,9 +949,49 @@ async fn run_batch(
     concurrency: usize,
     report: &mut JobReport,
 ) -> ControlState {
+    // Every copy-class step is redo-safe (`redo_safe`), so their intents go
+    // down `INTENT_WINDOW` at a time, each window one awaited fsync, before
+    // the copies start -- the batch's steps then never wait on the journal
+    // at all (completions are fire-and-forget for these kinds). A window
+    // that fails to journal fails its steps the way a single failed intent
+    // would, and the batch stops there.
+    let mut partials: Vec<Option<String>> = Vec::with_capacity(end - start);
+    let mut journaled_end = start;
+    for window_start in (start..end).step_by(INTENT_WINDOW) {
+        let window_end = (window_start + INTENT_WINDOW).min(end);
+        let mut intents = Vec::with_capacity(window_end - window_start);
+        for (i, step) in plan.steps[window_start..window_end].iter().enumerate() {
+            let partial_name = copy_partial_name(step);
+            intents.push(JournalRecord::Intent {
+                step_index: (window_start + i) as u32,
+                step: step.clone(),
+                partial_name: partial_name.clone(),
+            });
+            partials.push(partial_name);
+        }
+        if let Err(e) = ctx.journal.append_all(intents).await {
+            for (i, step) in plan.steps[window_start..end].iter().enumerate() {
+                let step_index = (window_start + i) as u32;
+                apply_outcome(
+                    report,
+                    step_index,
+                    step,
+                    StepOutcome::Failed(StepFailure {
+                        step_index,
+                        path: step_primary_path(step),
+                        kind: e.kind(),
+                        message: format!("failed to journal Intent: {e}"),
+                    }),
+                );
+            }
+            break;
+        }
+        journaled_end = window_end;
+    }
+
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut handles = Vec::with_capacity(end - start);
-    for i in start..end {
+    let mut handles = Vec::with_capacity(journaled_end - start);
+    for (i, partial_name) in (start..journaled_end).zip(partials) {
         let ctx = ctx.clone();
         let step = plan.steps[i].clone();
         let permit = Arc::clone(&semaphore);
@@ -896,7 +1001,7 @@ async fn run_batch(
                 .acquire_owned()
                 .await
                 .expect("semaphore never closed");
-            let outcome = run_step_with_retry(&ctx, step_index, &step).await;
+            let outcome = run_step_with_retry(&ctx, step_index, &step, Some(partial_name)).await;
             (step_index, step, outcome)
         }));
     }
@@ -930,7 +1035,18 @@ enum StepRun {
 /// cancelled. See the module doc comment's "resume restarts the step"
 /// scope note for why a retry-from-scratch loop, not byte-exact resume, is
 /// what "resumes correctly" means here.
-async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step) -> StepRun {
+///
+/// `journaled_intent`: `Some(partial_name)` when the caller already made
+/// this step's first `Intent` durable as part of an intent window (see
+/// [`INTENT_WINDOW`]); the first attempt then skips its own append and
+/// uses that partial name so the journal and the filesystem agree on it.
+/// Retries after a failed attempt journal a fresh intent as before.
+async fn run_step_with_retry(
+    ctx: &ExecutorContext,
+    step_index: u32,
+    step: &Step,
+    mut journaled_intent: Option<Option<String>>,
+) -> StepRun {
     // T-5.1.10: bounded across the whole step (not reset by a `Space`
     // pause/resume episode or a pause/cancel-interrupted retry) -- see
     // `retry_backoff`'s own doc comment for the bound.
@@ -940,23 +1056,29 @@ async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step
             return StepRun::Cancelled;
         }
 
-        let partial_name = copy_partial_name(step);
-        if let Err(e) = ctx
-            .journal
-            .append(JournalRecord::Intent {
-                step_index,
-                step: step.clone(),
-                partial_name: partial_name.clone(),
-            })
-            .await
-        {
-            return StepRun::Done(StepOutcome::Failed(StepFailure {
-                step_index,
-                path: step_primary_path(step),
-                kind: e.kind(),
-                message: format!("failed to journal Intent: {e}"),
-            }));
-        }
+        let partial_name = match journaled_intent.take() {
+            Some(partial_name) => partial_name,
+            None => {
+                let partial_name = copy_partial_name(step);
+                if let Err(e) = ctx
+                    .journal
+                    .append(JournalRecord::Intent {
+                        step_index,
+                        step: step.clone(),
+                        partial_name: partial_name.clone(),
+                    })
+                    .await
+                {
+                    return StepRun::Done(StepOutcome::Failed(StepFailure {
+                        step_index,
+                        path: step_primary_path(step),
+                        kind: e.kind(),
+                        message: format!("failed to journal Intent: {e}"),
+                    }));
+                }
+                partial_name
+            }
+        };
         let _ = ctx.events.send(JobEvent::StepStarted {
             job_id: ctx.job_id,
             step_index,
@@ -1020,14 +1142,16 @@ async fn run_step_with_retry(ctx: &ExecutorContext, step_index: u32, step: &Step
             .unwrap()
             .insert(step_index, outcome.clone());
 
-        if let Err(e) = ctx
-            .journal
-            .append(JournalRecord::Completion {
-                step_index,
-                outcome: outcome.clone(),
-            })
-            .await
-        {
+        let completion = JournalRecord::Completion {
+            step_index,
+            outcome: outcome.clone(),
+        };
+        if redo_safe(step) {
+            // Durable by the next awaited append at the latest; a crash
+            // before that costs a redundant redo, nothing more -- see
+            // `redo_safe`.
+            ctx.journal.append_nowait(completion);
+        } else if let Err(e) = ctx.journal.append(completion).await {
             return StepRun::Done(StepOutcome::Failed(StepFailure {
                 step_index,
                 path: step_primary_path(step),
@@ -2423,32 +2547,88 @@ async fn naive_copy(
 /// sharing that thread) and so concurrently-running copy-step tasks don't
 /// need a shared `&mut Journal`/async mutex to each append their own
 /// `Intent`/`Completion` records.
+///
+/// **Group commit.** The thread drains everything queued behind the record
+/// it just received (up to [`JOURNAL_GROUP_COMMIT_MAX`]) and writes the lot
+/// with one [`Journal::append_batch`] -- one `write`, one `fsync` -- then
+/// answers every awaited record in the batch. A record's reply still means
+/// "durable now"; what changed is that concurrent steps' records share one
+/// fsync instead of queueing for one each. Together with the executor's
+/// intent windows and fire-and-forget completions (see [`redo_safe`]) this
+/// is what took a 10 000-file copy from ~200 s to seconds on a home
+/// filesystem (`docs/perf-baseline.md`).
 #[derive(Clone)]
 struct JournalHandle {
-    tx: mpsc::UnboundedSender<(JournalRecord, oneshot::Sender<Result<()>>)>,
+    tx: mpsc::UnboundedSender<JournalMessage>,
 }
+
+/// One queued journal write: the record, plus -- for an awaited append --
+/// the channel to answer once it is durable. `None` is fire-and-forget
+/// ([`JournalHandle::append_nowait`]).
+type JournalMessage = (JournalRecord, Option<oneshot::Sender<Result<()>>>);
+
+/// Cap on records folded into one `write`+`fsync`. Bounds both the single
+/// buffer a power loss can tear (see `journal.rs`'s "Wire format") and how
+/// long the first record of a burst waits for its batch to close; ~150 KB
+/// of JSON at this crate's record sizes.
+const JOURNAL_GROUP_COMMIT_MAX: usize = 512;
 
 impl JournalHandle {
     fn spawn(mut journal: Journal) -> Self {
-        let (tx, mut rx) =
-            mpsc::unbounded_channel::<(JournalRecord, oneshot::Sender<Result<()>>)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<JournalMessage>();
         tokio::task::spawn_blocking(move || {
-            while let Some((record, reply)) = rx.blocking_recv() {
-                let result = journal.append(&record);
-                let _ = reply.send(result);
+            // Once one write has failed the journal can no longer vouch for
+            // anything after it, so every later record -- awaited or not --
+            // fails with the same error rather than silently writing past a
+            // hole. `execute` surfaces it when the awaited `JobFinished`
+            // append fails.
+            let mut poisoned: Option<(ErrorKind, String)> = None;
+            while let Some(first) = rx.blocking_recv() {
+                let mut batch = vec![first];
+                while batch.len() < JOURNAL_GROUP_COMMIT_MAX {
+                    match rx.try_recv() {
+                        Ok(message) => batch.push(message),
+                        Err(_) => break,
+                    }
+                }
+                let (records, replies): (Vec<JournalRecord>, Vec<_>) = batch.into_iter().unzip();
+                if poisoned.is_none()
+                    && let Err(e) = journal.append_batch(&records)
+                {
+                    poisoned = Some((e.kind(), e.to_string()));
+                }
+                for reply in replies.into_iter().flatten() {
+                    let _ = reply.send(match &poisoned {
+                        None => Ok(()),
+                        Some((kind, message)) => {
+                            Err(Box::new(VfsError::new(*kind, message.clone())))
+                        }
+                    });
+                }
             }
         });
         JournalHandle { tx }
     }
 
+    /// Appends `record` and returns once it is durable.
     async fn append(&self, record: JournalRecord) -> Result<()> {
+        self.append_all(vec![record]).await
+    }
+
+    /// Appends every record in `records`, in order, and returns once the
+    /// last one is durable -- which, the writer being FIFO, means all of
+    /// them are. A handful of batches at most, however long the list.
+    async fn append_all(&self, mut records: Vec<JournalRecord>) -> Result<()> {
+        let Some(last) = records.pop() else {
+            return Ok(());
+        };
+        for record in records {
+            self.tx.send((record, None)).map_err(|_| writer_gone())?;
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send((record, reply_tx)).map_err(|_| {
-            Box::new(VfsError::new(
-                ErrorKind::Fatal,
-                "journal writer task is no longer running",
-            ))
-        })?;
+        self.tx
+            .send((last, Some(reply_tx)))
+            .map_err(|_| writer_gone())?;
         reply_rx.await.map_err(|_| {
             Box::new(VfsError::new(
                 ErrorKind::Fatal,
@@ -2456,7 +2636,57 @@ impl JournalHandle {
             ))
         })?
     }
+
+    /// Queues `record` without waiting for it: it rides in the next batch
+    /// the writer commits, ahead of any record appended later, and the
+    /// next *awaited* append (at the latest, `execute`'s own `JobFinished`)
+    /// does not return until it is durable too. For records whose
+    /// durability only ever shortens recovery work rather than protecting
+    /// data -- see [`redo_safe`].
+    fn append_nowait(&self, record: JournalRecord) {
+        // A dead writer is reported by the next awaited append; nothing to
+        // do about it from here.
+        let _ = self.tx.send((record, None));
+    }
 }
+
+fn writer_gone() -> Box<VfsError> {
+    Box::new(VfsError::new(
+        ErrorKind::Fatal,
+        "journal writer task is no longer running",
+    ))
+}
+
+/// Steps whose journal records may be batched *ahead* of execution and
+/// whose `Completion` may be fire-and-forget: the ones a recovery redo can
+/// repeat without harm. Recovery re-runs every step that has an `Intent`
+/// but no `Completion`, so for these kinds an intent journaled early (the
+/// step never started before a crash) or a completion lost with the page
+/// cache (the step finished, the crash beat its fsync) both cost at most a
+/// redundant redo -- `CreateDir` on an existing directory, `SetMeta` and
+/// `Verify` applied twice, a `CopyFile`/`Reflink` finding its destination
+/// already there and going through the job's conflict policy. Everything
+/// else (`Rename`, `Remove`, `Link`, `Symlink`, `WriteTrashInfo`) keeps
+/// the strict one-awaited-fsync-per-record protocol: redoing a finished
+/// rename or delete fails on a missing source and would surface a phantom
+/// error at recovery time, and deletes are journaled before execution
+/// precisely so the undo stack can trust the record.
+fn redo_safe(step: &Step) -> bool {
+    matches!(
+        step.kind(),
+        StepKind::CreateDir
+            | StepKind::CopyFile
+            | StepKind::Reflink
+            | StepKind::SetMeta
+            | StepKind::Verify
+    )
+}
+
+/// How many redo-safe steps' `Intent`s are journaled with one awaited
+/// batch before those steps run. Larger means fewer fsyncs per file but
+/// more steps a recovery may redundantly redo after a crash; 64 keeps the
+/// worst-case redo to a fraction of a second of work.
+const INTENT_WINDOW: usize = 64;
 
 /// Spawns the 100ms-cadence progress-sampling task (design.md §9.3:
 /// "Updated on a 100 ms timer sampling atomic counters"). Returns its
@@ -3245,6 +3475,55 @@ mod tests {
             std::fs::read_to_string(dst.path().join(src_name).join("sub/b.txt")).unwrap(),
             "world!"
         );
+    }
+
+    /// Intent windows + fire-and-forget completions (2026-09-06): a plan
+    /// with more barrier steps than `INTENT_WINDOW` (200 nested empty
+    /// directories -> 200 `CreateDir`s and their deferred `SetMeta`s) runs
+    /// through several windows, every step still ends up with a durable
+    /// `Intent` and `Completion` by the time `execute` returns, and the
+    /// directories really exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_steps_beyond_one_intent_window_all_complete_and_are_journaled() {
+        let src = TempDir::new().unwrap();
+        for i in 0..200 {
+            std::fs::create_dir(src.path().join(format!("d{i:03}"))).unwrap();
+        }
+        let dst = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let cancel = crate::planner::CancelToken::new();
+        let plan = crate::planner::plan_copy(
+            &*fs,
+            &[vpath_for(src.path())],
+            &vpath_for(dst.path()),
+            PlanOptions::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert!(
+            plan.steps.len() > INTENT_WINDOW,
+            "{} steps is not enough to cross a window boundary",
+            plan.steps.len()
+        );
+
+        let (report, _events) = run(fs, plan.clone(), state.path(), 2).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let reports = crate::journal::JournalReader::scan(state.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(
+            reports[0].incomplete_steps.is_empty(),
+            "every one of the {} steps must have a matching Completion once execute returns",
+            plan.steps.len()
+        );
+        assert_eq!(reports[0].last_outcome, Some(JobOutcome::Completed));
+        let src_name = src.path().file_name().unwrap();
+        for i in 0..200 {
+            assert!(dst.path().join(src_name).join(format!("d{i:03}")).is_dir());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4837,7 +5116,8 @@ mod tests {
         };
 
         let ctx_task = ctx.clone();
-        let handle = tokio::spawn(async move { run_step_with_retry(&ctx_task, 0, &step).await });
+        let handle =
+            tokio::spawn(async move { run_step_with_retry(&ctx_task, 0, &step, None).await });
 
         // Poll the raw counter directly until real, partial (neither zero
         // nor complete) progress is observed, then pause -- exercising
@@ -5377,7 +5657,7 @@ mod tests {
             size: 1,
             conflict: Some(ConflictPolicy::Abort),
         };
-        let outcome1 = run_step_with_retry(&ctx, 0, &step1).await;
+        let outcome1 = run_step_with_retry(&ctx, 0, &step1, None).await;
         match outcome1 {
             StepRun::Done(StepOutcome::Skipped { .. }) => {}
             other => panic!("expected step 1's abort to resolve as a skip, got {other:?}"),
@@ -5399,7 +5679,7 @@ mod tests {
             size: 1,
             conflict: None,
         };
-        let outcome2 = run_step_with_retry(&ctx, 1, &step2).await;
+        let outcome2 = run_step_with_retry(&ctx, 1, &step2, None).await;
         assert!(
             matches!(outcome2, StepRun::Cancelled),
             "step 2 must bail out on the job's already-cancelled state instead of running, got \
@@ -5603,7 +5883,7 @@ mod tests {
         };
         let mut report = JobReport::default();
         for (i, step) in steps.iter().enumerate() {
-            match run_step_with_retry(&ctx, i as u32, step).await {
+            match run_step_with_retry(&ctx, i as u32, step, None).await {
                 StepRun::Done(outcome) => apply_outcome(&mut report, i as u32, step, outcome),
                 StepRun::Cancelled => panic!("no step in this test cancels the job"),
             }

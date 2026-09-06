@@ -28,12 +28,16 @@
 //! own round-trip tests), and it makes [`JournalReader::scan`]'s hardest
 //! requirement — treating a torn trailing record (the expected artifact of
 //! a `SIGKILL` landing mid-`write()`) as *absent*, not a scan-ending error —
-//! trivial: a line that fails to parse as JSON, or a final line with no
-//! trailing `\n` at all, just gets dropped. A record's bytes are written by
-//! a single `write_all` call immediately followed by `fsync`, so a crash
-//! can only ever truncate the *last* record, never corrupt one in the
-//! middle — [`JournalReader::scan`] treats a parse failure anywhere before
-//! the last line as real corruption (a hard error), not a recoverable gap.
+//! trivial: a torn tail -- a final line with no trailing `\n`, or a run of
+//! unparseable lines at the very end -- just gets dropped. Records are
+//! appended in *batches* ([`Journal::append_batch`]: one `write`, one
+//! `fsync`), so a `SIGKILL` (the page cache survives the process) persists
+//! a whole batch or none of it, and only a power loss mid-writeback can
+//! leave a prefix of a batch ending in garbage. Either way the damage is
+//! confined to the tail: [`JournalReader::scan`] treats an unparseable line
+//! *followed by a valid one* as real corruption (a hard error), never as a
+//! recoverable gap, because an append-only file cannot produce that shape
+//! by crashing.
 //!
 //! # Directory-entry durability
 //!
@@ -261,10 +265,38 @@ impl Journal {
     ///   but handled identically: pause the queue).
     /// - `Retryable`/`Fatal` — as for any local file I/O.
     pub fn append(&mut self, record: &JournalRecord) -> Result<()> {
-        let mut line = serde_json::to_string(record)
-            .map_err(|e| corrupt(&self.path, format!("failed to serialize record: {e}")))?;
-        line.push('\n');
-        self.file.write_all(line.as_bytes()).map_err(io_error)?;
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Appends every record in `records`, in order, with **one** `write`
+    /// and **one** `fsync` for the whole batch -- the group commit that
+    /// makes many-small-file jobs affordable (a 10 000-file copy writes
+    /// ~40 000 records; at one fsync each on a typical home filesystem that
+    /// was minutes of pure journal time, see `docs/perf-baseline.md`).
+    /// The durability contract is unchanged: when this returns `Ok`, every
+    /// record in the batch is on disk.
+    ///
+    /// Crash semantics of a batch: the bytes go down in a single `write`,
+    /// so a `SIGKILL` (the page cache survives) persists all of them or
+    /// none; only a power loss mid-writeback can leave a *prefix* of the
+    /// batch, ending in a torn line -- which [`JournalReader::scan`]
+    /// tolerates as long as nothing parseable follows it (see the module
+    /// doc comment's "Wire format" section).
+    ///
+    /// # Errors
+    /// As [`Self::append`]. On error nothing about the batch is promised;
+    /// callers treat the journal as unusable from then on.
+    pub fn append_batch(&mut self, records: &[JournalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(records.len() * 256);
+        for record in records {
+            serde_json::to_writer(&mut buf, record)
+                .map_err(|e| corrupt(&self.path, format!("failed to serialize record: {e}")))?;
+            buf.push(b'\n');
+        }
+        self.file.write_all(&buf).map_err(io_error)?;
         self.file.sync_all().map_err(io_error)?;
         Ok(())
     }
@@ -367,27 +399,34 @@ impl JournalReader {
             return Ok(None);
         }
 
-        // Every complete record's bytes end in '\n' (see the module doc
-        // comment's "Wire format" section) -- so only when the file does
-        // *not* end in '\n' can its last non-empty line possibly be a torn
-        // record. When it does, every non-empty line is a complete record
-        // and a parse failure anywhere is real corruption, not a crash
-        // artifact.
-        let ends_with_newline = contents.ends_with('\n');
-        let mut lines: Vec<&str> = contents.split('\n').filter(|l| !l.is_empty()).collect();
-        let torn_tail = if ends_with_newline { None } else { lines.pop() };
-
-        let mut records = Vec::with_capacity(lines.len() + 1);
-        for line in lines {
-            let record: JournalRecord = serde_json::from_str(line)
-                .map_err(|e| corrupt(path, format!("unparseable record {line:?}: {e}")))?;
-            records.push(record);
-        }
-        if let Some(tail) = torn_tail {
-            // A parse failure here is the expected SIGKILL artifact --
-            // silently dropped, not an error.
-            if let Ok(record) = serde_json::from_str::<JournalRecord>(tail) {
-                records.push(record);
+        // Records are appended in batches written by one `write` and one
+        // `fsync` (see the module doc comment's "Wire format" section), so
+        // the crash artifact to tolerate is a torn *tail*: the file's last
+        // batch may end in a partial line, or (power loss mid-writeback) in
+        // a run of partial/garbage lines. What is never tolerated is a bad
+        // line *followed by a good one* -- bytes that failed to parse with
+        // durable records after them cannot be a crash artifact of an
+        // append-only file, so that is real corruption and a hard error.
+        let lines: Vec<&str> = contents.split('\n').filter(|l| !l.is_empty()).collect();
+        let mut records = Vec::with_capacity(lines.len());
+        let mut torn_from: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<JournalRecord>(line) {
+                Ok(record) => {
+                    if let Some(first_bad) = torn_from {
+                        return Err(corrupt(
+                            path,
+                            format!(
+                                "unparseable record {:?} is followed by a valid one -- not a torn tail",
+                                lines[first_bad]
+                            ),
+                        ));
+                    }
+                    records.push(record);
+                }
+                Err(_) => {
+                    torn_from.get_or_insert(i);
+                }
             }
         }
 
@@ -775,6 +814,128 @@ mod tests {
             "resolve must leave no incomplete steps behind on a fresh rescan"
         );
         assert_eq!(reports_after[0].last_outcome, Some(JobOutcome::Cancelled));
+    }
+
+    /// Group commit (2026-09-06): a batch is one `write` + one `fsync`, and
+    /// every record in it is recovered, in order, exactly as if appended
+    /// one at a time.
+    #[test]
+    fn append_batch_records_are_all_recovered_in_order() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = Journal::open(JobId(3), dir.path()).unwrap();
+        let mut batch = vec![JournalRecord::JobStarted {
+            job_id: JobId(3),
+            started_at: Timestamp::EPOCH,
+            plan: Plan::new(Vec::new(), PlanOptions::default()),
+            kind: JobKind::Copy,
+        }];
+        for i in 0..200u32 {
+            batch.push(JournalRecord::Intent {
+                step_index: i,
+                step: Step::CreateDir {
+                    dest: test_vpath(i),
+                    mode: None,
+                },
+                partial_name: None,
+            });
+        }
+        // Complete all but the last three, in a second batch.
+        journal.append_batch(&batch).unwrap();
+        let completions: Vec<JournalRecord> = (0..197u32)
+            .map(|i| JournalRecord::Completion {
+                step_index: i,
+                outcome: StepOutcome::Succeeded,
+            })
+            .collect();
+        journal.append_batch(&completions).unwrap();
+
+        let reports = JournalReader::scan(dir.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].incomplete_steps, vec![197, 198, 199]);
+        assert_eq!(reports[0].last_outcome, None);
+    }
+
+    /// The batch crash artifact: a power loss mid-writeback can leave a
+    /// *prefix* of the last batch ending in one or more unparseable lines.
+    /// Everything before the first bad line is recovered; the bad tail is
+    /// dropped, not treated as corruption.
+    #[test]
+    fn scan_drops_a_multi_line_torn_tail() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = Journal::open(JobId(4), dir.path()).unwrap();
+        journal
+            .append_batch(&[
+                JournalRecord::JobStarted {
+                    job_id: JobId(4),
+                    started_at: Timestamp::EPOCH,
+                    plan: Plan::new(Vec::new(), PlanOptions::default()),
+                    kind: JobKind::Copy,
+                },
+                JournalRecord::Intent {
+                    step_index: 0,
+                    step: Step::CreateDir {
+                        dest: test_vpath(0),
+                        mode: None,
+                    },
+                    partial_name: None,
+                },
+            ])
+            .unwrap();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"Completion\":{\"step_in\n\0\0\0\0\n{\"Intent\":{\"ste")
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let reports = JournalReader::scan(dir.path()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].incomplete_steps,
+            vec![0],
+            "the intact prefix is recovered; the torn tail counts for nothing"
+        );
+    }
+
+    /// What is never tolerated: an unparseable line *followed by a valid
+    /// record*. An append-only file cannot produce that shape by crashing,
+    /// so it is real corruption and a hard error, exactly as before batching.
+    #[test]
+    fn scan_rejects_garbage_followed_by_a_valid_record() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = Journal::open(JobId(5), dir.path()).unwrap();
+        journal
+            .append(&JournalRecord::JobStarted {
+                job_id: JobId(5),
+                started_at: Timestamp::EPOCH,
+                plan: Plan::new(Vec::new(), PlanOptions::default()),
+                kind: JobKind::Copy,
+            })
+            .unwrap();
+        let path = journal.path().to_path_buf();
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"not json at all\n").unwrap();
+            file.sync_all().unwrap();
+        }
+        journal
+            .append(&JournalRecord::Completion {
+                step_index: 0,
+                outcome: StepOutcome::Succeeded,
+            })
+            .unwrap();
+
+        let err = JournalReader::scan(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("followed by a valid one"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

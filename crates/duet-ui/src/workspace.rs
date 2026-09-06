@@ -9412,18 +9412,29 @@ mod tests {
                         .unwrap();
                     path = journal.path().to_path_buf();
                 }
-                // A non-JSON line followed by a trailing newline -- the
-                // file therefore *ends* with `\n`, so `JournalReader::
-                // scan`'s "only a torn trailing record is tolerated" rule
-                // (see `duet_ops::journal`'s own module doc comment,
-                // "Wire format" section) treats this as a hard parse
-                // failure, not an expected crash artifact.
+                // A non-JSON line *followed by a valid record*. Since the
+                // journal moved to batched writes (2026-09-06), any trailing
+                // run of unparseable lines is the tolerated torn-tail crash
+                // artifact; what `JournalReader::scan` still rejects as
+                // real corruption is garbage with durable records after it
+                // (see `duet_ops::journal`'s module doc comment, "Wire
+                // format" section), which an append-only file cannot
+                // produce by crashing.
                 use std::io::Write as _;
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
+                {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    writeln!(file, "not valid json at all").unwrap();
+                }
+                Journal::open(job_id, state_dir)
+                    .unwrap()
+                    .append(&JournalRecord::Completion {
+                        step_index: 0,
+                        outcome: duet_ops::StepOutcome::Succeeded,
+                    })
                     .unwrap();
-                writeln!(file, "not valid json at all").unwrap();
             },
             |workspace, vcx, _data_dir| {
                 let _ = vcx.update(|window, cx| window.draw(cx));
