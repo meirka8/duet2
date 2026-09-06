@@ -5201,6 +5201,91 @@ mod tests {
                     bar.candidates(),
                     ["alpha".to_string(), "alphabet".to_string()]
                 );
+                assert_eq!(bar.selected(), None, "listed, nothing picked yet");
+            });
+
+            // Further Tabs cycle through the candidates like a shell's
+            // menu completion, wrapping; Shift+Tab goes back.
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alpha/"));
+                assert_eq!(bar.selected(), Some(0));
+                assert_eq!(bar.candidates().len(), 2, "the hint stays up");
+            });
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alphabet/"));
+                assert_eq!(bar.selected(), Some(1));
+            });
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alpha/"), "wraps");
+            });
+            vcx.dispatch_action(duet_widgets::input::OutdentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alphabet/"), "backwards");
+            });
+
+            // A real edit ends the cycle; the next Tab completes afresh
+            // from the new text (inside the chosen directory).
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/alphabet/x"), window, cx);
+            });
+            bar.read_with(vcx, |bar, _| {
+                assert!(bar.candidates().is_empty());
+                assert_eq!(bar.selected(), None);
+            });
+        });
+    }
+
+    /// The candidate hint shows a window of names; cycling past its end
+    /// slides the window by one (the leftmost name gives way, `+N`
+    /// shrinks by one), and wrapping around brings it back to the start.
+    #[gpui::test]
+    fn cycling_past_the_visible_hint_slides_the_window(cx: &mut TestAppContext) {
+        use crate::path_bar::HINT_VISIBLE;
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let total = HINT_VISIBLE + 3;
+            for i in 0..total {
+                std::fs::create_dir(dir.path().join(format!("d{i:02}"))).unwrap();
+            }
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let bar = open_path_bar_state(&workspace, vcx);
+            let root = dir.path().to_string_lossy().into_owned();
+
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/d"), window, cx);
+            });
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                bar.read_with(vcx, |bar, _| bar.candidates().len() == total)
+            });
+            bar.read_with(vcx, |bar, _| assert_eq!(bar.hint_window_start(), 0));
+
+            // Tab up to the last visible candidate: the window holds.
+            for _ in 0..HINT_VISIBLE {
+                vcx.dispatch_action(IndentInline);
+            }
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.selected(), Some(HINT_VISIBLE - 1));
+                assert_eq!(bar.hint_window_start(), 0);
+                assert_eq!(bar.value(cx), format!("{root}/d{:02}/", HINT_VISIBLE - 1));
+            });
+            // One more: the next candidate scrolls in, the first scrolls out.
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, _| {
+                assert_eq!(bar.selected(), Some(HINT_VISIBLE));
+                assert_eq!(bar.hint_window_start(), 1);
+            });
+            // Through the end and around: back to the first, window reset.
+            for _ in 0..3 {
+                vcx.dispatch_action(IndentInline);
+            }
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.selected(), Some(0));
+                assert_eq!(bar.hint_window_start(), 0);
+                assert_eq!(bar.value(cx), format!("{root}/d00/"));
             });
         });
     }

@@ -27,9 +27,19 @@
 //! T-3.1.6's armed guard) and the directory names starting with the typed
 //! prefix come back through a `oneshot`. Exactly one match completes the
 //! field with a trailing `/`; several extend the field to their longest
-//! common prefix and are listed under the input as a hint so the next
-//! keystroke can disambiguate; none is a silent no-op. Only directories
-//! are offered -- a path bar navigates, it never opens files.
+//! common prefix and are listed under the input as a hint; none is a
+//! silent no-op. Only directories are offered -- a path bar navigates,
+//! it never opens files.
+//!
+//! While that hint is showing, further `Tab`s cycle through the
+//! candidates the way a shell's menu completion does (`Shift+Tab` goes
+//! backwards): each press puts the next candidate, with its trailing `/`,
+//! into the field and highlights it in the hint. The hint shows at most
+//! [`HINT_VISIBLE`] names at a time with `… +N` for the rest; when the
+//! selection walks off the visible end the window slides by one, so the
+//! leftmost name drops out, `+N` shrinks by one, and a `+M …` on the left
+//! counts what has scrolled out. Any real edit ends the cycle and the next
+//! `Tab` completes afresh from what is now in the field.
 //!
 //! # What "navigates" means
 //!
@@ -62,15 +72,48 @@
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use duet_widgets::input::{Escape, IndentInline, Input, InputEvent, InputState, Position};
+use duet_widgets::input::{
+    Escape, IndentInline, Input, InputEvent, InputState, OutdentInline, Position,
+};
 use duet_widgets::layout::{h_flex, v_flex};
 use duet_widgets::theme::TokenPalette;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, WeakEntity, Window, div, px,
 };
+
+/// How many candidate names the hint line shows at once -- see the
+/// module doc comment's "Completion" section for how the window slides.
+pub(crate) const HINT_VISIBLE: usize = 8;
+
+/// The candidate index the next `Tab` (or `Shift+Tab`, `backwards`)
+/// selects: the first one when nothing is selected yet, wrapping at
+/// either end. Pure so the cycle order is unit-testable.
+pub(crate) fn cycle_index(selected: Option<usize>, len: usize, backwards: bool) -> usize {
+    debug_assert!(len > 0);
+    match (selected, backwards) {
+        (None, false) => 0,
+        (None, true) => len - 1,
+        (Some(ix), false) => (ix + 1) % len,
+        (Some(ix), true) => (ix + len - 1) % len,
+    }
+}
+
+/// Where the hint window must start so that `selected` is visible: the
+/// window slides by the minimum needed (one step per `Tab` at the edge,
+/// which is what makes the rightmost name give way to the next one and
+/// `+N` shrink by one) and never jumps further than that. Pure.
+pub(crate) fn scroll_hint_window(window_start: usize, selected: usize, visible: usize) -> usize {
+    if selected < window_start {
+        selected
+    } else if selected >= window_start + visible {
+        selected + 1 - visible
+    } else {
+        window_start
+    }
+}
 
 use crate::workspace::{PanelSide, Workspace};
 
@@ -261,6 +304,14 @@ pub(crate) struct PathBarState {
     /// Ambiguous-Tab hint: the directory names the last completion attempt
     /// found. Cleared on every edit.
     candidates: Vec<String>,
+    /// The directory `candidates` live in, so cycling can build each
+    /// candidate's full path without re-listing.
+    candidate_parent: Option<PathBuf>,
+    /// Which candidate the last `Tab` put into the field, if the user has
+    /// started cycling (see the module doc comment).
+    selected: Option<usize>,
+    /// Index of the first candidate the hint line shows.
+    window_start: usize,
     /// Why the last `Enter` was refused ("Not a directory: ..."), shown
     /// under the input until the next edit. Inline rather than a toast:
     /// the user is looking at the field they need to fix.
@@ -299,6 +350,9 @@ impl PathBarState {
             current,
             input,
             candidates: Vec::new(),
+            candidate_parent: None,
+            selected: None,
+            window_start: 0,
             error: None,
             programmatic_value: None,
             workspace,
@@ -323,6 +377,16 @@ impl PathBarState {
     #[cfg(test)]
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hint_window_start(&self) -> usize {
+        self.window_start
     }
 
     /// Whether keyboard focus is currently inside the bar's own input.
@@ -365,13 +429,46 @@ impl PathBarState {
                     return;
                 }
                 if !self.candidates.is_empty() || self.error.is_some() {
-                    self.candidates.clear();
+                    self.clear_candidates();
                     self.error = None;
                     cx.notify();
                 }
             }
             _ => {}
         }
+    }
+
+    fn clear_candidates(&mut self) {
+        self.candidates.clear();
+        self.candidate_parent = None;
+        self.selected = None;
+        self.window_start = 0;
+    }
+
+    /// `Tab`/`Shift+Tab` while the candidate hint is showing: put the
+    /// next (previous) candidate into the field and keep it visible in
+    /// the hint -- see the module doc comment's "Completion" section.
+    fn cycle(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(parent), false) = (self.candidate_parent.as_ref(), self.candidates.is_empty())
+        else {
+            return;
+        };
+        let ix = cycle_index(self.selected, self.candidates.len(), backwards);
+        self.selected = Some(ix);
+        self.window_start = scroll_hint_window(self.window_start, ix, HINT_VISIBLE);
+        let mut value = parent
+            .join(&self.candidates[ix])
+            .to_string_lossy()
+            .into_owned();
+        if !value.ends_with('/') {
+            value.push('/');
+        }
+        self.programmatic_value = Some(value.clone());
+        self.input.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+            state.set_cursor_position(Position::new(0, u32::MAX), window, cx);
+        });
+        cx.notify();
     }
 
     fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -418,8 +515,13 @@ impl PathBarState {
         .detach();
     }
 
-    /// `Tab`: see the module doc comment's "Completion" section.
+    /// `Tab`: see the module doc comment's "Completion" section. With a
+    /// candidate hint already showing this cycles instead of re-listing.
     pub(crate) fn try_complete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.candidates.is_empty() {
+            self.cycle(false, window, cx);
+            return;
+        }
         let typed = self.value(cx);
         let home = std::env::var_os("HOME").map(PathBuf::from);
         // Complete against the expanded form, so `~/Doc<Tab>` works, but
@@ -465,7 +567,11 @@ impl PathBarState {
                         state.set_cursor_position(Position::new(0, u32::MAX), window, cx);
                     });
                 }
-                this.candidates = candidates;
+                this.clear_candidates();
+                if !candidates.is_empty() {
+                    this.candidate_parent = Some(parent);
+                    this.candidates = candidates;
+                }
                 cx.notify();
             });
         })
@@ -477,14 +583,33 @@ impl Render for PathBarState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let error: Option<SharedString> = self.error.clone().map(SharedString::from);
-        let hint: Option<SharedString> = (!self.candidates.is_empty()).then(|| {
-            let shown: Vec<&str> = self.candidates.iter().take(8).map(String::as_str).collect();
-            let more = self.candidates.len().saturating_sub(shown.len());
-            let mut text = shown.join("  ");
-            if more > 0 {
-                text.push_str(&format!("  … +{more}"));
+        let hint = (!self.candidates.is_empty()).then(|| {
+            let start = self.window_start.min(self.candidates.len());
+            let end = (start + HINT_VISIBLE).min(self.candidates.len());
+            let before = start;
+            let after = self.candidates.len() - end;
+            let mut row = h_flex()
+                .px_1()
+                .gap_2()
+                .text_size(px(10.))
+                .text_color(tokens.color.statusbar_fg)
+                .overflow_hidden();
+            if before > 0 {
+                row = row.child(SharedString::from(format!("+{before} …")));
             }
-            text.into()
+            for (ix, name) in self.candidates[start..end].iter().enumerate() {
+                let mut item = div().child(SharedString::from(name.clone()));
+                if Some(start + ix) == self.selected {
+                    item = item
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(tokens.color.panel_fg_active);
+                }
+                row = row.child(item);
+            }
+            if after > 0 {
+                row = row.child(SharedString::from(format!("… +{after}")));
+            }
+            row
         });
         v_flex()
             .w_full()
@@ -493,6 +618,9 @@ impl Render for PathBarState {
             .on_action(cx.listener(|this, _: &IndentInline, window, cx| {
                 this.try_complete(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+                this.cycle(true, window, cx);
+            }))
             .child(
                 h_flex()
                     .w_full()
@@ -500,16 +628,7 @@ impl Render for PathBarState {
                     .items_center()
                     .child(Input::new(&self.input)),
             )
-            .when_some(hint, |this, hint| {
-                this.child(
-                    div()
-                        .px_1()
-                        .text_size(px(10.))
-                        .text_color(tokens.color.statusbar_fg)
-                        .truncate()
-                        .child(hint),
-                )
-            })
+            .when_some(hint, |this, hint| this.child(hint))
             .when_some(error, |this, error| {
                 this.child(
                     div()
@@ -688,6 +807,31 @@ mod tests {
         assert_eq!(completion_for(parent, "zzz", &names), (None, Vec::new()));
         let (value, _) = completion_for(parent, "", &names);
         assert_eq!(value, None, "three names share no prefix");
+    }
+
+    #[test]
+    fn cycle_index_walks_forward_and_backward_with_wraparound() {
+        assert_eq!(cycle_index(None, 3, false), 0);
+        assert_eq!(cycle_index(None, 3, true), 2);
+        assert_eq!(cycle_index(Some(0), 3, false), 1);
+        assert_eq!(cycle_index(Some(2), 3, false), 0);
+        assert_eq!(cycle_index(Some(0), 3, true), 2);
+        assert_eq!(cycle_index(Some(1), 3, true), 0);
+        assert_eq!(cycle_index(Some(0), 1, false), 0);
+    }
+
+    #[test]
+    fn hint_window_slides_one_step_at_the_edges_and_snaps_back_on_wrap() {
+        // Within the window: unchanged.
+        assert_eq!(scroll_hint_window(0, 0, 8), 0);
+        assert_eq!(scroll_hint_window(0, 7, 8), 0);
+        // Walking off the right edge drops exactly one name on the left.
+        assert_eq!(scroll_hint_window(0, 8, 8), 1);
+        assert_eq!(scroll_hint_window(1, 9, 8), 2);
+        // Wrapping to the first candidate brings the window back to it.
+        assert_eq!(scroll_hint_window(2, 0, 8), 0);
+        // Backwards off the left edge slides by one too.
+        assert_eq!(scroll_hint_window(2, 1, 8), 1);
     }
 
     #[test]
