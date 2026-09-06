@@ -45,10 +45,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use duet_index::{DirectoryModel, FilterSpec, SortColumn};
+use duet_index::{DirectoryModel, FilterSpec, SortColumn, extension_of};
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
-use duet_widgets::menu::{PopupMenu, PopupMenuItem};
+use duet_widgets::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
 };
@@ -57,18 +57,13 @@ use futures_util::StreamExt;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     HighlightStyle, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
-    ParentElement as _, Render, SharedString, Styled as _, StyledText, Window, actions, div, px,
+    ParentElement as _, Render, SharedString, Styled as _, StyledText, WeakEntity, Window, actions,
+    div, px,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-/// Column indices this delegate ships with -- a reasonable subset
-/// (name/size/modified). The full column set (permissions, owner,
-/// extension, git status, ...) is T-4.2.4's job; see `Column::new` calls
-/// in [`FileTableDelegate::new`] for the exact three.
-const COL_NAME: usize = 0;
-const COL_SIZE: usize = 1;
-const COL_MODIFIED: usize = 2;
+use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
 
 /// `duet_widgets::table::TableDelegate::render_last_empty_col`'s default
 /// (`gpui-component-0.5.1/src/table/delegate.rs`) unconditionally appends
@@ -80,54 +75,88 @@ const COL_MODIFIED: usize = 2;
 /// really means fits, with a little slack for rounding.
 const TABLE_CHROME_RESERVE: f32 = 20.0;
 
-/// Responsive column sizing: Size and Modified stay at their fixed ideal
-/// widths always -- they're short, roughly constant-width content (a size
-/// string, a date), nothing is gained by shrinking them. Name is the only
-/// elastic column: it grows to fill whatever space Size+Modified leave
-/// behind, and shrinks as the panel narrows, down to [`NAME_MIN`] --
-/// narrower than that, filenames just get ellipsized (`render_td` applies
-/// `.truncate()` to the Name cell), never truncated by hiding a column or
-/// growing the panel. Below `NAME_MIN` even with Size+Modified included,
-/// this falls back to fixed minimum widths for all three and lets
-/// `duet_widgets::table::Table`'s built-in horizontal scrollbar take over
-/// -- "impossibly narrow", not worth squeezing further.
+/// Derives the table widget's column definitions from a [`ColumnLayout`]
+/// (T-4.2.4): header text, order and the widget's own flags from the
+/// layout, widths from `widths` (the layout's responsive answer for the
+/// current panel width -- Name elastic, the rest fixed, see
+/// `columns.rs`), and the sort indicator from `sort` (the model's actual
+/// sort state), so the header can never show a column, an order or a
+/// sort arrow the table isn't really using. Name is `resizable(false)`:
+/// it is the elastic column, and a user drag on it would be undone by
+/// the very next responsive pass -- the other columns are what the user
+/// resizes, Name absorbs the difference.
 ///
-/// Full per-column configuration (more columns, user-chosen order/widths)
-/// is T-4.2.4's job.
-mod responsive {
-    pub const NAME_MIN: f32 = 60.0;
-    pub const NAME_IDEAL: f32 = 360.0;
-    pub const SIZE_WIDTH: f32 = 110.0;
-    pub const MODIFIED_WIDTH: f32 = 170.0;
+/// The one place `FileTableDelegate::columns` is ever built; every path
+/// that changes the layout, the width or the sort goes through
+/// [`FileTableDelegate::rebuild_columns`].
+fn build_columns(layout: &ColumnLayout, widths: &[f32], sort: (SortColumn, bool)) -> Vec<Column> {
+    layout
+        .columns()
+        .iter()
+        .zip(widths)
+        .map(|(entry, &width)| {
+            let mut column = Column::new(entry.kind.key(), entry.kind.title())
+                .width(px(width))
+                .sortable();
+            if entry.kind == ColumnKind::Name {
+                column = column.resizable(false);
+            }
+            if entry.kind.sort_column() == sort.0 {
+                column = if sort.1 {
+                    column.ascending()
+                } else {
+                    column.descending()
+                };
+            }
+            column
+        })
+        .collect()
+}
 
-    /// Computes column widths (Name, Size, Modified) for `available`
-    /// pixels of panel width. Never changes the *number* of columns --
-    /// see the module doc comment.
-    pub fn column_widths(available: f32) -> [f32; 3] {
-        let name = available - SIZE_WIDTH - MODIFIED_WIDTH;
-        if name >= NAME_MIN {
-            [name, SIZE_WIDTH, MODIFIED_WIDTH]
-        } else {
-            [NAME_MIN, SIZE_WIDTH, MODIFIED_WIDTH]
-        }
+/// TC's header-click rule, applied by [`FileTableDelegate::perform_sort`]
+/// instead of the widget's own three-state cycle: a click on the column
+/// the listing is already sorted by flips its direction; a click on any
+/// other column sorts by it ascending. Pure, so it's unit-testable.
+fn next_sort(current: (SortColumn, bool), clicked: SortColumn) -> (SortColumn, bool) {
+    if current.0 == clicked {
+        (clicked, !current.1)
+    } else {
+        (clicked, true)
     }
 }
 
-/// Clones `base` (Name/Size/Modified, in that order, carrying their
-/// sortable/alignment flags) and overwrites each clone's width from
-/// `widths`. Shared by [`FileTableDelegate::new`] (the narrow first-frame
-/// widths) and [`FileTableDelegate::apply_responsive_widths`] (every
-/// subsequent recomputation) so the two never drift out of sync on column
-/// order/count.
-fn columns_with_widths(base: &[Column], widths: [f32; 3]) -> Vec<Column> {
-    base.iter()
-        .cloned()
-        .zip(widths)
-        .map(|(mut col, w)| {
-            col.width = px(w);
-            col
-        })
-        .collect()
+/// The header right-click menu (T-4.2.4's add/remove): one checkable
+/// entry per column in the catalogue, plus a reset. Name is listed but
+/// disabled -- it can't be hidden (see `columns.rs`). Each entry reaches
+/// back into the table through its `WeakEntity`, the same captured-weak-
+/// handle pattern every other menu in this module uses.
+fn column_menu(
+    menu: PopupMenu,
+    layout: &ColumnLayout,
+    table: &WeakEntity<TableState<FileTableDelegate>>,
+) -> PopupMenu {
+    let mut menu = menu;
+    for kind in ColumnKind::ALL {
+        let table = table.clone();
+        menu = menu.item(
+            PopupMenuItem::new(kind.title())
+                .checked(layout.contains(kind))
+                .disabled(!kind.removable())
+                .on_click(move |_, _window, app| {
+                    let _ = table.update(app, |state, cx| {
+                        state.delegate_mut().toggle_column(kind, cx);
+                    });
+                }),
+        );
+    }
+    let table = table.clone();
+    menu.separator().item(
+        PopupMenuItem::new("Reset Columns").on_click(move |_, _window, app| {
+            let _ = table.update(app, |state, cx| {
+                state.delegate_mut().reset_columns(cx);
+            });
+        }),
+    )
 }
 
 /// One row's pre-formatted display text -- see the module doc comment for
@@ -137,6 +166,11 @@ struct RowText {
     name: SharedString,
     size: SharedString,
     modified: SharedString,
+    /// Empty (no allocation) unless the layout shows the Ext column --
+    /// see [`FileTableDelegate::rebuild_row_text`].
+    ext: SharedString,
+    /// Empty (no allocation) unless the layout shows the Attr column.
+    attrs: SharedString,
 }
 
 /// `duet_widgets::table::TableDelegate` (gpui-component's `TableDelegate`,
@@ -147,13 +181,20 @@ struct RowText {
 /// generation, never per frame. See the module doc comment.
 pub struct FileTableDelegate {
     model: DirectoryModel,
+    /// T-4.2.4: which columns, in what order, how wide -- this table's
+    /// copy of the shared [`ColumnLayoutStore`]'s layout. `columns` is
+    /// derived from it (plus the measured width and the model's sort
+    /// state) by [`Self::rebuild_columns`]; never edited directly.
+    layout: ColumnLayout,
+    /// The shared store every table in both panels renders from, so a
+    /// header change made here fans out to all of them (and to
+    /// `settings.toml`, via the workspace's observer). `None` only for
+    /// delegates built outside a `FileTable` (unit tests, the row
+    /// benchmark), where a change stays local.
+    layout_store: Option<WeakEntity<ColumnLayoutStore>>,
+    /// The widget-facing column definitions, always derived -- see
+    /// [`build_columns`].
     columns: Vec<Column>,
-    /// The Name/Size/Modified column definitions (sortable flags,
-    /// alignment, ...) at their initial widths -- `columns` is rebuilt from
-    /// this base (cloned, re-widthed) every time
-    /// [`Self::apply_responsive_widths`] runs, so those flags never need to
-    /// be re-specified by hand there.
-    base_columns: Vec<Column>,
     /// The panel width `columns` was last computed for -- lets
     /// `apply_responsive_widths` skip recomputation (and the `cx.notify()`
     /// that would follow) when the measured width hasn't materially
@@ -274,21 +315,8 @@ impl FileTableDelegate {
     /// Builds a delegate over `model` (which may be empty -- see
     /// `loading`'s doc comment for the "still populating" case).
     pub fn new(model: DirectoryModel) -> Self {
-        let base_columns = vec![
-            Column::new("name", "Name")
-                .width(px(responsive::NAME_IDEAL))
-                .sortable(),
-            // Not `.text_right()` -- see `render_td`'s doc comment: that
-            // builder sets `Column::align`, which nothing in
-            // `gpui-component-0.5.1`'s table rendering ever reads.
-            Column::new("size", "Size")
-                .width(px(responsive::SIZE_WIDTH))
-                .sortable(),
-            Column::new("modified", "Modified")
-                .width(px(responsive::MODIFIED_WIDTH))
-                .sortable(),
-        ];
-        // Start at NAME_MIN, not NAME_IDEAL: `duet_widgets::resizable`'s
+        // Starts at the layout's narrowest answer (`responsive_widths(0.0)`
+        // -- Name at its floor), not its ideal: `duet_widgets::resizable`'s
         // `ResizablePanel` treats a panel with no stored size yet as
         // non-shrinkable on its very first render (`flex_none()` in
         // `gpui-component-0.5.1/src/resizable/panel.rs`), and an
@@ -299,18 +327,17 @@ impl FileTableDelegate {
         // narrow, and let `FileTable::render`'s measuring canvas correct
         // `columns` to the real available width within a frame or two,
         // same as any other resize.
-        let columns = columns_with_widths(
-            &base_columns,
-            [
-                responsive::NAME_MIN,
-                responsive::SIZE_WIDTH,
-                responsive::MODIFIED_WIDTH,
-            ],
+        let layout = ColumnLayout::default();
+        let columns = build_columns(
+            &layout,
+            &layout.responsive_widths(0.0),
+            (SortColumn::Name, true),
         );
         let mut delegate = Self {
             model,
+            layout,
+            layout_store: None,
             columns,
-            base_columns,
             last_available_width: None,
             row_text: Vec::new(),
             cached_generation: u64::MAX, // guarantees the first rebuild runs
@@ -333,10 +360,9 @@ impl FileTableDelegate {
     }
 
     /// Recomputes `columns` for `available` pixels of real panel width
-    /// (see `FileTable::render`'s measuring `canvas`) -- see the
-    /// `responsive` module doc comment. Returns whether anything actually
-    /// changed, so the caller only `cx.notify()`s on a real change rather
-    /// than every frame.
+    /// (see `FileTable::render`'s measuring `canvas`) -- see `columns.rs`'s
+    /// responsive rule. Returns whether anything actually changed, so the
+    /// caller only `refresh()`es on a real change rather than every frame.
     fn apply_responsive_widths(&mut self, available: f32) -> bool {
         if let Some(last) = self.last_available_width
             && (last - available).abs() < 1.0
@@ -344,47 +370,132 @@ impl FileTableDelegate {
             return false;
         }
         self.last_available_width = Some(available);
-
-        let usable = (available - TABLE_CHROME_RESERVE).max(0.0);
-        self.columns = columns_with_widths(&self.base_columns, responsive::column_widths(usable));
+        self.rebuild_columns();
         true
     }
 
-    /// The current `[Name, Size, Modified]` column widths (px) together
-    /// with the panel width they were computed for -- `None` until the
-    /// measuring canvas has actually run at least once (see
-    /// `apply_responsive_widths`). T-4.3.2's `Panel::add_tab_entry` uses
-    /// this to seed a freshly-created sibling tab's initial widths
-    /// directly from one that's already been measured (every tab in a
-    /// `Panel` renders at the same panel width, so a sibling's answer is
-    /// exactly right, not an approximation), skipping the one-frame
-    /// narrow-then-corrects dance [`Self::new`] otherwise commits to.
-    /// Purely cosmetic -- `apply_responsive_widths` would converge to the
-    /// same answer regardless -- but without this, a tab opened mid-
-    /// session (unlike the very first tab at app startup, which rides
-    /// along with several other early re-renders that mask the same
-    /// glitch) visibly flashes narrow until some unrelated later action
-    /// happens to trigger the next repaint.
-    pub(crate) fn responsive_seed(&self) -> Option<([f32; 3], f32)> {
-        let available = self.last_available_width?;
-        Some((
-            [
-                f32::from(self.columns[COL_NAME].width),
-                f32::from(self.columns[COL_SIZE].width),
-                f32::from(self.columns[COL_MODIFIED].width),
-            ],
-            available,
-        ))
+    /// Re-derives `columns` from the layout, the last measured width and
+    /// the model's sort state -- see [`build_columns`]. Cheap (a handful
+    /// of small clones), and the only writer of `columns`.
+    fn rebuild_columns(&mut self) {
+        let usable = self
+            .last_available_width
+            .map(|available| (available - TABLE_CHROME_RESERVE).max(0.0))
+            .unwrap_or(0.0);
+        let widths = self.layout.responsive_widths(usable);
+        let options = self.model.sort_options();
+        self.columns = build_columns(&self.layout, &widths, (options.column, options.ascending));
     }
 
-    /// The inverse of [`Self::responsive_seed`]: applies an already-known
-    /// widths/available-width pair directly, without going through
-    /// [`Self::apply_responsive_widths`]'s own recomputation -- there's
-    /// nothing to recompute, the caller already has the exact answer that
-    /// call would produce.
-    fn seed_column_widths(&mut self, widths: [f32; 3], available: f32) {
-        self.columns = columns_with_widths(&self.base_columns, widths);
+    /// The panel width this table's columns were last computed for --
+    /// `None` until the measuring canvas has actually run at least once
+    /// (see `apply_responsive_widths`). T-4.3.2's `Panel::add_tab_entry`
+    /// uses this to seed a freshly-created sibling tab directly from one
+    /// that's already been measured (every tab in a `Panel` renders at
+    /// the same panel width, so a sibling's answer is exactly right, not
+    /// an approximation), skipping the one-frame narrow-then-corrects
+    /// dance [`Self::new`] otherwise commits to. Purely cosmetic --
+    /// `apply_responsive_widths` would converge to the same answer
+    /// regardless -- but without this, a tab opened mid-session (unlike
+    /// the very first tab at app startup, which rides along with several
+    /// other early re-renders that mask the same glitch) visibly flashes
+    /// narrow until some unrelated later action happens to trigger the
+    /// next repaint.
+    pub(crate) fn responsive_seed(&self) -> Option<f32> {
+        self.last_available_width
+    }
+
+    /// The inverse of [`Self::responsive_seed`]: adopts an already-
+    /// measured panel width directly.
+    fn seed_available_width(&mut self, available: f32) {
         self.last_available_width = Some(available);
+        self.rebuild_columns();
+    }
+
+    /// This table's current column layout (T-4.2.4).
+    #[cfg(test)]
+    pub(crate) fn layout(&self) -> &ColumnLayout {
+        &self.layout
+    }
+
+    /// See the `layout_store` field's doc comment.
+    pub(crate) fn set_layout_store(&mut self, store: WeakEntity<ColumnLayoutStore>) {
+        self.layout_store = Some(store);
+    }
+
+    /// Adopts `layout` (from the shared store, or a local change about to
+    /// be published to it). Rebuilds the per-row text cache only when the
+    /// *set* of text-bearing columns changed (Ext/Attr appearing or
+    /// disappearing -- see `rebuild_row_text`); a pure reorder or resize
+    /// never touches it. Returns whether anything changed, so an
+    /// observer can skip the widget `refresh()` for the echo of its own
+    /// publish.
+    pub(crate) fn apply_layout(&mut self, layout: ColumnLayout) -> bool {
+        if self.layout == layout {
+            return false;
+        }
+        let text_columns = |layout: &ColumnLayout| {
+            (
+                layout.contains(ColumnKind::Extension),
+                layout.contains(ColumnKind::Attributes),
+            )
+        };
+        let before = text_columns(&self.layout);
+        self.layout = layout;
+        if text_columns(&self.layout) != before {
+            self.cached_generation = u64::MAX;
+            self.rebuild_row_text();
+        }
+        self.rebuild_columns();
+        true
+    }
+
+    /// Pushes this delegate's layout to the shared store -- every other
+    /// table follows through its own observer, and the workspace persists
+    /// it -- and refreshes this table's own header on the next effect
+    /// flush. Deferred, not immediate: this is called from inside the
+    /// widget's own event handlers (a header menu click, `move_column`,
+    /// the resize mouse-up), where `TableState` is already borrowed and
+    /// `refresh()` can't be called on it directly.
+    fn publish_layout(&self, cx: &mut Context<TableState<Self>>) {
+        if let Some(store) = self.layout_store.as_ref().and_then(WeakEntity::upgrade) {
+            let layout = self.layout.clone();
+            store.update(cx, |store, cx| {
+                store.set_full(layout, cx);
+            });
+        }
+        let this = cx.weak_entity();
+        cx.defer(move |app| {
+            let _ = this.update(app, |state, cx| state.refresh(cx));
+        });
+    }
+
+    /// Header menu: show `kind` if hidden, hide it if shown (Name: no-op).
+    pub(crate) fn toggle_column(&mut self, kind: ColumnKind, cx: &mut Context<TableState<Self>>) {
+        let mut layout = self.layout.clone();
+        if layout.toggle(kind) && self.apply_layout(layout) {
+            self.publish_layout(cx);
+        }
+    }
+
+    /// Header menu: back to the default three columns at default widths.
+    pub(crate) fn reset_columns(&mut self, cx: &mut Context<TableState<Self>>) {
+        if self.apply_layout(ColumnLayout::default()) {
+            self.publish_layout(cx);
+        }
+    }
+
+    /// `TableEvent::ColumnWidthsChanged`: the widths the widget settled on
+    /// after a drag-resize, one per column in display order.
+    pub(crate) fn record_column_widths(
+        &mut self,
+        widths: &[f32],
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let mut layout = self.layout.clone();
+        if layout.set_widths(widths) && self.apply_layout(layout) {
+            self.publish_layout(cx);
+        }
     }
 
     pub fn model(&self) -> &DirectoryModel {
@@ -412,6 +523,9 @@ impl FileTableDelegate {
         self.model = model;
         self.cached_generation = u64::MAX;
         self.rebuild_row_text();
+        // The new model carries its own sort (a restored session's, an
+        // inherited tab's); the header's arrow must follow it.
+        self.rebuild_columns();
         // Every fresh listing starts the cursor on real row 0, not
         // wherever `cursor_on_parent` happened to be left over from
         // whatever directory was showing before -- without this, a plain
@@ -1115,6 +1229,12 @@ impl FileTableDelegate {
         self.row_text.clear();
         self.row_text.reserve(self.model.order().len());
         self.total_bytes_in_view = 0;
+        // Ext/Attr text is only materialised while those columns are
+        // shown: two more `SharedString`s per row would otherwise cost
+        // ~100 MB on a 1M-row listing that never displays them (NFR-06).
+        // Toggling either column on re-runs this pass (`apply_layout`).
+        let want_ext = self.layout.contains(ColumnKind::Extension);
+        let want_attrs = self.layout.contains(ColumnKind::Attributes);
         for &ix in self.model.order() {
             let id = EntryId::new(ix);
             let entries = self.model.entries();
@@ -1133,10 +1253,24 @@ impl FileTableDelegate {
             write_date(&mut self.scratch, entries.mtime_secs(id));
             let modified = SharedString::new(self.scratch.as_str());
 
+            let ext = match extension_of(entries.name(id)) {
+                e if want_ext && !e.is_empty() => SharedString::new(e),
+                _ => SharedString::default(),
+            };
+            let attrs = if want_attrs {
+                self.scratch.clear();
+                write_mode(&mut self.scratch, entries.mode(id), kind);
+                SharedString::new(self.scratch.as_str())
+            } else {
+                SharedString::default()
+            };
+
             self.row_text.push(RowText {
                 name,
                 size,
                 modified,
+                ext,
+                attrs,
             });
         }
         self.cached_generation = self.model.generation();
@@ -1161,22 +1295,73 @@ impl TableDelegate for FileTableDelegate {
         &self.columns[col_ix]
     }
 
+    /// Header click. The widget's own `sort` argument (its three-state
+    /// Default/Descending/Ascending cycle) is deliberately ignored in
+    /// favour of [`next_sort`]: the model is the one source of truth for
+    /// the sort, the header arrow is rebuilt from it (`rebuild_columns` +
+    /// the deferred `refresh()`), and the widget's cycle would otherwise
+    /// fall out of step with it after any refresh -- T-4.2.4's "header
+    /// sort indicator correct" AC, which also covers a restored session's
+    /// sort (T-4.3.7) showing its arrow from the first frame.
     fn perform_sort(
         &mut self,
         col_ix: usize,
-        sort: ColumnSort,
+        _sort: ColumnSort,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) {
-        let column = match col_ix {
-            COL_SIZE => SortColumn::Size,
-            COL_MODIFIED => SortColumn::Modified,
-            _ => SortColumn::Name,
+        let Some(kind) = self.layout.kind_at(col_ix) else {
+            return;
         };
-        let ascending = !matches!(sort, ColumnSort::Descending);
+        let options = self.model.sort_options();
+        let (column, ascending) =
+            next_sort((options.column, options.ascending), kind.sort_column());
         self.model.sort_by(column, ascending);
         self.rebuild_row_text();
         self.sync_cursor_row_from_model();
+        self.rebuild_columns();
+        let this = cx.weak_entity();
+        cx.defer(move |app| {
+            let _ = this.update(app, |state, cx| state.refresh(cx));
+        });
+    }
+
+    /// Header drag-reorder (T-4.2.4). The widget reorders its own column
+    /// groups right after this returns; the layout change is published so
+    /// every other table (and `settings.toml`) follows.
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let mut layout = self.layout.clone();
+        if layout.move_column(col_ix, to_ix) && self.apply_layout(layout) {
+            self.publish_layout(cx);
+        }
+    }
+
+    /// Header cell: the column title, with the add/remove menu on
+    /// right-click ([`column_menu`]). The widget wraps this in its own
+    /// left-click-to-sort / drag-to-move / resize-handle chrome.
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let title = self
+            .layout
+            .kind_at(col_ix)
+            .map(ColumnKind::title)
+            .unwrap_or("");
+        let layout = self.layout.clone();
+        let table = cx.weak_entity();
+        div()
+            .size_full()
+            .child(title)
+            .context_menu(move |menu, _window, _cx| column_menu(menu, &layout, &table))
     }
 
     /// Row container: the only per-row work is an `order`/selection-bitmap
@@ -1244,20 +1429,23 @@ impl TableDelegate for FileTableDelegate {
         // The synthetic ".." row (T-4.3.1) has no `row_text` entry -- it
         // isn't a model row at all -- so it's rendered directly here
         // instead of going through the `row_text` lookup below.
+        let kind = self.layout.kind_at(col_ix);
         let text = if self.has_parent_row && row_ix == 0 {
-            match col_ix {
-                COL_NAME => SharedString::from(".."),
+            match kind {
+                Some(ColumnKind::Name) => SharedString::from(".."),
                 _ => SharedString::default(),
             }
         } else {
             let model_row = row_ix - self.parent_offset();
             self.row_text
                 .get(model_row)
-                .map(|row| match col_ix {
-                    COL_NAME => row.name.clone(),
-                    COL_SIZE => row.size.clone(),
-                    COL_MODIFIED => row.modified.clone(),
-                    _ => SharedString::default(),
+                .map(|row| match kind {
+                    Some(ColumnKind::Name) => row.name.clone(),
+                    Some(ColumnKind::Extension) => row.ext.clone(),
+                    Some(ColumnKind::Size) => row.size.clone(),
+                    Some(ColumnKind::Modified) => row.modified.clone(),
+                    Some(ColumnKind::Attributes) => row.attrs.clone(),
+                    None => SharedString::default(),
                 })
                 .unwrap_or_default()
         };
@@ -1285,7 +1473,7 @@ impl TableDelegate for FileTableDelegate {
             .w_full()
             .px_2()
             .truncate();
-        if col_ix == COL_SIZE || col_ix == COL_MODIFIED {
+        if kind.is_some_and(ColumnKind::right_aligned) {
             cell = cell.text_right();
         }
 
@@ -1313,7 +1501,7 @@ impl TableDelegate for FileTableDelegate {
         // signal that the panel is currently in quick-filter regime,
         // visible for as long as the (now no-longer-timing-out) filtered
         // view stays up, not just on the keystroke that produced it.
-        if col_ix == COL_NAME {
+        if kind == Some(ColumnKind::Name) {
             let model_row =
                 (!self.has_parent_row || row_ix != 0).then(|| row_ix - self.parent_offset());
             let ranges: Option<Vec<std::ops::Range<usize>>> = model_row.and_then(|model_row| {
@@ -2055,22 +2243,42 @@ impl FileTable {
     /// of tab lifecycle) -- taking `TabRestore` (itself `pub(crate)`) as
     /// a parameter here would otherwise leak a private type through a
     /// public signature.
+    // Eight parameters: T-4.2.4 added the shared layout store to an already
+    // full signature. Every one is a distinct per-tab input `Panel` really
+    // has to supply; bundling them into a struct would just move the same
+    // eight names one level down.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         dir: PathBuf,
         tokio_handle: tokio::runtime::Handle,
-        width_seed: Option<([f32; 3], f32)>,
+        width_seed: Option<f32>,
+        layout_store: Entity<ColumnLayoutStore>,
         restore: TabRestore,
         settings: FileTableSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut delegate = FileTableDelegate::new(DirectoryModel::new());
-        if let Some((widths, available)) = width_seed {
-            delegate.seed_column_widths(widths, available);
+        delegate.set_layout_store(layout_store.downgrade());
+        delegate.apply_layout(layout_store.read(cx).full().clone());
+        if let Some(available) = width_seed {
+            delegate.seed_available_width(available);
         }
         delegate.set_mouse_mode(settings.mouse_mode);
         delegate.set_quick_search_default_mode(settings.quick_search_default_mode);
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
+        // T-4.2.4: follow the shared layout. `apply_layout` is a no-op for
+        // the echo of this table's own publish (same layout already
+        // adopted), so only *other* tables' changes cost a `refresh()`.
+        cx.observe(&layout_store, |this, store, cx| {
+            let layout = store.read(cx).full().clone();
+            this.state.update(cx, |state, cx| {
+                if state.delegate_mut().apply_layout(layout) {
+                    state.refresh(cx);
+                }
+            });
+        })
+        .detach();
         spawn_directory_load(
             dir.clone(),
             tokio_handle.clone(),
@@ -2120,7 +2328,14 @@ impl FileTable {
                 TableEvent::SelectColumn(_) => {
                     state.update(cx, |state, cx| state.clear_selection(cx));
                 }
-                _ => {}
+                TableEvent::ColumnWidthsChanged(widths) => {
+                    // T-4.2.4 drag-resize: emitted once, on mouse-up.
+                    let widths: Vec<f32> = widths.iter().map(|w| f32::from(*w)).collect();
+                    state.update(cx, |state, cx| {
+                        state.delegate_mut().record_column_widths(&widths, cx);
+                    });
+                }
+                TableEvent::MoveColumn(..) => {} // handled in the delegate's `move_column`
             },
         )
         .detach();
@@ -2193,7 +2408,7 @@ impl FileTable {
     }
 
     /// See `FileTableDelegate::responsive_seed`.
-    pub(crate) fn responsive_seed(&self, cx: &App) -> Option<([f32; 3], f32)> {
+    pub(crate) fn responsive_seed(&self, cx: &App) -> Option<f32> {
         self.state.read(cx).delegate().responsive_seed()
     }
 
@@ -3172,6 +3387,10 @@ fn spawn_directory_load(
             if let Some(row) = delegate.display_row() {
                 state.scroll_to_row(row, cx);
             }
+            // The header's sort arrow is rebuilt from the loaded model's
+            // sort by `set_model`; `refresh()` is what makes the widget
+            // pick the rebuilt columns up (see `FileTable::render`).
+            state.refresh(cx);
             cx.notify();
             true
         });
@@ -3221,8 +3440,11 @@ async fn list_directory(dir: PathBuf) -> Result<Vec<DirEntry>, String> {
     let vpath = local_vpath(&dir)?;
 
     let fs = LocalFs;
+    // `MODE` too (T-4.2.4's Attr column): `statx` returns it in the same
+    // call as the mtime, so it costs no extra syscall, and `EntryStore`
+    // keeps it as a 4-byte column rather than boxing anything.
     let opts = ListOpts {
-        fields: ListFields::MODIFIED,
+        fields: ListFields::MODIFIED | ListFields::MODE,
         follow_symlinks: false,
     };
     let mut stream = fs.read_dir(&vpath, opts);
@@ -4074,55 +4296,6 @@ mod tests {
     }
 
     #[test]
-    fn responsive_widths_keep_size_and_modified_fixed_always() {
-        for available in [80.0, 250.0, 500.0, 1000.0] {
-            let widths = responsive::column_widths(available);
-            assert_eq!(widths[1], responsive::SIZE_WIDTH, "Size never changes");
-            assert_eq!(
-                widths[2],
-                responsive::MODIFIED_WIDTH,
-                "Modified never changes"
-            );
-        }
-    }
-
-    #[test]
-    fn responsive_widths_grow_name_to_fill_all_leftover_space_when_roomy() {
-        let widths = responsive::column_widths(1000.0);
-        let expected_name = 1000.0 - responsive::SIZE_WIDTH - responsive::MODIFIED_WIDTH;
-        assert_eq!(widths[0], expected_name);
-        assert!((widths.iter().sum::<f32>() - 1000.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn responsive_widths_shrink_name_as_panel_narrows() {
-        let wide = responsive::column_widths(1000.0);
-        let narrow = responsive::column_widths(500.0);
-        assert!(narrow[0] < wide[0], "Name shrinks as available width drops");
-        assert_eq!(
-            narrow[0],
-            500.0 - responsive::SIZE_WIDTH - responsive::MODIFIED_WIDTH
-        );
-    }
-
-    #[test]
-    fn responsive_widths_fall_back_to_name_min_when_impossibly_narrow() {
-        // Below Size+Modified+NAME_MIN, Name can't shrink any further
-        // without disappearing -- hold it at its floor and let the
-        // Table's own horizontal scrollbar handle the (now unavoidable)
-        // overflow, rather than letting Name go to zero or negative.
-        let widths = responsive::column_widths(50.0);
-        assert_eq!(
-            widths,
-            [
-                responsive::NAME_MIN,
-                responsive::SIZE_WIDTH,
-                responsive::MODIFIED_WIDTH,
-            ]
-        );
-    }
-
-    #[test]
     fn apply_responsive_widths_updates_columns_and_dedupes_repeat_calls() {
         let mut delegate = FileTableDelegate::new(sample_model());
         assert!(delegate.apply_responsive_widths(500.0));
@@ -4142,6 +4315,114 @@ mod tests {
         assert!(
             delegate.columns[0].width > narrow_name,
             "Name grows back once the panel widens"
+        );
+        let fixed: f32 = delegate.columns[1..]
+            .iter()
+            .map(|c| f32::from(c.width))
+            .sum();
+        assert_eq!(
+            f32::from(delegate.columns[0].width) + fixed,
+            1000.0 - TABLE_CHROME_RESERVE,
+            "Name takes exactly what the fixed columns leave"
+        );
+    }
+
+    fn column_keys(delegate: &FileTableDelegate) -> Vec<String> {
+        delegate.columns.iter().map(|c| c.key.to_string()).collect()
+    }
+
+    #[test]
+    fn apply_layout_changes_the_column_set_and_materialises_ext_and_attr_text() {
+        let mut model = DirectoryModel::new();
+        let mut with_mode = meta(EntryKind::File, 10, 0);
+        with_mode.mode = Some(0o100644);
+        model.entries_mut().push("notes.txt", &with_mode);
+        model
+            .entries_mut()
+            .push("Makefile", &meta(EntryKind::File, 20, 0));
+        model.sort_by(SortColumn::Name, true);
+        let mut delegate = FileTableDelegate::new(model);
+        assert_eq!(column_keys(&delegate), ["name", "size", "modified"]);
+        assert!(
+            delegate
+                .row_text
+                .iter()
+                .all(|r| r.ext.is_empty() && r.attrs.is_empty()),
+            "no Ext/Attr column shown, so no text is materialised"
+        );
+
+        assert!(delegate.apply_layout(ColumnLayout::from_kinds(ColumnKind::ALL)));
+        assert_eq!(
+            column_keys(&delegate),
+            ["name", "ext", "size", "modified", "attrs"]
+        );
+        let by_name = |name: &str| {
+            delegate
+                .row_text
+                .iter()
+                .find(|r| r.name.as_ref() == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("notes.txt").ext.as_ref(), "txt");
+        assert_eq!(by_name("notes.txt").attrs.as_ref(), "-rw-r--r--");
+        assert_eq!(by_name("Makefile").ext.as_ref(), "");
+        assert_eq!(by_name("Makefile").attrs.as_ref(), "-", "mode unknown");
+
+        assert!(
+            !delegate.apply_layout(ColumnLayout::from_kinds(ColumnKind::ALL)),
+            "same layout again is a no-op"
+        );
+
+        let mut reordered = ColumnLayout::from_kinds(ColumnKind::ALL);
+        reordered.move_column(4, 1);
+        assert!(delegate.apply_layout(reordered));
+        assert_eq!(
+            column_keys(&delegate),
+            ["name", "attrs", "ext", "size", "modified"]
+        );
+        assert_eq!(delegate.columns[1].name.as_ref(), "Attr");
+    }
+
+    #[test]
+    fn built_columns_carry_the_models_sort_arrow_and_name_is_not_resizable() {
+        let layout = ColumnLayout::from_kinds(ColumnKind::ALL);
+        let widths = layout.responsive_widths(1000.0);
+        let columns = build_columns(&layout, &widths, (SortColumn::Size, false));
+        assert_eq!(columns[2].key.as_ref(), "size");
+        assert_eq!(columns[2].sort, Some(ColumnSort::Descending));
+        assert!(
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| *ix != 2)
+                .all(|(_, c)| c.sort == Some(ColumnSort::Default)),
+            "every other sortable column shows the neutral indicator"
+        );
+        assert!(!columns[0].resizable, "Name is elastic, not draggable");
+        assert!(columns[1..].iter().all(|c| c.resizable));
+
+        let ascending = build_columns(&layout, &widths, (SortColumn::Extension, true));
+        assert_eq!(ascending[1].sort, Some(ColumnSort::Ascending));
+    }
+
+    #[test]
+    fn header_click_flips_the_current_column_and_starts_others_ascending() {
+        assert_eq!(
+            next_sort((SortColumn::Name, true), SortColumn::Name),
+            (SortColumn::Name, false)
+        );
+        assert_eq!(
+            next_sort((SortColumn::Name, false), SortColumn::Name),
+            (SortColumn::Name, true)
+        );
+        assert_eq!(
+            next_sort((SortColumn::Name, false), SortColumn::Size),
+            (SortColumn::Size, true)
+        );
+        assert_eq!(
+            next_sort((SortColumn::Size, true), SortColumn::Attributes),
+            (SortColumn::Attributes, true)
         );
     }
 

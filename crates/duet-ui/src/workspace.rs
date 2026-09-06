@@ -41,6 +41,7 @@ use gpui::{
 use crate::attributes_dialog::{
     AttributesDialogState, AttributesPrefill, bind_attributes_dialog_keys,
 };
+use crate::columns::{ColumnLayout, ColumnLayoutStore};
 use crate::command_palette::CommandPaletteDelegate;
 use crate::conflict_dialog::{
     ConflictDialogState, ConflictRequest, InteractiveConflictResolver, bind_conflict_dialog_keys,
@@ -957,6 +958,25 @@ impl Workspace {
                 .map(load_quick_search_idle_timeout)
                 .unwrap_or(Duration::from_millis(1200)),
         };
+        // T-4.2.4: the one column layout every tab in both panels renders
+        // from (see `columns.rs`), read once from `[panels.layouts.full]`
+        // (built-in default when absent or unusable). Owned by the two
+        // `Panel`s (every tab holds a handle); observed here to persist
+        // each change any table publishes to `settings.toml`, off the UI
+        // thread, exactly like `splitter_ratio`.
+        let column_layouts = cx.new(|_| {
+            ColumnLayoutStore::new(
+                settings_path
+                    .as_deref()
+                    .map(load_column_layout)
+                    .unwrap_or_default(),
+            )
+        });
+        cx.observe(&column_layouts, |this, store, cx| {
+            let layout = store.read(cx).full().to_config();
+            this.persist_column_layout(layout, cx);
+        })
+        .detach();
         // T-5.2.6: the two `[operations]`/`[trash]` values F8 needs, read
         // once here alongside every other `settings.toml`-derived default.
         let confirm_delete = settings_path
@@ -1012,6 +1032,7 @@ impl Workspace {
                 left_active,
                 tokio_handle.clone(),
                 file_table_settings,
+                column_layouts.clone(),
                 window,
                 cx,
             )
@@ -1022,6 +1043,7 @@ impl Workspace {
                 right_active,
                 tokio_handle.clone(),
                 file_table_settings,
+                column_layouts.clone(),
                 window,
                 cx,
             )
@@ -1397,6 +1419,25 @@ impl Workspace {
                     tracing::warn!(
                         target: "duet_ui::workspace",
                         "failed to persist splitter ratio: {err}"
+                    );
+                }
+            })
+            .detach();
+    }
+
+    /// Saves the Full-view column layout to `settings.toml` off the UI
+    /// thread -- same best-effort contract as
+    /// [`Self::persist_splitter_ratio`].
+    fn persist_column_layout(&self, layout: duet_config::ColumnLayout, cx: &mut Context<Self>) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = save_column_layout(&path, crate::columns::FULL_VIEW, &layout) {
+                    tracing::warn!(
+                        target: "duet_ui::workspace",
+                        "failed to persist column layout: {err}"
                     );
                 }
             })
@@ -4221,6 +4262,30 @@ fn load_splitter_ratio(path: &std::path::Path) -> f32 {
         })
 }
 
+/// Reads `[panels.layouts.full]` (T-4.2.4) from `settings.toml` at
+/// `path`, same fallback tolerance as [`load_splitter_ratio`]; a section
+/// that is absent or unusable (see `ColumnLayout::from_config`) yields
+/// the built-in default layout.
+fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| {
+            settings
+                .panels
+                .layouts
+                .get(crate::columns::FULL_VIEW)
+                .and_then(ColumnLayout::from_config)
+                .unwrap_or_default()
+        })
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default column layout (settings.toml not loaded yet: {err})"
+            );
+            ColumnLayout::default()
+        })
+}
+
 /// Reads `selection.mouse_mode` (FR-SEL-06) from `settings.toml` at
 /// `path`, same "missing/malformed file falls back to
 /// `Settings::default()`" tolerance as [`load_splitter_ratio`] --
@@ -4378,6 +4443,27 @@ fn save_splitter_ratio(path: &std::path::Path, ratio: f32) -> duet_config::Resul
         )?,
     };
     file.set(&["panels", "splitter_ratio"], ratio as f64);
+    file.save()
+}
+
+/// The column-layout counterpart of [`save_splitter_ratio`]: writes
+/// `[panels.layouts.<view>]`, creating the file if needed and leaving
+/// every other key alone.
+fn save_column_layout(
+    path: &std::path::Path,
+    view: &str,
+    layout: &duet_config::ColumnLayout,
+) -> duet_config::Result<()> {
+    let mut file = match duet_config::settings::load(path) {
+        Ok(file) => file,
+        Err(_) => duet_config::SettingsFile::from_str(
+            path,
+            "schema_version = 1\n",
+            &duet_config::MigrationRegistry::settings(),
+            duet_config::settings::SETTINGS_SCHEMA_VERSION,
+        )?,
+    };
+    duet_config::settings::set_column_layout(&mut file, view, layout);
     file.save()
 }
 
@@ -5462,6 +5548,104 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("show_hidden = true"), "{on_disk}");
         assert!(on_disk.contains("splitter_ratio = 0.8"), "{on_disk}");
+    }
+
+    #[test]
+    fn column_layout_round_trips_through_settings_toml_from_a_fresh_install() {
+        use crate::columns::{ColumnKind, FULL_VIEW};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        assert_eq!(load_column_layout(&path), ColumnLayout::default());
+
+        let mut layout = ColumnLayout::default();
+        layout.toggle(ColumnKind::Extension);
+        layout.set_widths(&[0.0, 64.0, 120.0, 180.0]);
+        save_column_layout(&path, FULL_VIEW, &layout.to_config()).unwrap();
+        assert_eq!(load_column_layout(&path), layout);
+
+        // A second save (the user dragged again) replaces, never appends.
+        layout.toggle(ColumnKind::Extension);
+        save_column_layout(&path, FULL_VIEW, &layout.to_config()).unwrap();
+        assert_eq!(load_column_layout(&path), layout);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("\"ext\""), "{on_disk}");
+        assert!(on_disk.contains("[panels.layouts.full]"), "{on_disk}");
+    }
+
+    #[test]
+    fn saving_a_column_layout_preserves_other_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[panels]\nshow_hidden = true\nsplitter_ratio = 0.4\n",
+        )
+        .unwrap();
+        save_column_layout(
+            &path,
+            crate::columns::FULL_VIEW,
+            &ColumnLayout::default().to_config(),
+        )
+        .unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("show_hidden = true"), "{on_disk}");
+        assert!(on_disk.contains("splitter_ratio = 0.4"), "{on_disk}");
+        assert_eq!(load_splitter_ratio(&path), 0.4);
+    }
+
+    /// T-4.2.4's fan-out: a column toggled from one table's header shows
+    /// up in the other panel's table (they share one layout) and lands in
+    /// `settings.toml` (so it survives a restart) without anything else
+    /// having to be wired per tab.
+    #[gpui::test]
+    fn toggling_a_column_updates_every_table_and_persists_it(cx: &mut TestAppContext) {
+        use crate::columns::ColumnKind;
+        with_workspace(cx, |workspace, vcx| {
+            let (left, right) = workspace.read_with(vcx, |ws, cx| {
+                (
+                    ws.left_panel.read(cx).active_table().clone(),
+                    ws.right_panel.read(cx).active_table().clone(),
+                )
+            });
+            let has_attrs = |table: &Entity<FileTable>, vcx: &mut VisualTestContext| {
+                table.read_with(vcx, |table, cx| {
+                    table
+                        .state()
+                        .read(cx)
+                        .delegate()
+                        .layout()
+                        .contains(ColumnKind::Attributes)
+                })
+            };
+            assert!(!has_attrs(&left, vcx));
+            assert!(!has_attrs(&right, vcx));
+
+            left.update(vcx, |table, cx| {
+                let state = table.state().clone();
+                state.update(cx, |state, cx| {
+                    state
+                        .delegate_mut()
+                        .toggle_column(ColumnKind::Attributes, cx);
+                });
+            });
+            vcx.run_until_parked();
+            assert!(has_attrs(&left, vcx), "the toggling table itself");
+            assert!(
+                has_attrs(&right, vcx),
+                "the other panel follows the shared layout"
+            );
+
+            let settings = duet_config::paths::settings_path().unwrap();
+            wait_until(vcx, |_| {
+                std::fs::read_to_string(&settings)
+                    .map(|text| text.contains("attrs"))
+                    .unwrap_or(false)
+            });
+            assert_eq!(
+                load_column_layout(&settings),
+                left.read_with(vcx, |t, cx| t.state().read(cx).delegate().layout().clone())
+            );
+        });
     }
 
     fn session_tab(dir: PathBuf, locked: bool) -> SessionTab {

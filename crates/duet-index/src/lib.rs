@@ -44,7 +44,7 @@ pub use poll::{
     needs_polling,
 };
 pub use size_service::{DirSizeKey, DirSizeService, SizeHandle, SizeOutcome};
-pub use sort::{SortColumn, SortOptions, Sorter};
+pub use sort::{SortColumn, SortOptions, Sorter, extension_of};
 pub use watch::{DirWatcher, RecursiveMode, WatchUpdate};
 
 /// Installed only for the crate's own unit-test binary (`cargo test -p

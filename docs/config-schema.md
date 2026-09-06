@@ -31,9 +31,12 @@ Per `design.md` §10:
 
 Everything below documents the four config-file schemas in scope for T-1.6.1:
 `settings.toml`, `keymap.toml` (plus its base files), `connections.toml`, and the theme
-token list used by `themes/*.toml`. Per-tab UI state (column widths, sort column actually
-in effect, cursor position) lives in `session.json`, not in `settings.toml` — that file is
-runtime state, not user-authored configuration, so it is out of scope here.
+token list used by `themes/*.toml`. Per-tab UI state (sort column actually in effect,
+cursor position) lives in `session.json`, not in `settings.toml` — that file is runtime
+state, not user-authored configuration, so it is out of scope here. Column layouts
+(`panels.layouts.<view>`, T-4.2.4) are the exception: they are shared by every tab and
+are user configuration, so they live in `settings.toml` and the UI writes them back on
+every change, the same way it writes `panels.splitter_ratio`.
 
 ## Hot reload (FR-CFG-01)
 
@@ -171,6 +174,8 @@ Validated with Python's `tomllib` — parses cleanly.
 | `panels.default_sort_column` | enum | `"name"` | `name` \| `ext` \| `size` \| `date` \| `attrs` | Initial sort key for newly opened tabs. |
 | `panels.default_sort_order` | enum | `"ascending"` | `ascending` \| `descending` | Initial sort direction. |
 | `panels.remember_view_per_tab` | bool | `true` | — | Whether view/sort changes persist per tab in `session.json` or reset to these defaults each launch. |
+| `panels.splitter_ratio` | float | `0.5` | 0.1–0.9 | The dual-pane splitter's left-panel fraction of the window width (FR-NAV-01). Written back by the UI after every splitter drag or keyboard resize (T-4.1.4). |
+| `panels.layouts.<view>.columns` | array of inline tables | *(absent; built-in default `name`, `size`, `modified`)* | each `{ key = <col>, width = <px> }`, `key` ∈ `name` \| `ext` \| `size` \| `modified` \| `attrs` | FR-NAV-05 / T-4.2.4: the column set, display order and widths of view mode `<view>` (`full` today; `brief`/`thumbnails`/`tree` once T-4.2.5 gives them columns). `width` is in logical pixels and is ignored for `name`, which always takes whatever the other columns leave. Unknown keys are skipped, duplicates collapse to the first, a missing `name` is put back in front, and an empty or unusable list falls back to the default. Written back by the UI whenever a column is added, removed, reordered or drag-resized from the table header. |
 | `selection.mouse_mode` | enum | `"windows"` | `windows` \| `norton` \| `none` | FR-SEL-06: left-click-select vs. right-click-select vs. mouse never changes selection. |
 | `selection.restore_selection_after_operation` | bool | `true` | — | FR-SEL-04. |
 | `navigation.quick_search_mode` | enum | `"jump"` | `jump` \| `filter` | FR-NAV-07: typed letters jump to a match, or (modifier-prefixed by default, this key changes the unprefixed default) filter the panel. |

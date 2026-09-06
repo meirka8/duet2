@@ -42,3 +42,29 @@ the Duet window (or otherwise moving OS-level focus elsewhere) clears
 an active quick-search session the next time the window regains focus.
 If it doesn't, the bug is in the `on_focus_out` wiring itself, not the
 test gap.
+
+## FR-NAV-05: the column configuration menu is mouse-only
+
+**Symptom:** T-4.2.4's add/remove-column menu opens on a right-click
+on any table header cell (and columns are reordered by dragging a
+header, resized by dragging the handle between two headers). There is
+no keyboard route to any of the three: no default binding opens the
+menu, and no `columns.*` commands exist for the command palette.
+
+**Root cause:** Total Commander itself has no default accelerator for
+column configuration (`docs/keymap-tc.csv` lists none -- it lives under
+Configuration > Options > Custom columns), so T-4.2.4 had nothing to
+adopt, and the `gpui-component` popup menu is anchored to a mouse
+position. The layout *model* (`crates/duet-ui/src/columns.rs`) is
+keyboard-agnostic already; only the entry point is missing.
+
+**Why deferred:** the WBS row's ACs (survives restart, smooth
+drag-resize, correct sort indicator) are all met by the mouse path, and
+FR-NAV-05's "named layouts switchable by keyboard" is T-4.2.5's Ctrl+4..9
+custom-view slots, which need view modes first. Adding palette commands
+(`columns.toggle_ext`, `columns.reset`, ...) is a small follow-up once
+the command palette's command registry is the natural home for them.
+
+**To close this out:** register `columns.toggle_<key>` / `columns.reset`
+commands in the palette (and, if TC users ask, a default chord), plus a
+keyboard-driven reorder (Ctrl+Shift+Left/Right on the sorted column, say).

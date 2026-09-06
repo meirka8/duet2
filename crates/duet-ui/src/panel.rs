@@ -28,6 +28,7 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, actions, div, px,
 };
 
+use crate::columns::ColumnLayoutStore;
 use crate::file_table::{
     FileTable, FileTableEvent, FileTableSettings, LockedNavigationHandler, TabRestore,
 };
@@ -39,20 +40,21 @@ fn sort_column_from_session(column: SessionSortColumn) -> SortColumn {
         SessionSortColumn::Name => SortColumn::Name,
         SessionSortColumn::Size => SortColumn::Size,
         SessionSortColumn::Modified => SortColumn::Modified,
+        SessionSortColumn::Extension => SortColumn::Extension,
+        SessionSortColumn::Attributes => SortColumn::Attributes,
     }
 }
 
 /// The inverse of [`sort_column_from_session`], for [`Panel::snapshot`].
 /// `SortColumn::Kind` is a real variant but unreachable through any
 /// column `FileTableDelegate` actually renders (see
-/// `SessionSortColumn`'s own doc comment) -- falls back to `Name`,
-/// matching what `FileTableDelegate::perform_sort`'s own
-/// `_ => SortColumn::Name` arm already does for anything outside its
-/// three known columns.
+/// `SessionSortColumn`'s own doc comment) -- falls back to `Name`.
 fn sort_column_to_session(column: SortColumn) -> SessionSortColumn {
     match column {
         SortColumn::Size => SessionSortColumn::Size,
         SortColumn::Modified => SessionSortColumn::Modified,
+        SortColumn::Extension => SessionSortColumn::Extension,
+        SortColumn::Attributes => SessionSortColumn::Attributes,
         SortColumn::Name | SortColumn::Kind => SessionSortColumn::Name,
     }
 }
@@ -136,6 +138,9 @@ pub struct Panel {
     /// `Workspace::new` and passed down unchanged to every tab this panel
     /// creates.
     file_table_settings: FileTableSettings,
+    /// T-4.2.4: the workspace-wide column layout store every tab's
+    /// `FileTable` observes -- see `columns.rs`.
+    layout_store: Entity<ColumnLayoutStore>,
 }
 
 impl Panel {
@@ -157,6 +162,7 @@ impl Panel {
         active: usize,
         tokio_handle: tokio::runtime::Handle,
         file_table_settings: FileTableSettings,
+        layout_store: Entity<ColumnLayoutStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -167,6 +173,7 @@ impl Panel {
             closed_stack: Vec::new(),
             tokio_handle,
             file_table_settings,
+            layout_store,
         };
         for tab in tabs {
             let restore = TabRestore {
@@ -227,6 +234,7 @@ impl Panel {
                 dir,
                 self.tokio_handle.clone(),
                 width_seed,
+                self.layout_store.clone(),
                 restore,
                 self.file_table_settings,
                 window,
@@ -689,6 +697,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    use crate::columns::ColumnLayout;
     use crate::file_table::{CursorDown, EnterDirectory, MouseMode, NavigateRoot, QuickSearchMode};
 
     fn session_tab(dir: PathBuf, locked: bool, lock_dir_change: bool) -> SessionTab {
@@ -762,12 +772,14 @@ mod tests {
         };
         let mut panel_cell: Option<Entity<Panel>> = None;
         let (_root, vcx) = cx.add_window_view(|window, cx| {
+            let layout_store = cx.new(|_| ColumnLayoutStore::new(ColumnLayout::default()));
             let panel = cx.new(|cx| {
                 Panel::new(
                     tabs,
                     active,
                     tokio_handle.clone(),
                     file_table_settings,
+                    layout_store,
                     window,
                     cx,
                 )

@@ -13,6 +13,8 @@
 //! `docs/config-schema.md` §1's "Key reference" table, which remains the
 //! single source of truth for meaning, defaults, and valid ranges.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::document::ConfigFile;
@@ -143,6 +145,33 @@ pub struct Panels {
     /// splitter state (distinct ratios across restored tabs) is T-4.3.7's
     /// job ("Session persistence: panes, tabs, cwds, ..., splitter").
     pub splitter_ratio: f32,
+    /// `[panels.layouts.<view>]` (FR-NAV-05, T-4.2.4): the column set,
+    /// order and widths of each view mode, keyed by the view's name
+    /// (`"full"` today; `brief`/`thumbnails`/`tree` once T-4.2.5 gives
+    /// them columns). Absent -> the UI's built-in default layout for that
+    /// view. Written by the UI whenever the user adds, removes, reorders
+    /// or drag-resizes a column, exactly like `splitter_ratio`.
+    pub layouts: BTreeMap<String, ColumnLayout>,
+}
+
+/// One view mode's column layout -- see [`Panels::layouts`]. `columns`
+/// is in display order; an unknown `key` (a plugin column whose plugin
+/// is gone, a typo) is skipped by the UI, never an error.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColumnLayout {
+    pub columns: Vec<ColumnSpec>,
+}
+
+/// One column of a [`ColumnLayout`]: its key (`name` \| `ext` \| `size`
+/// \| `modified` \| `attrs`) and, optionally, its width in logical
+/// pixels. The UI ignores `width` for its elastic `name` column, which
+/// always takes whatever the others leave.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnSpec {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
 }
 
 impl Default for Panels {
@@ -157,6 +186,7 @@ impl Default for Panels {
             default_sort_order: "ascending".into(),
             remember_view_per_tab: true,
             splitter_ratio: 0.5,
+            layouts: BTreeMap::new(),
         }
     }
 }
@@ -387,6 +417,27 @@ impl Default for Plugins {
     }
 }
 
+/// Writes `layout` as `[panels.layouts.<view>]` into `file`, replacing
+/// that view's previous layout and leaving every other key in the
+/// document alone ([`ConfigFile::set`]'s own guarantee). Each column is
+/// one inline table (`{ key = "size", width = 110.0 }`; `width` omitted
+/// when `None`), which is what [`ColumnLayout`] deserializes back from.
+pub fn set_column_layout(file: &mut SettingsFile, view: &str, layout: &ColumnLayout) {
+    let mut array = toml_edit::Array::new();
+    for spec in &layout.columns {
+        let mut table = toml_edit::InlineTable::new();
+        table.insert("key", toml_edit::Value::from(spec.key.as_str()));
+        if let Some(width) = spec.width {
+            table.insert("width", toml_edit::Value::from(f64::from(width)));
+        }
+        array.push(toml_edit::Value::InlineTable(table));
+    }
+    file.set(
+        &["panels", "layouts", view, "columns"],
+        toml_edit::Value::Array(array),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +481,74 @@ remember_view_per_tab    = true
         // deserialize via #[serde(default)].
         assert_eq!(settings.selection, Selection::default());
         assert_eq!(settings.trash, Trash::default());
+    }
+
+    #[test]
+    fn column_layouts_round_trip_through_toml_and_default_to_empty() {
+        let text = r#"
+schema_version = 1
+
+[panels.layouts.full]
+columns = [
+    { key = "name" },
+    { key = "ext", width = 70.0 },
+    { key = "size", width = 110.0 },
+]
+"#;
+        let file = SettingsFile::from_str(
+            Path::new("settings.toml"),
+            text,
+            &MigrationRegistry::settings(),
+            SETTINGS_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let settings = file.typed().unwrap();
+        let full = settings.panels.layouts.get("full").expect("full layout");
+        let keys: Vec<&str> = full.columns.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["name", "ext", "size"]);
+        assert_eq!(full.columns[0].width, None);
+        assert_eq!(full.columns[1].width, Some(70.0));
+        assert!(Settings::default().panels.layouts.is_empty());
+        assert!(!settings.panels.layouts.contains_key("brief"));
+    }
+
+    #[test]
+    fn set_column_layout_writes_a_section_the_typed_view_reads_back() {
+        let mut file = SettingsFile::from_str(
+            Path::new("settings.toml"),
+            "schema_version = 1\n\n[panels]\nshow_hidden = true\n",
+            &MigrationRegistry::settings(),
+            SETTINGS_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let layout = ColumnLayout {
+            columns: vec![
+                ColumnSpec {
+                    key: "name".into(),
+                    width: None,
+                },
+                ColumnSpec {
+                    key: "size".into(),
+                    width: Some(110.0),
+                },
+            ],
+        };
+        set_column_layout(&mut file, "full", &layout);
+        set_column_layout(&mut file, "full", &layout); // idempotent, replaces
+        let text = file.raw().to_string();
+        assert!(text.contains("show_hidden = true"), "{text}");
+        assert_eq!(text.matches("[panels.layouts.full]").count(), 1, "{text}");
+
+        let reread = SettingsFile::from_str(
+            Path::new("settings.toml"),
+            &text,
+            &MigrationRegistry::settings(),
+            SETTINGS_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let settings = reread.typed().unwrap();
+        assert_eq!(settings.panels.layouts.get("full"), Some(&layout));
+        assert!(settings.panels.show_hidden);
     }
 
     #[test]
