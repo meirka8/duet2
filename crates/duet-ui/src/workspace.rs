@@ -234,6 +234,17 @@ actions!(duet_workspace, [AttributesDialog]);
 // focus, since the nearer context's binding always wins first.
 actions!(duet_workspace, [OpenTrashDialog]);
 
+// T-4.3.4's path bar (`nav.goto_path`, `docs/commands.md`'s Navigation
+// row, FR-NAV-09): focus the active panel's header as an editable path
+// input. `Ctrl+L` is this module's own disclosed default -- Total Commander
+// has no equivalent (its title bar isn't editable), so `docs/keymap-tc.csv`
+// has no row to follow, and `Ctrl+L` is what every GTK file chooser,
+// Nautilus, Dolphin and every browser use for exactly this; it is unclaimed
+// by every `KeyBinding::new` call site in this crate at any scope. Bound in
+// the `FileTable` context (the panel), not `Workspace`, so it cannot fire
+// from inside a dialog or the command line.
+actions!(duet_workspace, [GotoPath]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -265,6 +276,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-h", HardlinkDialog, Some("Workspace")),
         KeyBinding::new("ctrl-a", AttributesDialog, Some("Workspace")),
         KeyBinding::new("alt-t", OpenTrashDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-l", GotoPath, Some("FileTable")),
     ]);
 }
 
@@ -495,6 +507,15 @@ pub struct Workspace {
     /// like the XDG ones because there is no environment knob for
     /// `/proc/self/mountinfo`; it has to be an explicit policy.
     trash_mount_scan: MountScan,
+    /// T-4.3.4: the path bar in its editing face, when open -- at most one
+    /// across both panels (`PathBarState::side` says which); `None` means
+    /// both headers show their breadcrumb. See `crate::path_bar`.
+    path_bar: Option<Entity<crate::path_bar::PathBarState>>,
+    /// Whatever had focus before the path bar opened (the panel's table,
+    /// normally), restored by `close_path_bar`. Held here rather than in
+    /// the bar so closing from inside one of the bar's own listeners never
+    /// has to read the bar entity while it is leased.
+    path_bar_previous_focus: Option<FocusHandle>,
 
     /// The dual-pane splitter's current left-panel fraction of the
     /// workspace width, `[SPLITTER_MIN_RATIO, SPLITTER_MAX_RATIO]`.
@@ -917,7 +938,7 @@ pub(crate) struct PendingNotice {
 /// Which of the two panels a palette-dispatched tab command should apply
 /// to -- see the `palette_target_panel` field's doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelSide {
+pub(crate) enum PanelSide {
     Left,
     Right,
 }
@@ -1310,6 +1331,8 @@ impl Workspace {
             demo: DemoState::Loading,
             focus_handle: cx.focus_handle(),
             trash_mount_scan: MountScan::System,
+            path_bar: None,
+            path_bar_previous_focus: None,
             splitter_ratio,
             resizable_state: cx.new(|_| ResizableState::default()),
             left_panel,
@@ -2814,6 +2837,110 @@ impl Workspace {
         None
     }
 
+    /// T-4.3.4: one panel header, in whichever face applies -- the editing
+    /// [`crate::path_bar::PathBarState`] if it is open on this side, else
+    /// the breadcrumb whose segments navigate the panel and whose empty
+    /// area (or pencil) opens the editor. See `crate::path_bar`.
+    fn panel_header(
+        &self,
+        side: PanelSide,
+        dir: &Path,
+        tokens: &TokenPalette,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        if let Some(bar) = &self.path_bar
+            && bar.read(cx).side() == side
+        {
+            return bar.clone().into_any_element();
+        }
+        let weak = cx.entity().downgrade();
+        let on_segment: crate::path_bar::SegmentHandler = Rc::new({
+            let weak = weak.clone();
+            move |target, window, cx| {
+                let target = target.to_path_buf();
+                let _ = weak.update(cx, |this, cx| {
+                    this.navigate_panel_to_path(side, target, window, cx);
+                });
+            }
+        });
+        let on_edit: crate::path_bar::EditHandler = Rc::new(move |window, cx| {
+            let _ = weak.update(cx, |this, cx| this.open_path_bar(side, window, cx));
+        });
+        crate::path_bar::breadcrumb_header(side, dir, tokens, on_segment, on_edit)
+            .into_any_element()
+    }
+
+    /// `Ctrl+L` (`GotoPath`) or a click on the header: opens `side`'s path
+    /// bar for editing, pre-filled with its current directory. Opening the
+    /// other panel's bar while one is open moves the editor there (the
+    /// original previous-focus is kept, so `Esc` still lands where the
+    /// user started). A no-op if this side's bar is already open.
+    pub(crate) fn open_path_bar(
+        &mut self,
+        side: PanelSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(bar) = &self.path_bar
+            && bar.read(cx).side() == side
+        {
+            return;
+        }
+        // Switching sides keeps the *original* previous focus, so `Esc`
+        // still lands where the user started.
+        let previous_focus = if self.path_bar.take().is_some() {
+            self.path_bar_previous_focus.take()
+        } else {
+            window.focused(cx)
+        };
+        self.path_bar_previous_focus = previous_focus;
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let dir = panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .current_dir()
+            .to_path_buf();
+        let workspace = cx.entity().downgrade();
+        let tokio_handle = self.tokio_handle.clone();
+        let bar = cx.new(|cx| {
+            crate::path_bar::PathBarState::new(side, dir, workspace, tokio_handle, window, cx)
+        });
+        self.path_bar = Some(bar);
+        cx.notify();
+    }
+
+    /// Closes the path bar (Enter, Esc, or a completed navigation) and
+    /// hands focus back to whatever had it before it opened.
+    pub(crate) fn close_path_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.path_bar = None;
+        if let Some(handle) = self.path_bar_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Navigates `side`'s active tab to `dir` -- the same in-place
+    /// navigation (history entry, locked-tab redirect, quick-search
+    /// invalidation) any other "go to this directory" gesture uses.
+    pub(crate) fn navigate_panel_to_path(
+        &mut self,
+        side: PanelSide,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let table = panel.read(cx).active_table().clone();
+        table.update(cx, |table, cx| table.navigate_to_path(dir, window, cx));
+    }
+
     /// `Ctrl+O` (`OpenOperationManager`, T-5.2.2, FR-OPS-02/03): opens the
     /// expandable operation manager overlay listing every T-5.1.13 queue
     /// job (`self.queue.snapshot()`, read directly by the overlay itself
@@ -3056,10 +3183,18 @@ impl Workspace {
         // path/stats within whichever panel, since that's the only thing
         // meaningfully "this panel's" state once a panel can hold more
         // than one directory at a time.
-        let (left_header, left_footer, left_active) =
+        let (left_dir, left_footer, left_focused) =
             panel_header_footer_active(&self.left_panel, window, cx);
-        let (right_header, right_footer, right_active) =
+        let (right_dir, right_footer, right_focused) =
             panel_header_footer_active(&self.right_panel, window, cx);
+        // T-4.3.4: while a panel's path bar is being edited, keyboard focus
+        // is in the bar's input, not the table -- the panel is still the
+        // active one as far as its chrome is concerned.
+        let editing = self.path_bar.as_ref().map(|bar| bar.read(cx).side());
+        let left_active = left_focused || editing == Some(PanelSide::Left);
+        let right_active = right_focused || editing == Some(PanelSide::Right);
+        let left_header = self.panel_header(PanelSide::Left, &left_dir, tokens, cx);
+        let right_header = self.panel_header(PanelSide::Right, &right_dir, tokens, cx);
 
         h_resizable("workspace-splitter")
             .with_state(&self.resizable_state)
@@ -3337,6 +3472,10 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenTrashDialog, window, cx| {
                 this.open_trash_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GotoPath, window, cx| {
+                let side = this.focused_panel_side(window, cx);
+                this.open_path_bar(side, window, cx);
             }))
             // Client-side window chrome: on Linux, GPUI defaults every
             // window to *client* decorations unless the compositor
@@ -4022,7 +4161,7 @@ fn panel_footer_text(table: &FileTable, cx: &App) -> SharedString {
 /// doesn't depend on the theme's brightness contrast being strong enough
 /// on its own.
 fn panel_chrome(
-    header_text: impl Into<SharedString>,
+    header: gpui::AnyElement,
     footer_text: impl Into<SharedString>,
     active: bool,
     tokens: &TokenPalette,
@@ -4046,7 +4185,7 @@ fn panel_chrome(
                 .border_b_1()
                 .border_color(underline)
                 .truncate()
-                .child(header_text.into()),
+                .child(header),
         )
         .child(gpui::div().flex_1().min_h(px(0.)).child(body))
         .child(
@@ -4075,11 +4214,11 @@ fn panel_header_footer_active(
     panel: &Entity<Panel>,
     window: &Window,
     cx: &App,
-) -> (String, SharedString, bool) {
+) -> (PathBuf, SharedString, bool) {
     let panel = panel.read(cx);
     let table = panel.active_table().read(cx);
     let active = table.focus_handle(cx).is_focused(window);
-    let header = table.current_dir().display().to_string();
+    let header = table.current_dir().to_path_buf();
     let footer = panel_footer_text(table, cx);
     (header, footer, active)
 }
@@ -4090,7 +4229,7 @@ fn panel_header_footer_active(
 /// and pre-computed header/footer/active values the caller passes in.
 fn panel_view(
     panel: &Entity<Panel>,
-    header_text: impl Into<SharedString>,
+    header: gpui::AnyElement,
     footer_text: impl Into<SharedString>,
     active: bool,
     tokens: &TokenPalette,
@@ -4115,7 +4254,7 @@ fn panel_view(
         })
         .rounded_md()
         .child(panel_chrome(
-            header_text,
+            header,
             footer_text,
             active,
             tokens,
@@ -4944,6 +5083,295 @@ mod tests {
                     left_handle.is_focused(window),
                     "a titlebar click must leave keyboard focus on the panel that had it"
                 );
+            });
+        });
+    }
+
+    // -- T-4.3.4 path bar --------------------------------------------------
+
+    fn open_path_bar_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<crate::path_bar::PathBarState> {
+        vcx.dispatch_action(GotoPath);
+        let _ = vcx.update(|window, cx| window.draw(cx));
+        workspace
+            .read_with(vcx, |ws, _| ws.path_bar.clone())
+            .expect("Ctrl+L must open the path bar")
+    }
+
+    /// `Ctrl+L` opens the focused panel's path bar, pre-filled with its
+    /// directory, with keyboard focus in the field, and the panel's chrome
+    /// still reads as active while the bar has focus.
+    #[gpui::test]
+    fn ctrl_l_opens_the_path_bar_prefilled_and_focused(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            let bar = open_path_bar_state(&workspace, vcx);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.side(), PanelSide::Left);
+                assert_eq!(bar.value(cx), dir.path().to_string_lossy());
+            });
+            vcx.update(|window, cx| {
+                assert!(
+                    bar.read(cx).is_focused(window, cx),
+                    "the bar's input must take keyboard focus on open"
+                );
+            });
+            // Opening it again on the same side is a no-op, not a second bar.
+            vcx.dispatch_action(GotoPath);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            workspace.read_with(vcx, |ws, _| {
+                assert!(
+                    ws.path_bar
+                        .as_ref()
+                        .is_some_and(|b| b.entity_id() == bar.entity_id())
+                );
+            });
+        });
+    }
+
+    /// `Enter` on a real directory navigates the panel there, closes the
+    /// bar, and returns focus to the panel's table.
+    #[gpui::test]
+    fn enter_in_the_path_bar_navigates_closes_and_restores_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let sub = dir.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+
+            let bar = open_path_bar_state(&workspace, vcx);
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&sub.to_string_lossy(), window, cx);
+            });
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left_table.read_with(vcx, |t, _| t.current_dir() == sub)
+            });
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.path_bar.is_none())
+            });
+            vcx.update(|window, _cx| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "after navigating, focus must be back on the panel's table"
+                );
+            });
+        });
+    }
+
+    /// A relative entry resolves against the panel's directory and `~`
+    /// against `$HOME` -- exercised end to end through the same `Enter`.
+    #[gpui::test]
+    fn a_relative_path_in_the_bar_resolves_against_the_panel_directory(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let nested = dir.path().join("a").join("b");
+            std::fs::create_dir_all(&nested).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            let bar = open_path_bar_state(&workspace, vcx);
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test("a/./b/", window, cx)
+            });
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left_table.read_with(vcx, |t, _| t.current_dir() == nested)
+            });
+        });
+    }
+
+    /// `Esc` closes the bar without navigating and restores focus.
+    #[gpui::test]
+    fn escape_in_the_path_bar_cancels_and_restores_focus(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+
+            let bar = open_path_bar_state(&workspace, vcx);
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test("/nowhere", window, cx)
+            });
+            vcx.dispatch_action(duet_widgets::input::Escape);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            workspace.read_with(vcx, |ws, cx| {
+                assert!(ws.path_bar.is_none(), "Esc must close the bar");
+                assert_eq!(
+                    ws.left_panel.read(cx).active_table().read(cx).current_dir(),
+                    dir.path(),
+                    "Esc must not navigate"
+                );
+            });
+            vcx.update(|window, _cx| assert!(left_handle.is_focused(window)));
+        });
+    }
+
+    /// `Enter` on something that is not a directory keeps the bar open and
+    /// says why, inline; the next edit clears the message.
+    #[gpui::test]
+    fn a_non_directory_entry_keeps_the_path_bar_open_with_an_inline_error(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("plain.txt");
+            std::fs::write(&file, b"x").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            let bar = open_path_bar_state(&workspace, vcx);
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&file.to_string_lossy(), window, cx);
+            });
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+            wait_until(vcx, |vcx| {
+                bar.read_with(vcx, |bar, _| bar.error().is_some())
+            });
+            workspace.read_with(vcx, |ws, _| assert!(ws.path_bar.is_some()));
+            bar.read_with(vcx, |bar, _| {
+                assert!(bar.error().unwrap().starts_with("Not a directory: "));
+            });
+
+            vcx.simulate_input("x");
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            bar.read_with(vcx, |bar, _| {
+                assert!(bar.error().is_none(), "an edit clears it")
+            });
+        });
+    }
+
+    /// `Tab` completes a unique directory (with a trailing `/`), and for an
+    /// ambiguous prefix extends to the common prefix and lists the
+    /// candidates -- against the real filesystem, off the UI thread.
+    #[gpui::test]
+    fn tab_in_the_path_bar_completes_directories(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["alpha", "alphabet", "beta"] {
+                std::fs::create_dir(dir.path().join(name)).unwrap();
+            }
+            std::fs::write(dir.path().join("betamax.txt"), b"not a dir").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let bar = open_path_bar_state(&workspace, vcx);
+            let root = dir.path().to_string_lossy().into_owned();
+
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/b"), window, cx);
+            });
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                bar.read_with(vcx, |bar, cx| bar.value(cx) == format!("{root}/beta/"))
+            });
+            bar.read_with(vcx, |bar, _| assert!(bar.candidates().is_empty()));
+
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/al"), window, cx);
+            });
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                bar.read_with(vcx, |bar, cx| bar.value(cx) == format!("{root}/alpha"))
+            });
+            bar.read_with(vcx, |bar, _| {
+                assert_eq!(
+                    bar.candidates(),
+                    ["alpha".to_string(), "alphabet".to_string()]
+                );
+                assert_eq!(bar.selected(), None, "listed, nothing picked yet");
+            });
+
+            // Further Tabs cycle through the candidates like a shell's
+            // menu completion, wrapping; Shift+Tab goes back.
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alpha/"));
+                assert_eq!(bar.selected(), Some(0));
+                assert_eq!(bar.candidates().len(), 2, "the hint stays up");
+            });
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alphabet/"));
+                assert_eq!(bar.selected(), Some(1));
+            });
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alpha/"), "wraps");
+            });
+            vcx.dispatch_action(duet_widgets::input::OutdentInline);
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.value(cx), format!("{root}/alphabet/"), "backwards");
+            });
+
+            // A real edit ends the cycle; the next Tab completes afresh
+            // from the new text (inside the chosen directory).
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/alphabet/x"), window, cx);
+            });
+            bar.read_with(vcx, |bar, _| {
+                assert!(bar.candidates().is_empty());
+                assert_eq!(bar.selected(), None);
+            });
+        });
+    }
+
+    /// The candidate hint shows a window of names; cycling past its end
+    /// slides the window by one (the leftmost name gives way, `+N`
+    /// shrinks by one), and wrapping around brings it back to the start.
+    #[gpui::test]
+    fn cycling_past_the_visible_hint_slides_the_window(cx: &mut TestAppContext) {
+        use crate::path_bar::HINT_VISIBLE;
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let total = HINT_VISIBLE + 3;
+            for i in 0..total {
+                std::fs::create_dir(dir.path().join(format!("d{i:02}"))).unwrap();
+            }
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let bar = open_path_bar_state(&workspace, vcx);
+            let root = dir.path().to_string_lossy().into_owned();
+
+            bar.update_in(vcx, |bar, window, cx| {
+                bar.set_value_for_test(&format!("{root}/d"), window, cx);
+            });
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                bar.read_with(vcx, |bar, _| bar.candidates().len() == total)
+            });
+            bar.read_with(vcx, |bar, _| assert_eq!(bar.hint_window_start(), 0));
+
+            // Tab up to the last visible candidate: the window holds.
+            for _ in 0..HINT_VISIBLE {
+                vcx.dispatch_action(IndentInline);
+            }
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.selected(), Some(HINT_VISIBLE - 1));
+                assert_eq!(bar.hint_window_start(), 0);
+                assert_eq!(bar.value(cx), format!("{root}/d{:02}/", HINT_VISIBLE - 1));
+            });
+            // One more: the next candidate scrolls in, the first scrolls out.
+            vcx.dispatch_action(IndentInline);
+            bar.read_with(vcx, |bar, _| {
+                assert_eq!(bar.selected(), Some(HINT_VISIBLE));
+                assert_eq!(bar.hint_window_start(), 1);
+            });
+            // Through the end and around: back to the first, window reset.
+            for _ in 0..3 {
+                vcx.dispatch_action(IndentInline);
+            }
+            bar.read_with(vcx, |bar, cx| {
+                assert_eq!(bar.selected(), Some(0));
+                assert_eq!(bar.hint_window_start(), 0);
+                assert_eq!(bar.value(cx), format!("{root}/d00/"));
             });
         });
     }

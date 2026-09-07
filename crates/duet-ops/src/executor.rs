@@ -4705,6 +4705,20 @@ mod tests {
     /// once both regimes have moved. The literal "within 20% after 10s"
     /// number is [`eta_accuracy_is_within_20_percent_after_ten_seconds`]'s
     /// job, gated behind real wall-clock time.
+    /// The large file is streamed through [`PacedFs`] at a fixed rate
+    /// rather than copied at whatever speed the test tempdir happens to
+    /// have. This test used to rely on `TestFs`'s 5 ms per-step delay plus
+    /// the per-record journal fsyncs of the 80 small files to stretch the
+    /// job across enough 100 ms sampler ticks; once the journal
+    /// group-committed (PR #66) the whole job could finish inside three
+    /// ticks, and when the 16 MiB file happened to be planned last its
+    /// entire copy landed between the last tick and `Finished`, leaving
+    /// every sampled ETA `None` (seen on the CI runner, 2026-09-06).
+    /// Pacing the large file to ~1 s guarantees several ticks in which the
+    /// small regime is already drained (concurrency 2 keeps the second
+    /// worker on the small files while the first streams the large one)
+    /// and the large regime has a real rate -- exactly the state a real
+    /// ETA needs, whatever order the planner emits the steps in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copying_a_mixed_corpus_reports_a_real_eta_before_finishing() {
         let src = TempDir::new().unwrap();
@@ -4716,16 +4730,9 @@ mod tests {
         let dst = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
 
-        // `delay`: an artificial per-step floor so this genuinely spans
-        // several 100ms sampler ticks even on tmpfs, where the real I/O
-        // for a corpus this size would otherwise finish inside a single
-        // tick and never exercise the estimator at all.
-        let fs: Arc<dyn FileSystem> = Arc::new(TestFs {
+        let fs: Arc<dyn FileSystem> = Arc::new(PacedFs {
             inner: LocalFs,
-            force_unsupported: true, // force naive_copy's incremental path
-            delay: Duration::from_millis(5),
-            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bytes_per_sec: 16 * 1024 * 1024, // the 16 MiB file takes ~1 s = ~10 ticks
         });
         let cancel = crate::planner::CancelToken::new();
         let plan = crate::planner::plan_copy(
