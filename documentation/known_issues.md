@@ -42,3 +42,46 @@ the Duet window (or otherwise moving OS-level focus elsewhere) clears
 an active quick-search session the next time the window regains focus.
 If it doesn't, the bug is in the `on_focus_out` wiring itself, not the
 test gap.
+
+## FR-NAV-09: RTL (Arabic/Hebrew) path segments render in logical order in the path bar
+
+**Found during:** S-6 (text input spike), scoped into T-4.3.4 (path bar).
+
+**Behavior:** `gpui-component` 0.5.1's `Input` performs no BiDi visual
+reordering: an RTL run inside the path bar's editable field is drawn in
+logical (typing) order, so a Hebrew or Arabic directory name reads
+backwards on screen while being edited. The breadcrumb face (plain text
+elements) has the same limitation for the same reason. Navigation is
+unaffected: the bytes round-trip exactly (S-6 verified paste, cursor and
+IME-range plumbing on 4000-character and RTL paths), the panel lists the
+right directory, and completion matches the right names.
+
+**Root cause:** the widget's text layout is logical-order-only
+(`documentation/spikes/S-6.md`, confirmed via `bounds_for_range`). Not
+fixable from `duet-ui`: R-G7 forbids reaching past the façade, and the
+fix belongs in the vendored widget's shaping.
+
+**Why deferred:** correctness holds; only rendering of a minority of
+paths is affected, and the fix is upstream work with a full
+gpui-component bump behind it (ADR-003).
+
+**To close this out:** re-test the S-6 RTL cases at the next
+`gpui-component` bump; if still wrong, file upstream or patch the
+vendored widget the way ADR-007 does for gpui.
+
+## FR-NAV-09: CJK IME composition in the path bar is unverified headlessly
+
+**Found during:** S-6, carried into T-4.3.4.
+
+**Behavior:** unknown, not known-bad. GPUI's Wayland `zwp_text_input_v3`
+and X11 XIM plumbing is present and S-6 proved the marked-text API works;
+whether a real ibus/fcitx composition sequence lands correctly in the path
+bar can only be checked by a person typing one.
+
+**Why deferred:** the headless test platform implements no text-input
+protocol, so no automated test can claim it.
+
+**To close this out:** manual UAT step -- with ibus engaged, type a
+pinyin/romaji sequence into the path bar, pick a candidate, confirm the
+committed text and that `Enter` navigates to the matching directory.
+

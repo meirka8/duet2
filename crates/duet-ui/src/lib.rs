@@ -31,6 +31,7 @@ mod link_dialog;
 mod mkdir_dialog;
 mod operation_manager;
 pub mod panel;
+mod path_bar;
 mod recovery_dialog;
 mod rename_dialog;
 mod theme_controller;
