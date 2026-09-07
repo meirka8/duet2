@@ -35,6 +35,27 @@ pub enum SortColumn {
     Size,
     Modified,
     Kind,
+    /// T-4.2.4's Ext column: entries group by [`extension_of`] (locale-
+    /// collated, like `Name`), ties broken by the full name -- TC's own
+    /// "sort by extension" order, so `a.txt`/`b.txt` stay alphabetical
+    /// within the `.txt` run instead of keeping whatever order they had.
+    Extension,
+    /// T-4.2.4's Attr column: raw POSIX mode bits ([`EntryStore::mode`],
+    /// `0` when unknown), ties broken by the full name.
+    Attributes,
+}
+
+/// The part of `name` after its last `.`, or `""` when there is none:
+/// `README.md` -> `md`, `archive.tar.gz` -> `gz`, `Makefile` -> `""`.
+/// A leading dot never starts an extension (`.bashrc` -> `""`, the
+/// dotfile convention; `.config.toml` -> `toml`), and a trailing dot
+/// yields `""` too. Shared by the sorter's `Extension` keys and the
+/// UI's Ext column so the two can never disagree about what counts.
+pub fn extension_of(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(0) | None => "",
+        Some(ix) => &name[ix + 1..],
+    }
 }
 
 /// Full sort configuration: column, direction, and the directories-first
@@ -79,6 +100,17 @@ enum ColumnKey {
     /// timestamps rather than wrapping.
     Modified(i64),
     Kind(u8),
+    /// Collated extension key, then collated full-name key as the
+    /// tie-breaker (see [`SortColumn::Extension`]).
+    Extension {
+        ext: Vec<u8>,
+        name: Vec<u8>,
+    },
+    /// Raw mode bits, then collated full-name key as the tie-breaker.
+    Attributes {
+        mode: u32,
+        name: Vec<u8>,
+    },
 }
 
 impl ColumnKey {
@@ -88,6 +120,14 @@ impl ColumnKey {
             (ColumnKey::Size(a), ColumnKey::Size(b)) => a.cmp(b),
             (ColumnKey::Modified(a), ColumnKey::Modified(b)) => a.cmp(b),
             (ColumnKey::Kind(a), ColumnKey::Kind(b)) => a.cmp(b),
+            (
+                ColumnKey::Extension { ext: ea, name: na },
+                ColumnKey::Extension { ext: eb, name: nb },
+            ) => ea.cmp(eb).then_with(|| na.cmp(nb)),
+            (
+                ColumnKey::Attributes { mode: ma, name: na },
+                ColumnKey::Attributes { mode: mb, name: nb },
+            ) => ma.cmp(mb).then_with(|| na.cmp(nb)),
             // Every key in one `SortKeys` batch is built for the same
             // `SortColumn` (see `build_keys`), so mixed variants never
             // actually occur; this arm exists only so the match is total.
@@ -163,6 +203,19 @@ impl Sorter {
     /// (design.md §8.2 names "bulk sort" as a Rayon workload explicitly);
     /// every other column is a cheap sequential copy of an already-columnar
     /// `EntryStore` field, not worth parallelizing.
+    /// One string's locale-collated sort key (the same bytes the `Name`
+    /// keys carry), for the tie-breaking name keys of the `Extension`/
+    /// `Attributes` columns.
+    fn collation_key(&self, text: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Only failure mode is a sink error; `Vec<u8>` never errors as a
+        // `CollationKeySink`, so this can't fail in practice.
+        self.collator
+            .write_sort_key_to(text, &mut buf)
+            .expect("Vec<u8> sink is infallible");
+        buf
+    }
+
     pub fn build_keys(&self, entries: &EntryStore, column: SortColumn) -> SortKeys {
         let n = entries.len();
         let dir_ranks: Vec<u8> = (0..n as u32)
@@ -192,6 +245,26 @@ impl Sorter {
                 .collect(),
             SortColumn::Kind => (0..n as u32)
                 .map(|ix| ColumnKey::Kind(kind_rank(entries.kind(EntryId::new(ix)))))
+                .collect(),
+            SortColumn::Extension => (0..n as u32)
+                .into_par_iter()
+                .map(|ix| {
+                    let name = entries.name(EntryId::new(ix));
+                    ColumnKey::Extension {
+                        ext: self.collation_key(extension_of(name)),
+                        name: self.collation_key(name),
+                    }
+                })
+                .collect(),
+            SortColumn::Attributes => (0..n as u32)
+                .into_par_iter()
+                .map(|ix| {
+                    let id = EntryId::new(ix);
+                    ColumnKey::Attributes {
+                        mode: entries.mode(id).unwrap_or(0),
+                        name: self.collation_key(entries.name(id)),
+                    }
+                })
                 .collect(),
         };
 
@@ -408,5 +481,73 @@ mod tests {
                 "1M-entry name sort took {elapsed:?}, over the 400ms T-3.2.2 budget"
             );
         }
+    }
+    #[test]
+    fn extension_of_follows_the_dotfile_and_trailing_dot_rules() {
+        assert_eq!(extension_of("README.md"), "md");
+        assert_eq!(extension_of("archive.tar.gz"), "gz");
+        assert_eq!(extension_of("Makefile"), "");
+        assert_eq!(extension_of(".bashrc"), "");
+        assert_eq!(extension_of(".config.toml"), "toml");
+        assert_eq!(extension_of("trailing."), "");
+        assert_eq!(extension_of(""), "");
+    }
+
+    #[test]
+    fn extension_sort_groups_by_extension_then_name_and_puts_no_extension_first() {
+        let mut entries = EntryStore::new();
+        for name in ["b.txt", "z.md", "Makefile", "a.txt", "c.md"] {
+            entries.push(name, &meta(EntryKind::File, 0, 0));
+        }
+        let sorter = Sorter::new();
+        let keys = sorter.build_keys(&entries, SortColumn::Extension);
+        let mut ids: Vec<u32> = (0..entries.len() as u32).collect();
+        sort_order(
+            &mut ids,
+            &keys,
+            SortOptions {
+                column: SortColumn::Extension,
+                ascending: true,
+                dirs_first: true,
+            },
+        );
+        let names: Vec<&str> = ids
+            .iter()
+            .map(|&ix| entries.name(EntryId::new(ix)))
+            .collect();
+        // "" < "md" < "txt"; within a run, by name (not by insertion
+        // order -- the point of the tie-breaker).
+        assert_eq!(names, ["Makefile", "c.md", "z.md", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn attributes_sort_orders_by_mode_bits_then_name() {
+        let mut entries = EntryStore::new();
+        let mut with_mode = |name: &str, mode: u32| {
+            let mut m = meta(EntryKind::File, 0, 0);
+            m.mode = Some(mode);
+            entries.push(name, &m);
+        };
+        with_mode("exec-b", 0o100755);
+        with_mode("plain", 0o100644);
+        with_mode("exec-a", 0o100755);
+        entries.push("unknown", &meta(EntryKind::File, 0, 0));
+        let sorter = Sorter::new();
+        let keys = sorter.build_keys(&entries, SortColumn::Attributes);
+        let mut ids: Vec<u32> = (0..entries.len() as u32).collect();
+        sort_order(
+            &mut ids,
+            &keys,
+            SortOptions {
+                column: SortColumn::Attributes,
+                ascending: true,
+                dirs_first: false,
+            },
+        );
+        let names: Vec<&str> = ids
+            .iter()
+            .map(|&ix| entries.name(EntryId::new(ix)))
+            .collect();
+        assert_eq!(names, ["unknown", "plain", "exec-a", "exec-b"]);
     }
 }

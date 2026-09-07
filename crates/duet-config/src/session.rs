@@ -24,10 +24,10 @@ use crate::io;
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
 /// Which column a tab was last sorted by, for [`SessionTab::sort_column`].
-/// Mirrors `duet_index::SortColumn`'s Name/Size/Modified variants (the
-/// only three `duet-ui`'s `FileTableDelegate` ever actually sorts by --
-/// `Kind` is a real `SortColumn` variant but isn't reachable through any
-/// column this app renders) without this crate depending on `duet-index`
+/// Mirrors `duet_index::SortColumn`'s Name/Size/Modified/Extension/
+/// Attributes variants (the columns `duet-ui`'s `FileTableDelegate` can
+/// render and sort by -- `Kind` is a real `SortColumn` variant but isn't
+/// reachable through any column) without this crate depending on `duet-index`
 /// just for a persistence enum; `duet-ui` translates between the two
 /// explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -36,6 +36,10 @@ pub enum SessionSortColumn {
     Name,
     Size,
     Modified,
+    /// T-4.2.4's Ext column (`duet_index::SortColumn::Extension`).
+    Extension,
+    /// T-4.2.4's Attr column (`duet_index::SortColumn::Attributes`).
+    Attributes,
 }
 
 fn default_true() -> bool {

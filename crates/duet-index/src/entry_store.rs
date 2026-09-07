@@ -134,21 +134,22 @@ fn set_bit(word: &mut u32, mask: u32, v: bool) {
 /// | `name_len`     | `Vec<u16>`               | 2           |
 /// | `sizes`        | `Vec<u64>`               | 8           |
 /// | `mtimes`       | `Vec<i64>`               | 8           |
+/// | `modes`        | `Vec<u32>`               | 4           |
 /// | `flags`        | `Vec<EntryFlags>` (u32)  | 4           |
 /// | `extended`     | `Vec<Option<Box<Metadata>>>` (niche-optimized to a pointer) | 8 |
-/// | **fixed total**|                          | **34**      |
+/// | **fixed total**|                          | **38**      |
 ///
-/// 34 B is well inside the 96 B budget, leaving ~62 B/entry of headroom
+/// 38 B is well inside the 96 B budget, leaving ~58 B/entry of headroom
 /// before the name's own bytes even enter the count (the name lives in
 /// [`NameArena`], addressed by `name_offset`/`name_len`, and is charged
 /// separately per the "+ name" clause of the AC). At 1M entries:
 ///
-/// - fixed columns: `34 B * 1_000_000 ≈ 32.4 MB`
+/// - fixed columns: `38 B * 1_000_000 ≈ 36.2 MB`
 /// - name arena at a generous 32 B/name average: `32 B * 1_000_000 ≈ 30.5 MB`
 /// - `DirectoryModel::order: Vec<u32>` (one entry per *visible* row, so
-///   `<= 34 B` bound doesn't apply, but bounded by the same 1M): `≈ 3.8 MB`
+///   `<= 38 B` bound doesn't apply, but bounded by the same 1M): `≈ 3.8 MB`
 ///
-/// Total ≈ 67 MB, comfortably under T-3.2.1's 120 MB ceiling with room for
+/// Total ≈ 71 MB, comfortably under T-3.2.1's 120 MB ceiling with room for
 /// allocator overhead and a non-trivial `selection: RoaringBitmap` (which
 /// is itself sub-linear for contiguous or sparse selections, per its
 /// compressed-bitmap design).
@@ -172,6 +173,13 @@ pub struct EntryStore {
     /// column and would cost another 4 B/entry for something the full
     /// `Metadata` in `extended` already carries when anyone needs it.
     mtimes: Vec<i64>,
+    /// POSIX mode bits (file-type + permission bits, `statx`'s `stx_mode`)
+    /// as their own 4-byte column, `0` when the listing didn't ask for
+    /// them (T-4.2.4's Attributes column). Kept out of `extended` on
+    /// purpose: boxing a whole `Metadata` per entry just to carry one
+    /// `u32` would cost ~150 bytes/entry and blow NFR-06's 1M-entry
+    /// budget the moment a Full-view panel shows attributes.
+    modes: Vec<u32>,
     flags: Vec<EntryFlags>,
     /// Populated on demand when a caller fetches metadata beyond the cheap
     /// core (§9.1 `ListOpts`). See the byte-budget note above for why this
@@ -189,6 +197,7 @@ impl EntryStore {
             name_len: Vec::new(),
             sizes: Vec::new(),
             mtimes: Vec::new(),
+            modes: Vec::new(),
             flags: Vec::new(),
             extended: Vec::new(),
         }
@@ -204,6 +213,7 @@ impl EntryStore {
             name_len: Vec::with_capacity(capacity),
             sizes: Vec::with_capacity(capacity),
             mtimes: Vec::with_capacity(capacity),
+            modes: Vec::with_capacity(capacity),
             flags: Vec::with_capacity(capacity),
             extended: Vec::with_capacity(capacity),
         }
@@ -226,7 +236,7 @@ impl EntryStore {
     /// call -- see `EntryId`'s doc comment on why that equivalence holds
     /// only within one generation).
     ///
-    /// `metadata` beyond `size`/`modified`/`kind` is stashed in `extended`
+    /// `metadata` beyond `size`/`modified`/`kind`/`mode` is stashed in `extended`
     /// only if any such field is actually present, to honor the
     /// zero-allocation-for-the-common-case budget above.
     pub fn push(&mut self, name: &str, metadata: &Metadata) -> EntryId {
@@ -237,6 +247,7 @@ impl EntryStore {
         self.sizes.push(metadata.size);
         self.mtimes
             .push(metadata.modified.map(|t| t.secs).unwrap_or(0));
+        self.modes.push(metadata.mode.unwrap_or(0));
 
         let mut flags = EntryFlags::new(metadata.kind);
         let has_extended = has_extended_fields(metadata);
@@ -272,6 +283,14 @@ impl EntryStore {
     /// `mtimes` for the precision trade-off.
     pub fn mtime_secs(&self, id: EntryId) -> i64 {
         self.mtimes[id.index() as usize]
+    }
+
+    /// The entry's POSIX mode bits (type + permissions), or `None` if the
+    /// listing didn't populate them (`ListFields::MODE` not requested, or a
+    /// backend with no notion of mode).
+    pub fn mode(&self, id: EntryId) -> Option<u32> {
+        let mode = self.modes[id.index() as usize];
+        (mode != 0).then_some(mode)
     }
 
     pub fn kind(&self, id: EntryId) -> EntryKind {
@@ -326,6 +345,7 @@ impl EntryStore {
             + self.name_len.len() * size_of::<u16>()
             + self.sizes.len() * size_of::<u64>()
             + self.mtimes.len() * size_of::<i64>()
+            + self.modes.len() * size_of::<u32>()
             + self.flags.len() * size_of::<EntryFlags>()
             + self.extended.len() * size_of::<Option<Box<Metadata>>>()
             + self
@@ -346,7 +366,6 @@ impl Default for EntryStore {
 fn has_extended_fields(metadata: &Metadata) -> bool {
     metadata.accessed.is_some()
         || metadata.created.is_some()
-        || metadata.mode.is_some()
         || metadata.uid.is_some()
         || metadata.gid.is_some()
         || metadata.nlink.is_some()
@@ -521,7 +540,7 @@ mod tests {
 
     #[test]
     fn fixed_column_width_matches_documented_budget() {
-        // Sanity-checks the "34 B fixed total" arithmetic in the doc
+        // Sanity-checks the "38 B fixed total" arithmetic in the doc
         // comment against the actual Rust type sizes, so the two can't
         // silently drift apart.
         assert_eq!(size_of::<u32>(), 4); // name_offset
@@ -530,6 +549,6 @@ mod tests {
         assert_eq!(size_of::<i64>(), 8); // mtimes
         assert_eq!(size_of::<EntryFlags>(), 4); // flags
         assert_eq!(size_of::<Option<Box<Metadata>>>(), 8); // extended (niche-optimized)
-        assert_eq!(4 + 2 + 8 + 8 + 4 + 8, 34);
+        assert_eq!(4 + 2 + 8 + 8 + 4 + 4 + 8, 38);
     }
 }
