@@ -27,6 +27,7 @@ mod dialog_job;
 pub mod file_table;
 mod function_bar;
 mod hotlist;
+pub mod icons;
 mod job_report_dialog;
 mod link_dialog;
 mod mkdir_dialog;

@@ -322,6 +322,15 @@ pub fn run() {
         bind_recovery_dialog_keys(cx);
         bind_trash_dialog_keys(cx);
 
+        // T-4.2.6: the icon tables load on the Tokio runtime; every
+        // window refreshes once they are in.
+        let (icon_theme, show_icons) = duet_config::paths::settings_path()
+            .ok()
+            .as_deref()
+            .map(load_icon_settings)
+            .unwrap_or((None, true));
+        crate::icons::IconCache::install(cx, tokio_handle.clone(), icon_theme, show_icons);
+
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         // The window's own titlebar text/traffic-light metadata --
         // `TitleBar::title_bar_options()`'s own defaults
@@ -4425,6 +4434,28 @@ fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
         })
 }
 
+/// Reads `appearance.icon_theme` (`None` for `"system"`) and
+/// `appearance.show_icons` (T-4.2.6) from `settings.toml` at `path`, same
+/// fallback tolerance as [`load_splitter_ratio`].
+fn load_icon_settings(path: &std::path::Path) -> (Option<String>, bool) {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| {
+            let theme = settings.appearance.icon_theme.trim().to_string();
+            (
+                (!theme.is_empty() && theme != "system").then_some(theme),
+                settings.appearance.show_icons,
+            )
+        })
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default icon settings (settings.toml not loaded yet: {err})"
+            );
+            (None, true)
+        })
+}
+
 /// Reads `selection.mouse_mode` (FR-SEL-06) from `settings.toml` at
 /// `path`, same "missing/malformed file falls back to
 /// `Settings::default()`" tolerance as [`load_splitter_ratio`] --
@@ -6073,6 +6104,77 @@ mod tests {
                 load_column_layout(&settings),
                 left.read_with(vcx, |t, cx| t.state().read(cx).delegate().layout().clone())
             );
+        });
+    }
+
+    /// T-4.2.6: with a theme that provides icons, listing a directory
+    /// rasterises one image per distinct type into the bounded cache,
+    /// off the UI thread, and the rows draw from it.
+    #[gpui::test]
+    fn listing_loads_icons_into_the_bounded_cache(cx: &mut TestAppContext) {
+        use crate::icons::{IconCache, IconTables};
+        use duet_meta::{IconResolver, MimeDb};
+        let theme_dir = tempfile::tempdir().unwrap();
+        let root = theme_dir.path().join("Fixture");
+        std::fs::create_dir_all(root.join("16x16/places")).unwrap();
+        std::fs::create_dir_all(root.join("16x16/mimetypes")).unwrap();
+        std::fs::write(
+            root.join("index.theme"),
+            "[Icon Theme]\nName=Fixture\nDirectories=16x16/places,16x16/mimetypes\n\n\
+             [16x16/places]\nSize=16\nType=Fixed\n\n[16x16/mimetypes]\nSize=16\nType=Fixed\n",
+        )
+        .unwrap();
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#00f"/></svg>"##;
+        std::fs::write(root.join("16x16/places/folder.svg"), svg).unwrap();
+        std::fs::write(root.join("16x16/mimetypes/text-plain.svg"), svg).unwrap();
+        let mut mime = MimeDb::default();
+        mime.parse_globs2("50:text/plain:*.txt\n");
+        let tables = IconTables::from_parts(
+            mime,
+            IconResolver::new("Fixture", vec![theme_dir.path().to_path_buf()]),
+        );
+        let icon_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        cx.update(|cx| {
+            cx.set_global(IconCache::with_tables(
+                icon_rt.handle().clone(),
+                tables,
+                64 * 1024,
+            ))
+        });
+
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+            std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            // Each frame schedules the missing icons; Tokio rasterises;
+            // the foreground inserts them and refreshes.
+            wait_until(vcx, |vcx| {
+                let _ = vcx.update(|window, cx| window.draw(cx));
+                vcx.update(|_, cx| {
+                    let cache = cx.global::<IconCache>();
+                    cache.contains("folder|inode-directory")
+                        && cache.contains("text-plain|text-x-generic|unknown")
+                })
+            });
+            vcx.update(|_, cx| {
+                let cache = cx.global::<IconCache>();
+                // The right panel lists the test process's cwd too; its
+                // types miss in the fixture theme (cached as misses), so
+                // count images, not entries.
+                assert_eq!(
+                    cache.image_count(),
+                    2,
+                    "one image per distinct icon, not per row"
+                );
+                assert!(cache.len() >= 2);
+                assert!(cache.used_bytes() <= 64 * 1024);
+            });
         });
     }
 

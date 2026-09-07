@@ -202,7 +202,7 @@ Validated with Python's `tomllib` — parses cleanly.
 | `appearance.font` | string | `"system-ui"` | `"system-ui"` \| a fontconfig family name | UI font; `"system-ui"` reads fontconfig (R-G5). |
 | `appearance.font_size` | int | `13` | 8–32 | Base UI font size in points. |
 | `appearance.row_height` | enum | `"compact"` | `compact` \| `comfortable` \| `spacious` | Table row density. |
-| `appearance.icon_theme` | string | `"system"` | `"system"` \| an installed XDG icon theme name | Icon theme resolution root (R-G5). |
+| `appearance.icon_theme` | string | `"system"` | `"system"` \| an installed XDG icon theme name | Icon theme resolution root (R-G5, T-4.2.6). `"system"` detects the desktop's theme: `$DUET_ICON_THEME`, then `gtk-icon-theme-name` in `gtk-4.0`/`gtk-3.0/settings.ini`, then `gsettings get org.gnome.desktop.interface icon-theme`, else `Adwaita`; `hicolor` is always the last fallback. Read once at startup. |
 | `appearance.show_icons` | bool | `true` | — | Disable to render text-only rows (accessibility / low-end GPU escape hatch). |
 | `terminal.shell` | string | `"$SHELL"` | any executable path or env-var reference | Shell used by the embedded command line and terminal panel. |
 | `terminal.embedded_terminal_enabled` | bool | `false` | — | FR-TOOL-07 toggle for the embedded terminal panel. |

@@ -40,12 +40,15 @@
 //! Caching an owned `SharedString` per name once, alongside size/date,
 //! avoids both the leak and any unsafe lifetime extension.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use duet_index::{DirectoryModel, FilterSpec, SortColumn, extension_of};
+use duet_meta::EntryClass;
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
 use duet_widgets::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -54,16 +57,91 @@ use duet_widgets::table::{
 };
 use duet_widgets::theme::{TokenPalette, suppress_row_hover, unsuppress_row_hover};
 use futures_util::StreamExt;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    HighlightStyle, InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton,
-    ParentElement as _, Render, SharedString, Styled as _, StyledText, WeakEntity, Window, actions,
-    div, px,
+    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, ImageSource, InteractiveElement as _,
+    IntoElement, KeyBinding, Modifiers, MouseButton, ParentElement as _, Render, SharedString,
+    Styled as _, StyledText, WeakEntity, Window, actions, div, img, px,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
+use crate::icons::{ICON_PX, IconCache, IconId, IconTables};
+
+/// `RowText::icon` for a row with no icon (icons disabled).
+const ICON_NONE: u32 = u32::MAX;
+/// `RowText::icon` for a row whose icon couldn't be assigned yet because
+/// the lookup tables were still loading -- see
+/// [`FileTableDelegate::resolve_pending_icons`].
+const ICON_UNRESOLVED: u32 = u32::MAX - 1;
+
+/// One distinct icon a listing needs (T-4.2.6): its cache identity and
+/// the theme candidate names behind it. Interned per delegate by
+/// [`icon_slot_for`], so a 100k-row listing of `.txt` files holds one.
+struct IconSlot {
+    id: IconId,
+    names: Arc<Vec<String>>,
+}
+
+/// The interning key for a file name's icon: its suffix after the first
+/// dot (`tar.gz` for `a.tar.gz` -- what the MIME database matches on),
+/// the whole name when a whole-name MIME rule exists for it
+/// (`Makefile`), and `""` for every other extension-less name, so a
+/// directory of a million such files interns one slot, not a million.
+fn icon_key_for_name<'a>(name: &'a str, tables: &IconTables) -> &'a str {
+    let start = usize::from(name.starts_with('.'));
+    match name[start..].find('.') {
+        Some(ix) => &name[start + ix + 1..],
+        None if tables.is_literal_name(name) => name,
+        None => "",
+    }
+}
+
+/// The slot index for a listing entry -- see [`IconSlot`]. A free
+/// function over the delegate's individual fields so it can run inside
+/// `rebuild_row_text`'s loop, which already holds `model` borrowed.
+fn icon_slot_for(
+    tables: &OnceLock<IconTables>,
+    by_key: &mut HashMap<String, u32>,
+    slots: &mut Vec<IconSlot>,
+    name: &str,
+    kind: EntryKind,
+) -> u32 {
+    let Some(tables) = tables.get() else {
+        return ICON_UNRESOLVED;
+    };
+    let class = match kind {
+        EntryKind::Directory => EntryClass::Directory,
+        EntryKind::File => EntryClass::File,
+        EntryKind::Symlink => EntryClass::Symlink,
+        _ => EntryClass::Special,
+    };
+    let key: &str = match class {
+        EntryClass::File => icon_key_for_name(name, tables),
+        EntryClass::Directory => "\0dir",
+        EntryClass::Symlink => "\0link",
+        EntryClass::Special => "\0special",
+    };
+    if let Some(&slot) = by_key.get(key) {
+        return slot;
+    }
+    let names = tables.icon_names(name, class);
+    let id: IconId = Arc::from(names.join("|"));
+    let slot = match slots.iter().position(|s| s.id == id) {
+        Some(ix) => ix,
+        None => {
+            slots.push(IconSlot {
+                id,
+                names: Arc::new(names),
+            });
+            slots.len() - 1
+        }
+    };
+    by_key.insert(key.to_string(), slot as u32);
+    slot as u32
+}
 
 /// `duet_widgets::table::TableDelegate::render_last_empty_col`'s default
 /// (`gpui-component-0.5.1/src/table/delegate.rs`) unconditionally appends
@@ -171,6 +249,9 @@ struct RowText {
     ext: SharedString,
     /// Empty (no allocation) unless the layout shows the Attr column.
     attrs: SharedString,
+    /// Index into `FileTableDelegate::icon_slots`, or [`ICON_NONE`] /
+    /// [`ICON_UNRESOLVED`] (T-4.2.6).
+    icon: u32,
 }
 
 /// `duet_widgets::table::TableDelegate` (gpui-component's `TableDelegate`,
@@ -309,6 +390,17 @@ pub struct FileTableDelegate {
     /// `FileTable::new`, same "no live-reload path yet" story as
     /// `mouse_mode`.
     quick_search_default_mode: QuickSearchMode,
+    /// T-4.2.6: the icon lookup tables shared through [`IconCache`], or
+    /// `None` when icons are off (`appearance.show_icons = false`, or a
+    /// delegate built outside a `FileTable`). See `icons.rs`.
+    icon_tables: Option<Arc<OnceLock<IconTables>>>,
+    /// Distinct icons this listing needs, interned -- see [`IconSlot`].
+    icon_slots: Vec<IconSlot>,
+    /// [`icon_key_for_name`] -> index into `icon_slots`.
+    icon_by_key: HashMap<String, u32>,
+    /// Set when a `rebuild_row_text` ran before the tables were loaded;
+    /// cleared by [`Self::resolve_pending_icons`].
+    icons_unresolved: bool,
 }
 
 impl FileTableDelegate {
@@ -353,6 +445,10 @@ impl FileTableDelegate {
             new_tab_handler: None,
             quick_search: None,
             quick_search_default_mode: QuickSearchMode::default(),
+            icon_tables: None,
+            icon_slots: Vec::new(),
+            icon_by_key: HashMap::new(),
+            icons_unresolved: false,
         };
         delegate.rebuild_row_text();
         delegate.set_cursor_row(Some(0));
@@ -1235,12 +1331,26 @@ impl FileTableDelegate {
         // Toggling either column on re-runs this pass (`apply_layout`).
         let want_ext = self.layout.contains(ColumnKind::Extension);
         let want_attrs = self.layout.contains(ColumnKind::Attributes);
+        self.icons_unresolved = false;
         for &ix in self.model.order() {
             let id = EntryId::new(ix);
             let entries = self.model.entries();
             let kind = entries.kind(id);
 
             let name = SharedString::new(entries.name(id));
+            let icon = match &self.icon_tables {
+                Some(tables) => icon_slot_for(
+                    tables,
+                    &mut self.icon_by_key,
+                    &mut self.icon_slots,
+                    entries.name(id),
+                    kind,
+                ),
+                None => ICON_NONE,
+            };
+            if icon == ICON_UNRESOLVED {
+                self.icons_unresolved = true;
+            }
 
             self.scratch.clear();
             write_size(&mut self.scratch, kind, entries.size(id));
@@ -1271,6 +1381,7 @@ impl FileTableDelegate {
                 modified,
                 ext,
                 attrs,
+                icon,
             });
         }
         self.cached_generation = self.model.generation();
@@ -1279,6 +1390,100 @@ impl FileTableDelegate {
     /// See the `total_bytes_in_view` field's doc comment.
     pub fn total_bytes_in_view(&self) -> u64 {
         self.total_bytes_in_view
+    }
+
+    /// See the `icon_tables` field's doc comment. Re-assigns every row's
+    /// icon so a delegate switched on after its first listing catches up.
+    pub fn set_icon_tables(&mut self, tables: Option<Arc<OnceLock<IconTables>>>) {
+        self.icon_tables = tables;
+        self.icon_slots.clear();
+        self.icon_by_key.clear();
+        let placeholder = if self.icon_tables.is_some() {
+            ICON_UNRESOLVED
+        } else {
+            ICON_NONE
+        };
+        for row in &mut self.row_text {
+            row.icon = placeholder;
+        }
+        self.icons_unresolved = self.icon_tables.is_some();
+        self.resolve_pending_icons();
+    }
+
+    /// Fills in icons for rows listed before the lookup tables were
+    /// loaded (see `icons.rs`). Cheap when there is nothing to do (one
+    /// flag, one `OnceLock` probe); returns whether any row changed.
+    pub(crate) fn resolve_pending_icons(&mut self) -> bool {
+        if !self.icons_unresolved {
+            return false;
+        }
+        let Some(tables) = &self.icon_tables else {
+            self.icons_unresolved = false;
+            return false;
+        };
+        if tables.get().is_none() {
+            return false;
+        }
+        for (row, &ix) in self.model.order().iter().enumerate() {
+            let Some(text) = self.row_text.get_mut(row) else {
+                break;
+            };
+            let id = EntryId::new(ix);
+            let entries = self.model.entries();
+            text.icon = icon_slot_for(
+                tables,
+                &mut self.icon_by_key,
+                &mut self.icon_slots,
+                entries.name(id),
+                entries.kind(id),
+            );
+        }
+        self.icons_unresolved = false;
+        true
+    }
+
+    /// The slot for the synthetic ".." row: a folder, like any directory.
+    fn parent_row_icon_slot(&mut self) -> u32 {
+        match &self.icon_tables {
+            Some(tables) => icon_slot_for(
+                tables,
+                &mut self.icon_by_key,
+                &mut self.icon_slots,
+                "..",
+                EntryKind::Directory,
+            ),
+            None => ICON_NONE,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_icon_slot(&self, model_row: usize) -> Option<u32> {
+        self.row_text.get(model_row).map(|r| r.icon)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn icon_slot_count(&self) -> usize {
+        self.icon_slots.len()
+    }
+
+    /// The image to draw in a Name cell for `slot`, if it is already in
+    /// the [`IconCache`] (a miss schedules the load and yields `None`).
+    fn icon_image(
+        &self,
+        slot: u32,
+        window: &Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Option<Arc<gpui::RenderImage>> {
+        if slot >= ICON_UNRESOLVED || !cx.has_global::<IconCache>() {
+            return None;
+        }
+        let slot = self.icon_slots.get(slot as usize)?;
+        // Integer scale factors only: a 1.5x display gets 2x pixels drawn
+        // into a 16 px box, which is crisper than 1x stretched.
+        let scale = window.scale_factor().ceil().max(1.0) as u32;
+        cx.update_global::<IconCache, _>(|cache, cx| {
+            cache.get_or_load(&slot.id, &slot.names, ICON_PX as u32, scale, cx)
+        })
     }
 }
 
@@ -1423,8 +1628,8 @@ impl TableDelegate for FileTableDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         // The synthetic ".." row (T-4.3.1) has no `row_text` entry -- it
         // isn't a model row at all -- so it's rendered directly here
@@ -1517,16 +1722,47 @@ impl TableDelegate for FileTableDelegate {
                     }
                 }
             });
-            if let Some(ranges) = ranges {
-                let highlight = HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                };
-                return cell.child(
+            let content: AnyElement = match ranges {
+                Some(ranges) => {
+                    let highlight = HighlightStyle {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..Default::default()
+                    };
                     StyledText::new(text)
-                        .with_highlights(ranges.into_iter().map(|range| (range, highlight))),
-                );
+                        .with_highlights(ranges.into_iter().map(|range| (range, highlight)))
+                        .into_any_element()
+                }
+                None => text.into_any_element(),
+            };
+            // T-4.2.6: a fixed 16 px icon slot ahead of the name -- always
+            // present once icons are on (empty while the icon loads, or
+            // when the theme has none), so the text never shifts. The
+            // ".." row gets a folder like any directory.
+            let slot = if self.has_parent_row && row_ix == 0 {
+                self.parent_row_icon_slot()
+            } else {
+                model_row
+                    .and_then(|row| self.row_text.get(row))
+                    .map_or(ICON_NONE, |row| row.icon)
+            };
+            if slot == ICON_NONE {
+                return cell.child(content);
             }
+            let image = self.icon_image(slot, window, cx);
+            return cell
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(ICON_PX))
+                        .when_some(image, |slot, image| {
+                            slot.child(img(ImageSource::Render(image)).size_full())
+                        }),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(content));
         }
         cell.child(text)
     }
@@ -2265,6 +2501,7 @@ impl FileTable {
             delegate.seed_available_width(available);
         }
         delegate.set_mouse_mode(settings.mouse_mode);
+        delegate.set_icon_tables(cx.try_global::<IconCache>().and_then(IconCache::tables));
         delegate.set_quick_search_default_mode(settings.quick_search_default_mode);
         let state = cx.new(|cx| TableState::new(delegate, window, cx));
         // T-4.2.4: follow the shared layout. `apply_layout` is a no-op for
@@ -3042,6 +3279,14 @@ impl Focusable for FileTable {
 
 impl Render for FileTable {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // T-4.2.6: rows listed before the icon tables finished loading get
+        // their icons on the first frame after (a flag check per frame,
+        // one pass over the rows once).
+        self.state.update(cx, |state, cx| {
+            if state.delegate_mut().resolve_pending_icons() {
+                cx.notify();
+            }
+        });
         let state = self.state.clone();
         div()
             .size_full()
@@ -4382,6 +4627,73 @@ mod tests {
             ["name", "attrs", "ext", "size", "modified"]
         );
         assert_eq!(delegate.columns[1].name.as_ref(), "Attr");
+    }
+
+    #[test]
+    fn icon_slots_are_interned_per_key_and_resolved_when_tables_arrive() {
+        use crate::icons::IconTables;
+        use duet_meta::{IconResolver, MimeDb};
+        let mut model = DirectoryModel::new();
+        for name in ["a.txt", "b.txt", "Makefile", "README", "LICENSE"] {
+            model.entries_mut().push(name, &meta(EntryKind::File, 1, 0));
+        }
+        model
+            .entries_mut()
+            .push("sub", &meta(EntryKind::Directory, 0, 0));
+        model.sort_by(SortColumn::Name, true);
+        let mut delegate = FileTableDelegate::new(model);
+        assert_eq!(
+            delegate.row_icon_slot(0),
+            Some(ICON_NONE),
+            "icons off by default"
+        );
+
+        let cell: Arc<OnceLock<IconTables>> = Arc::new(OnceLock::new());
+        delegate.set_icon_tables(Some(cell.clone()));
+        assert_eq!(delegate.row_icon_slot(0), Some(ICON_UNRESOLVED));
+        assert!(!delegate.resolve_pending_icons(), "tables not loaded yet");
+
+        let mut mime = MimeDb::default();
+        mime.parse_globs2("50:text/plain:*.txt\n50:text/x-makefile:Makefile\n");
+        assert!(
+            cell.set(IconTables::from_parts(
+                mime,
+                IconResolver::new("none", Vec::new())
+            ))
+            .is_ok()
+        );
+        assert!(delegate.resolve_pending_icons());
+        assert!(!delegate.resolve_pending_icons(), "only once");
+
+        let slot = |name: &str| {
+            let row = delegate
+                .row_text
+                .iter()
+                .position(|r| r.name.as_ref() == name)
+                .unwrap();
+            delegate.row_icon_slot(row).unwrap()
+        };
+        assert_eq!(slot("a.txt"), slot("b.txt"), "one slot per extension");
+        assert_ne!(slot("a.txt"), slot("sub"));
+        assert_ne!(
+            slot("Makefile"),
+            slot("README"),
+            "a whole-name MIME rule gets its own slot"
+        );
+        assert_eq!(
+            slot("README"),
+            slot("LICENSE"),
+            "other extension-less names share the generic slot"
+        );
+        assert_eq!(
+            delegate.icon_slot_count(),
+            4,
+            "txt, folder, makefile, generic"
+        );
+        assert!(delegate.row_text.iter().all(|r| r.icon < ICON_UNRESOLVED));
+
+        delegate.set_icon_tables(None);
+        assert!(delegate.row_text.iter().all(|r| r.icon == ICON_NONE));
     }
 
     #[test]

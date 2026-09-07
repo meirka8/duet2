@@ -1672,6 +1672,9 @@ dependencies = [
 [[package]]
 name = "duet-meta"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "duet-ops"
@@ -1735,16 +1738,20 @@ dependencies = [
  "duet-commands",
  "duet-config",
  "duet-index",
+ "duet-meta",
  "duet-ops",
  "duet-types",
  "duet-vfs",
  "duet-widgets",
  "futures-util",
  "gpui",
+ "image",
  "nucleo-matcher",
+ "resvg",
  "tempfile",
  "tokio",
  "tracing",
+ "usvg",
 ]
 
 [[package]]
