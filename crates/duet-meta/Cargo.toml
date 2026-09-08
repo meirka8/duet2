@@ -12,6 +12,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# T-5.3.4 launching: `setsid` for the detached child (same workspace pin
+# duet-vfs uses; the `process` feature is already on).
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

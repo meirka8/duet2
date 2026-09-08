@@ -51,12 +51,14 @@ use duet_index::{DirectoryModel, FilterSpec, SortColumn, extension_of};
 use duet_meta::EntryClass;
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
+use duet_widgets::layout::WindowExt as _;
 use duet_widgets::layout::{h_flex, v_flex};
 use duet_widgets::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
 };
 use duet_widgets::theme::{TokenPalette, suppress_row_hover, unsuppress_row_hover};
+use duet_widgets::toast::Notification;
 use futures_util::StreamExt;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -72,6 +74,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
 use crate::icons::{ICON_PX, IconCache, IconId, IconTables};
+use crate::launcher::{self, LaunchSettings};
 use crate::tree_view::{EnterHandler, TreeView};
 use crate::view_mode::{
     BRIEF_COLUMN_WIDTH, BRIEF_ROW_HEIGHT, BriefGeometry, GridGeometry, THUMB_CELL_HEIGHT,
@@ -1170,6 +1173,23 @@ impl FileTableDelegate {
         Some(self.model.entries().name(EntryId::new(ix)).to_string())
     }
 
+    /// T-5.3.4: the cursor entry's name, kind and mode bits (`None` on
+    /// the ".." row or an empty listing) -- what opening it needs.
+    pub(crate) fn cursor_entry_info(&self) -> Option<(String, EntryKind, Option<u32>)> {
+        if self.cursor_on_parent {
+            return None;
+        }
+        let row = self.cursor_row?;
+        let &ix = self.model.order().get(row)?;
+        let id = EntryId::new(ix);
+        let entries = self.model.entries();
+        Some((
+            entries.name(id).to_string(),
+            entries.kind(id),
+            entries.mode(id),
+        ))
+    }
+
     /// Whether the display cursor is on the synthetic ".." row. See the
     /// `cursor_on_parent` field's doc comment.
     pub fn cursor_on_parent(&self) -> bool {
@@ -2029,6 +2049,24 @@ impl TableDelegate for FileTableDelegate {
         if !self.prepare_context_menu_row(row_ix) {
             return menu;
         }
+        // T-5.3.4: a file row leads with what Enter does and the chooser.
+        // Both are workspace actions dispatched from the click, exactly
+        // as the keyboard would dispatch them, so one code path handles
+        // the launch and its notices.
+        let is_file = self
+            .cursor_entry_info()
+            .is_some_and(|(_, kind, _)| kind != EntryKind::Directory);
+        let menu = if is_file {
+            menu.item(PopupMenuItem::new("Open").on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(crate::workspace::OpenDefault), cx);
+            }))
+            .item(PopupMenuItem::new("Open With…").on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(crate::workspace::OpenWith), cx);
+            }))
+            .separator()
+        } else {
+            menu
+        };
         let is_selected = self
             .cursor_row
             .and_then(|row| self.model.order().get(row))
@@ -3829,7 +3867,52 @@ impl FileTable {
         if let Some(name) = name {
             let target = self.current_dir.join(name);
             self.navigate_to(target, true, None, window, cx);
+        } else {
+            self.open_cursor_file(window, cx);
         }
+    }
+
+    /// The cursor entry's full path when it is a file (anything but a
+    /// directory or the ".." row) -- what "Open"/"Open With" act on.
+    pub(crate) fn cursor_file_path(&self, cx: &App) -> Option<PathBuf> {
+        let (name, kind, _) = self.state.read(cx).delegate().cursor_entry_info()?;
+        (kind != EntryKind::Directory).then(|| self.current_dir.join(name))
+    }
+
+    /// T-5.3.4: Enter on a file -- resolve and launch on the Tokio
+    /// runtime (`launcher::open_default`: MIME lookup, overrides,
+    /// executables, the association database), and toast the reason if
+    /// nothing could be started. The listing itself is untouched.
+    pub(crate) fn open_cursor_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((name, kind, mode)) = self.state.read(cx).delegate().cursor_entry_info() else {
+            return;
+        };
+        if kind == EntryKind::Directory {
+            return;
+        }
+        let path = self.current_dir.join(&name);
+        let executable = mode.is_some_and(|m| m & 0o111 != 0);
+        let overrides = LaunchSettings::overrides(cx);
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        self.tokio_handle.spawn(async move {
+            let result =
+                launcher::open_default(&overrides, &path, executable).map(|plan| plan.label);
+            let _ = tx.send(result);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rx
+                .await
+                .unwrap_or_else(|_| Err("launch task dropped".to_string()));
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(label) => {
+                    tracing::info!(target: "duet_ui::launcher", "opened {name} with {label}");
+                }
+                Err(message) => {
+                    window.push_notification(Notification::error(message), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Ctrl+PgUp/Alt+Up, and Backspace via [`Self::handle_backspace`]
