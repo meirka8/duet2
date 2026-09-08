@@ -70,6 +70,21 @@ pub struct Settings {
     pub logging: Logging,
     /// `[plugins]`: plugin host master switch and bundle directory.
     pub plugins: Plugins,
+    /// `[associations]`: internal association overrides (FR-TOOL-08,
+    /// T-5.3.4).
+    pub associations: Associations,
+}
+
+/// `[associations]` -- what Enter runs for a file before the desktop's
+/// own `mimeapps.list` is consulted.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Associations {
+    /// `[associations.overrides]`: MIME type (`"text/markdown"`), media
+    /// class (`"image/*"`) or extension glob (`"*.tar.gz"`) to a command
+    /// in desktop-entry `Exec` syntax (`"zed %f"`, `"%f"` codes as in
+    /// `.desktop` files). Exact type wins over glob over media class.
+    pub overrides: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -87,6 +102,7 @@ impl Default for Settings {
             clipboard: Clipboard::default(),
             logging: Logging::default(),
             plugins: Plugins::default(),
+            associations: Associations::default(),
         }
     }
 }
@@ -549,6 +565,29 @@ columns = [
         let settings = reread.typed().unwrap();
         assert_eq!(settings.panels.layouts.get("full"), Some(&layout));
         assert!(settings.panels.show_hidden);
+    }
+
+    #[test]
+    fn association_overrides_parse_from_an_inline_table() {
+        let text = "schema_version = 1\n\n[associations.overrides]\n\"text/markdown\" = \"zed %f\"\n\"*.tar.gz\" = \"file-roller %f\"\n";
+        let file = SettingsFile::from_str(
+            Path::new("settings.toml"),
+            text,
+            &MigrationRegistry::settings(),
+            SETTINGS_SCHEMA_VERSION,
+        )
+        .unwrap();
+        let settings = file.typed().unwrap();
+        assert_eq!(
+            settings
+                .associations
+                .overrides
+                .get("text/markdown")
+                .map(String::as_str),
+            Some("zed %f")
+        );
+        assert_eq!(settings.associations.overrides.len(), 2);
+        assert!(Settings::default().associations.overrides.is_empty());
     }
 
     #[test]

@@ -54,8 +54,10 @@ use crate::file_table::{
 use crate::function_bar::{self, FKeySlot};
 use crate::hotlist::HotlistDelegate;
 use crate::job_report_dialog::{JobReportDialogState, bind_job_report_dialog_keys};
+use crate::launcher::{self, LaunchSettings};
 use crate::link_dialog::{LinkDialogState, LinkKind};
 use crate::mkdir_dialog::MkdirDialogState;
+use crate::open_with::OpenWithDelegate;
 use crate::operation_manager::{OperationManagerState, bind_operation_manager_keys};
 use crate::panel::{Panel, bind_panel_keys};
 use crate::recovery_dialog::{RecoveryDialogState, bind_recovery_dialog_keys};
@@ -117,6 +119,12 @@ actions!(
 // is bound to the bare, unmodified `"up"`/`"down"` keystrokes, so a
 // `Ctrl+Up`/`Ctrl+Down` binding is a genuinely different keystroke that
 // never competes with it.
+// T-5.3.4 (FR-TOOL-08): `file.open_default` / `file.open_with`. No
+// default chord -- Total Commander has none for "Open With" either --
+// but both are in the command palette and the row context menu, and
+// Enter on a file is `OpenDefault`'s everyday form.
+actions!(duet_workspace, [OpenDefault, OpenWith]);
+
 actions!(
     duet_workspace,
     [
@@ -331,6 +339,15 @@ pub fn run() {
             .map(load_icon_settings)
             .unwrap_or((None, true));
         crate::icons::IconCache::install(cx, tokio_handle.clone(), icon_theme, show_icons);
+        // T-5.3.4: `[associations.overrides]`, read once like the rest.
+        LaunchSettings::install(
+            cx,
+            duet_config::paths::settings_path()
+                .ok()
+                .as_deref()
+                .map(load_association_overrides)
+                .unwrap_or_default(),
+        );
 
         let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
         // The window's own titlebar text/traffic-light metadata --
@@ -685,6 +702,10 @@ pub struct Workspace {
     /// doesn't open the overlay, since it needs the exact same "which
     /// panel is the user actually working in" answer.
     hotlist_target_panel: PanelSide,
+    /// T-5.3.4: `Some` while the "Open With" chooser is up -- see
+    /// `open_with.rs`.
+    open_with: Option<Entity<ListState<OpenWithDelegate>>>,
+    open_with_previous_focus: Option<FocusHandle>,
 
     /// `Some` while the F5/F6 copy/move dialog (T-5.2.1, FR-OPS-01) is
     /// open -- constructed fresh on every `open_copy_move_dialog`, dropped
@@ -1371,6 +1392,8 @@ impl Workspace {
             hotlist: None,
             hotlist_previous_focus: None,
             hotlist_target_panel: PanelSide::Left,
+            open_with: None,
+            open_with_previous_focus: None,
             copy_move_dialog: None,
             copy_move_dialog_previous_focus: None,
             delete_dialog: None,
@@ -1579,6 +1602,14 @@ impl Workspace {
             PanelSide::Right => self.right_panel.clone(),
         };
         let handled = match id.as_str() {
+            "file.open_default" => {
+                self.open_cursor_default(window, cx);
+                true
+            }
+            "file.open_with" => {
+                self.open_open_with(window, cx);
+                true
+            }
             "tab.new" => {
                 panel.update(cx, |panel, cx| panel.new_tab(window, cx));
                 true
@@ -1722,6 +1753,113 @@ impl Workspace {
     /// active tab to `dir`, then closes the overlay. Goes through
     /// `FileTable::navigate_to_path` (T-4.3.5's own new entry point --
     /// `navigate_to` itself is private to `file_table`'s module).
+    /// T-5.3.4: the file under the focused panel's cursor, if any.
+    fn focused_cursor_file(&self, window: &Window, cx: &App) -> Option<PathBuf> {
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        panel.read(cx).active_table().read(cx).cursor_file_path(cx)
+    }
+
+    /// `OpenDefault` (`file.open_default`): what Enter does on a file.
+    fn open_cursor_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let table = panel.read(cx).active_table().clone();
+        table.update(cx, |table, cx| table.open_cursor_file(window, cx));
+    }
+
+    /// `OpenWith` (`file.open_with`): lists the applications for the
+    /// file under the cursor (looked up on the Tokio runtime) in the
+    /// chooser overlay; Enter there launches, Esc closes.
+    fn open_open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_with.is_some() {
+            return;
+        }
+        let Some(path) = self.focused_cursor_file(window, cx) else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<(String, Vec<launcher::AppChoice>)>();
+        let lookup_path = path.clone();
+        self.tokio_handle.spawn(async move {
+            let tables = launcher::tables();
+            let _ = tx.send(launcher::choices_for(&tables, &lookup_path));
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok((mime, choices)) = rx.await else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if choices.is_empty() {
+                    this.pending_notice.push(PendingNotice {
+                        level: NoticeLevel::Warning,
+                        message: format!("No installed application is associated with {mime}"),
+                    });
+                    cx.notify();
+                    return;
+                }
+                this.open_with_previous_focus = window.focused(cx);
+                let weak_workspace = cx.entity().downgrade();
+                let state = cx.new(|cx| {
+                    ListState::new(
+                        OpenWithDelegate::new(path, choices, weak_workspace),
+                        window,
+                        cx,
+                    )
+                });
+                state.update(cx, |state, cx| state.focus(window, cx));
+                this.open_with = Some(state);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn close_open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with = None;
+        if let Some(handle) = self.open_with_previous_focus.take() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// The chooser's Enter: launch `path` with the entry `id`, off the
+    /// UI thread, and report a failure as a toast.
+    pub(crate) fn launch_open_with_choice(
+        &mut self,
+        id: String,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_open_with(window, cx);
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        self.tokio_handle.spawn(async move {
+            let tables = launcher::tables();
+            let result = launcher::plan_for_choice(&tables, &id, &path)
+                .and_then(|plan| launcher::launch(&plan));
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx
+                .await
+                .unwrap_or_else(|_| Err("launch task dropped".to_string()));
+            if let Err(message) = result {
+                let _ = this.update(cx, |this, cx| {
+                    this.pending_notice.push(PendingNotice {
+                        level: NoticeLevel::Error,
+                        message,
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn navigate_to_hotlist_entry(
         &mut self,
         dir: String,
@@ -3452,6 +3590,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenDefault, window, cx| {
+                this.open_cursor_default(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenWith, window, cx| {
+                this.open_open_with(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenHotlist, window, cx| {
                 this.open_hotlist(window, cx);
             }))
@@ -3534,6 +3678,9 @@ impl Render for Workspace {
             })
             .when_some(self.hotlist.clone(), |this, state| {
                 this.child(hotlist_overlay(&state, cx))
+            })
+            .when_some(self.open_with.clone(), |this, state| {
+                this.child(open_with_overlay(&state, cx))
             })
             .when_some(self.copy_move_dialog.clone(), |this, state| {
                 this.child(copy_move_dialog_overlay(&state, cx))
@@ -3640,6 +3787,54 @@ fn command_palette_overlay(
 /// full reasoning), plus a `"HotlistOverlay"` key context and three extra
 /// `.on_action` handlers the palette never needed: this overlay is
 /// editable (`Delete`/`Ctrl+Up`/`Ctrl+Down`), not read-only.
+/// T-5.3.4's "Open With" chooser, the hotlist overlay's twin.
+fn open_with_overlay(
+    state: &Entity<ListState<OpenWithDelegate>>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    let title: SharedString = state
+        .read(cx)
+        .delegate()
+        .path
+        .file_name()
+        .map(|n| format!("Open {} with", n.to_string_lossy()))
+        .unwrap_or_else(|| "Open with".to_string())
+        .into();
+    gpui::div()
+        .id("open-with-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(96.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("open-with-card")
+                .occlude()
+                .w(px(480.))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(
+                    gpui::div()
+                        .px_2()
+                        .py_1()
+                        .text_color(tokens.color.header_fg)
+                        .bg(tokens.color.header_bg)
+                        .child(title),
+                )
+                .child(List::new(state).max_h(px(360.)))
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_open_with(window, cx);
+                })),
+        )
+}
+
 fn hotlist_overlay(
     state: &Entity<ListState<HotlistDelegate>>,
     cx: &mut Context<Workspace>,
@@ -4442,6 +4637,17 @@ fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
             );
             ColumnLayout::default()
         })
+}
+
+/// Reads `[associations.overrides]` (T-5.3.4) from `settings.toml` at
+/// `path`, same fallback tolerance as [`load_splitter_ratio`].
+fn load_association_overrides(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<String, String> {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| settings.associations.overrides)
+        .unwrap_or_default()
 }
 
 /// Reads `panels.default_view` (T-4.2.5) from `settings.toml` at `path`,
@@ -6342,6 +6548,116 @@ mod tests {
             assert_eq!(table.read_with(vcx, |t, _| t.view_mode()), ViewMode::Brief);
             wait_until(vcx, |vcx| table.read_with(vcx, |t, _| t.current_dir() == a));
             let _ = vcx.update(|window, cx| window.draw(cx));
+        });
+    }
+
+    /// T-5.3.4 end to end: with a fixture MIME database and one desktop
+    /// entry in the test's own XDG directories, Enter on a `.txt` runs
+    /// that entry's `Exec` with the file's path, and "Open With" lists
+    /// it (and launches it when chosen). Real desktop-entry lookup, real
+    /// process launch -- the entry is a shell script that records its
+    /// argument.
+    #[gpui::test]
+    fn enter_on_a_file_launches_its_association_and_open_with_lists_it(cx: &mut TestAppContext) {
+        use crate::file_table::EnterDirectory;
+        with_configured_workspace(cx, None, |workspace, vcx, data_dir| {
+            // Fixture: a data dir with mime/globs2, applications/ with the
+            // entry, mimeinfo.cache pointing the type at it -- and only
+            // that dir on XDG_DATA_DIRS so the machine's own apps stay out.
+            let prev_data_dirs = std::env::var_os("XDG_DATA_DIRS");
+            unsafe {
+                std::env::set_var("XDG_DATA_DIRS", data_dir);
+            }
+            let marker = data_dir.join("opened.marker");
+            let apps = data_dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::create_dir_all(data_dir.join("mime")).unwrap();
+            std::fs::write(data_dir.join("mime/globs2"), "50:text/plain:*.txt\n").unwrap();
+            let script = data_dir.join("opener.sh");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", marker.display()),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::write(
+                apps.join("opener.desktop"),
+                format!(
+                    "[Desktop Entry]\nType=Application\nName=Fixture Opener\nExec={} %f\nMimeType=text/plain;\n",
+                    script.display()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                apps.join("mimeinfo.cache"),
+                "[MIME Cache]\ntext/plain=opener.desktop;\n",
+            )
+            .unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let note = dir.path().join("note.txt");
+            std::fs::write(&note, b"hello").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                table.read_with(vcx, |t, cx| {
+                    t.cursor_entry_name(cx).as_deref() == Some("note.txt")
+                })
+            });
+            assert_eq!(
+                table.read_with(vcx, |t, cx| t.cursor_file_path(cx)),
+                Some(note.clone())
+            );
+
+            vcx.dispatch_action(EnterDirectory);
+            wait_until(vcx, |_| marker.exists());
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                note.to_string_lossy()
+            );
+            assert_eq!(
+                table.read_with(vcx, |t, _| t.current_dir().to_path_buf()),
+                dir.path().to_path_buf(),
+                "Enter on a file never navigates"
+            );
+
+            // Open With: the chooser lists the fixture entry; choosing it
+            // launches the same way.
+            std::fs::remove_file(&marker).unwrap();
+            vcx.dispatch_action(OpenWith);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.open_with.is_some())
+            });
+            let choices = workspace.read_with(vcx, |ws, cx| {
+                ws.open_with
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .delegate()
+                    .choices
+                    .clone()
+            });
+            assert_eq!(choices.len(), 1);
+            assert_eq!(choices[0].name, "Fixture Opener");
+            workspace.update_in(vcx, |ws, window, cx| {
+                ws.launch_open_with_choice("opener.desktop".to_string(), note.clone(), window, cx);
+            });
+            assert!(
+                workspace.read_with(vcx, |ws, _| ws.open_with.is_none()),
+                "chooser closed"
+            );
+            wait_until(vcx, |_| marker.exists());
+
+            unsafe {
+                match prev_data_dirs {
+                    Some(v) => std::env::set_var("XDG_DATA_DIRS", v),
+                    None => std::env::remove_var("XDG_DATA_DIRS"),
+                }
+            }
         });
     }
 

@@ -164,3 +164,29 @@ image once one is cached; if UAT wants it, `Space` in the tree could
 mark a directory for the next operation the way TC's tree `Space`
 computes its size.
 
+## FR-TOOL-08 / T-5.3.4: associations are read once per session; "Open With" has no default key
+
+**Symptom:** a `mimeapps.list` or `.desktop` change made while Duet
+runs (installing an application, changing a default in GNOME Settings)
+is not seen until the next launch. "Open With" is reachable from the
+row context menu and the command palette (`file.open_with`) only.
+`DBusActivatable=true` entries are started through their `Exec` line
+rather than D-Bus activation, and the desktop-specific
+`<desktop>-mimeapps.list` variants are not consulted.
+
+**Root cause:** scope. The association tables are a process-wide
+`OnceLock` loaded on the first launch; there is no watcher on the XDG
+directories yet. Total Commander has no default chord for "Open With",
+so T-5.3.4 adopted none. D-Bus activation would add a bus dependency
+for a result that is identical for a file manager (GLib itself falls
+back to `Exec` when the bus name isn't owned).
+
+**Why deferred:** all four of T-5.3.4's AC cases work with the tables
+as loaded at startup; a reload is a convenience, not a correctness
+gap, and the same watcher will serve the icon theme (T-4.2.6's note).
+
+**To close this out:** watch the `applications/` directories and
+`mimeapps.list` with the config watcher and drop the tables on change;
+if UAT wants a chord, bind `file.open_with` (Shift+Enter is free and
+TC uses it for "run with parameters", which is close in spirit).
+

@@ -7,15 +7,28 @@
 //! Icon Naming Specification derives from it, and [`icons`] resolves an
 //! icon name to a file through the XDG icon theme's inheritance chain.
 //! [`entry_icon_names`] ties them together for a directory listing.
-//! Thumbnails, desktop entries and associations are still their own
-//! later tasks; this crate has no GPUI dependency and does only
-//! synchronous file I/O, meant to run off the UI thread.
+//!
+//! T-5.3.4 added the association side: [`desktop`] (desktop entries and
+//! `Exec` expansion), [`associations`] (`mimeapps.list`, `mimeinfo.cache`,
+//! type parents), [`sniff`] (content signatures for names the database
+//! can't place) and [`launch`] (detached spawning, terminal wrapping).
+//! Thumbnails are still their own later task; this crate has no GPUI
+//! dependency and does only synchronous file I/O and process spawning,
+//! meant to run off the UI thread.
 
+pub mod associations;
+pub mod desktop;
 pub mod icons;
+pub mod launch;
 pub mod mime;
+pub mod sniff;
 
+pub use associations::{AssociationDb, Candidate, MimeAppsList};
+pub use desktop::{DesktopDb, DesktopEntry, default_application_dirs, expand_exec, split_exec};
 pub use icons::{IconResolver, ThemeIndex, default_base_dirs, detect_theme_name};
+pub use launch::{LaunchError, LaunchPlan, TerminalLauncher, spawn};
 pub use mime::{MimeDb, mime_icon_names};
+pub use sniff::{sniff, sniff_file};
 
 /// What kind of entry an icon is wanted for -- a subset of
 /// `duet_types::EntryKind` that avoids a dependency on it: this crate

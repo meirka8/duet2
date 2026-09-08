@@ -152,6 +152,10 @@ log_to_file = true
 [plugins]
 enabled   = true
 directory = "~/.config/duet/plugins"
+
+[associations.overrides]           # FR-TOOL-08 internal overrides (T-5.3.4); empty by default
+# "text/markdown" = "zed %f"        # MIME type, media class ("image/*") or extension glob ("*.tar.gz")
+# "*.tar.gz"      = "file-roller %f" # value: a command in desktop-entry Exec syntax (%f %F %u %U)
 ```
 
 Validated with Python's `tomllib` — parses cleanly.
@@ -211,6 +215,7 @@ Validated with Python's `tomllib` — parses cleanly.
 | `logging.log_to_file` | bool | `true` | — | Persist the ring buffer / session log under `~/.local/state/duet/`. |
 | `plugins.enabled` | bool | `true` | — | Master switch for the plugin host (FR-PLUG-\*). |
 | `plugins.directory` | string | `"~/.config/duet/plugins"` | any path | Override for where installed plugin bundles are read from. |
+| `associations.overrides.<key>` | string | *(none)* | key: a MIME type (`"text/markdown"`), a media class (`"image/*"`) or an extension glob (`"*.tar.gz"`); value: a command in desktop-entry `Exec` syntax | FR-TOOL-08 / T-5.3.4: what Enter runs for matching files *before* the desktop's `mimeapps.list` is consulted. Exact type wins over glob over media class. `%f`/`%F` expand to the path, `%u`/`%U` to a `file://` URI; a command with no field code gets the path appended. |
 
 ---
 
