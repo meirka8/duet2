@@ -94,7 +94,8 @@ impl RenderOnce for OpenWithRow {
 }
 
 pub(crate) struct OpenWithDelegate {
-    pub(crate) path: PathBuf,
+    /// The files the choice applies to (one, or the selection).
+    pub(crate) paths: Vec<PathBuf>,
     pub(crate) choices: Vec<AppChoice>,
     pub(crate) selected: Option<usize>,
     workspace: WeakEntity<Workspace>,
@@ -102,13 +103,13 @@ pub(crate) struct OpenWithDelegate {
 
 impl OpenWithDelegate {
     pub(crate) fn new(
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         choices: Vec<AppChoice>,
         workspace: WeakEntity<Workspace>,
     ) -> Self {
         let selected = if choices.is_empty() { None } else { Some(0) };
         Self {
-            path,
+            paths,
             choices,
             selected,
             workspace,
@@ -161,10 +162,10 @@ impl ListDelegate for OpenWithDelegate {
             return;
         };
         let id = choice.id.clone();
-        let path = self.path.clone();
+        let paths = self.paths.clone();
         let workspace = self.workspace.clone();
         let _ = workspace.update(cx, |workspace, cx| {
-            workspace.launch_open_with_choice(id, path, window, cx);
+            workspace.launch_open_with_choice(id, paths, window, cx);
         });
     }
 

@@ -74,7 +74,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
 use crate::icons::{ICON_PX, IconCache, IconId, IconTables};
-use crate::launcher::{self, LaunchSettings};
+use crate::launcher::{self, LaunchSettings, OpenTarget};
 use crate::tree_view::{EnterHandler, TreeView};
 use crate::view_mode::{
     BRIEF_COLUMN_WIDTH, BRIEF_ROW_HEIGHT, BriefGeometry, GridGeometry, THUMB_CELL_HEIGHT,
@@ -1190,6 +1190,40 @@ impl FileTableDelegate {
         ))
     }
 
+    /// What "Open"/"Open With" act on: every selected entry, in display
+    /// order, when the cursor entry is part of a selection (Total
+    /// Commander's rule for selection-aware commands); else the cursor
+    /// entry alone. Directories are left out -- a launch opens files.
+    pub(crate) fn open_targets_info(&self) -> Vec<(String, EntryKind, Option<u32>)> {
+        let Some(cursor) = self.cursor_entry_info() else {
+            return Vec::new();
+        };
+        let cursor_selected = self
+            .cursor_row
+            .and_then(|row| self.model.order().get(row))
+            .is_some_and(|&ix| self.model.is_selected(EntryId::new(ix)));
+        let entries = self.model.entries();
+        let mut targets: Vec<(String, EntryKind, Option<u32>)> = if cursor_selected {
+            self.model
+                .order()
+                .iter()
+                .map(|&ix| EntryId::new(ix))
+                .filter(|&id| self.model.is_selected(id))
+                .map(|id| {
+                    (
+                        entries.name(id).to_string(),
+                        entries.kind(id),
+                        entries.mode(id),
+                    )
+                })
+                .collect()
+        } else {
+            vec![cursor]
+        };
+        targets.retain(|(_, kind, _)| *kind != EntryKind::Directory);
+        targets
+    }
+
     /// Whether the display cursor is on the synthetic ".." row. See the
     /// `cursor_on_parent` field's doc comment.
     pub fn cursor_on_parent(&self) -> bool {
@@ -1265,7 +1299,7 @@ impl FileTableDelegate {
     }
 
     /// Ctrl+Num+ (T-4.2.3): selects every currently-visible entry.
-    fn select_all(&mut self) {
+    pub(crate) fn select_all(&mut self) {
         let ids: Vec<EntryId> = self
             .model
             .order()
@@ -2053,14 +2087,20 @@ impl TableDelegate for FileTableDelegate {
         // Both are workspace actions dispatched from the click, exactly
         // as the keyboard would dispatch them, so one code path handles
         // the launch and its notices.
-        let is_file = self
-            .cursor_entry_info()
-            .is_some_and(|(_, kind, _)| kind != EntryKind::Directory);
-        let menu = if is_file {
-            menu.item(PopupMenuItem::new("Open").on_click(|_, window, cx| {
+        let target_count = self.open_targets_info().len();
+        let menu = if target_count > 0 {
+            let (open, open_with) = if target_count > 1 {
+                (
+                    format!("Open {target_count} Files"),
+                    format!("Open {target_count} Files With…"),
+                )
+            } else {
+                ("Open".to_string(), "Open With…".to_string())
+            };
+            menu.item(PopupMenuItem::new(open).on_click(|_, window, cx| {
                 window.dispatch_action(Box::new(crate::workspace::OpenDefault), cx);
             }))
-            .item(PopupMenuItem::new("Open With…").on_click(|_, window, cx| {
+            .item(PopupMenuItem::new(open_with).on_click(|_, window, cx| {
                 window.dispatch_action(Box::new(crate::workspace::OpenWith), cx);
             }))
             .separator()
@@ -3873,16 +3913,31 @@ impl FileTable {
     }
 
     /// The cursor entry's full path when it is a file (anything but a
-    /// directory or the ".." row) -- what "Open"/"Open With" act on.
+    /// directory or the ".." row) -- what Enter acts on.
+    #[cfg(test)]
     pub(crate) fn cursor_file_path(&self, cx: &App) -> Option<PathBuf> {
         let (name, kind, _) = self.state.read(cx).delegate().cursor_entry_info()?;
         (kind != EntryKind::Directory).then(|| self.current_dir.join(name))
     }
 
-    /// T-5.3.4: Enter on a file -- resolve and launch on the Tokio
-    /// runtime (`launcher::open_default`: MIME lookup, overrides,
-    /// executables, the association database), and toast the reason if
-    /// nothing could be started. The listing itself is untouched.
+    /// What "Open"/"Open With" act on -- see
+    /// `FileTableDelegate::open_targets_info`: the selection when the
+    /// cursor is in it, else the cursor file; never directories.
+    pub(crate) fn open_targets(&self, cx: &App) -> Vec<OpenTarget> {
+        self.state
+            .read(cx)
+            .delegate()
+            .open_targets_info()
+            .into_iter()
+            .map(|(name, _, mode)| OpenTarget {
+                path: self.current_dir.join(name),
+                executable: mode.is_some_and(|m| m & 0o111 != 0),
+            })
+            .collect()
+    }
+
+    /// T-5.3.4: Enter on a file -- the cursor file only, whatever is
+    /// selected (Total Commander's rule for Enter).
     pub(crate) fn open_cursor_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((name, kind, mode)) = self.state.read(cx).delegate().cursor_entry_info() else {
             return;
@@ -3890,25 +3945,49 @@ impl FileTable {
         if kind == EntryKind::Directory {
             return;
         }
-        let path = self.current_dir.join(&name);
-        let executable = mode.is_some_and(|m| m & 0o111 != 0);
+        let target = OpenTarget {
+            path: self.current_dir.join(&name),
+            executable: mode.is_some_and(|m| m & 0o111 != 0),
+        };
+        self.open_files(vec![target], window, cx);
+    }
+
+    /// "Open" (`file.open_default`): the selection or the cursor file --
+    /// see [`Self::open_targets`].
+    pub(crate) fn open_selection_or_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.open_targets(cx);
+        self.open_files(targets, window, cx);
+    }
+
+    /// Resolves and launches `targets` on the Tokio runtime
+    /// (`launcher::open_default_many`: MIME lookup, overrides,
+    /// executables, the association database, grouping per
+    /// application), and toasts whatever could not be started. The
+    /// listing itself is untouched.
+    fn open_files(
+        &mut self,
+        targets: Vec<OpenTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
         let overrides = LaunchSettings::overrides(cx);
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Vec<String>, Vec<String>)>();
         self.tokio_handle.spawn(async move {
-            let result =
-                launcher::open_default(&overrides, &path, executable).map(|plan| plan.label);
-            let _ = tx.send(result);
+            let _ = tx.send(launcher::open_default_many(&overrides, &targets));
         });
         cx.spawn_in(window, async move |this, cx| {
-            let result = rx
+            let (labels, errors) = rx
                 .await
-                .unwrap_or_else(|_| Err("launch task dropped".to_string()));
-            let _ = this.update_in(cx, |_, window, cx| match result {
-                Ok(label) => {
-                    tracing::info!(target: "duet_ui::launcher", "opened {name} with {label}");
+                .unwrap_or_else(|_| (Vec::new(), vec!["launch task dropped".to_string()]));
+            let _ = this.update_in(cx, |_, window, cx| {
+                if !labels.is_empty() {
+                    tracing::info!(target: "duet_ui::launcher", "opened with {}", labels.join(", "));
                 }
-                Err(message) => {
-                    window.push_notification(Notification::error(message), cx);
+                if !errors.is_empty() {
+                    window.push_notification(Notification::error(errors.join("\n")), cx);
                 }
             });
         })
