@@ -74,6 +74,13 @@ blake3.workspace = true
 # reasoning. `duet-commands` doesn't re-export the crate, so this needs
 # its own direct dependency line rather than reaching it transitively.
 nucleo-matcher = "0.3.1"
+# T-4.2.6 icons: the lookup tables (duet-meta) and the rasterisers. `image`
+# and `resvg`/`usvg` are pinned to the versions gpui already builds so no
+# second copy of either enters the graph.
+duet-meta = { path = "../duet-meta" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+resvg = { version = "0.45", default-features = false }
+usvg = { version = "0.45", default-features = false }
 
 [dev-dependencies]
 # T-4.1.4: exercises splitter-ratio persistence against real temp files

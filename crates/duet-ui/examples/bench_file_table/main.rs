@@ -309,7 +309,17 @@ fn build_synthetic_model(scale: CorpusScale, seed: u64) -> (DirectoryModel, Dura
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    // T-4.2.6: the real app rasterises icons on its Tokio runtime; the
+    // benchmark installs the same cache so the per-row icon slot (one
+    // `Arc` clone per visible Name cell) is part of what it measures.
+    let icon_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime for icon rasterisation");
+    let icon_handle = icon_rt.handle().clone();
+    Application::new().run(move |cx: &mut App| {
+        duet_ui::icons::IconCache::install(cx, icon_handle, None, true);
         gpui_component_init(cx);
         let rss_baseline_kb = alloc_track::rss_kb();
         println!(
@@ -354,6 +364,10 @@ fn main() {
                 // it must flip that off itself or every frame would render
                 // gpui-component's loading skeleton instead of real rows.
                 delegate.set_loading(false);
+                delegate.set_icon_tables(
+                    cx.try_global::<duet_ui::icons::IconCache>()
+                        .and_then(duet_ui::icons::IconCache::tables),
+                );
 
                 let table = cx.new(|cx| TableState::new(delegate, window, cx));
                 table.update(cx, |state, cx| {

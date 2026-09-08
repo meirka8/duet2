@@ -110,3 +110,29 @@ the command palette's command registry is the natural home for them.
 **To close this out:** register `columns.toggle_<key>` / `columns.reset`
 commands in the palette (and, if TC users ask, a default chord), plus a
 keyboard-driven reorder (Ctrl+Shift+Left/Right on the sorted column, say).
+
+## FR-CFG-04 / T-4.2.6: file icons are type icons only, from a theme read once at startup
+
+**Symptom:** every entry gets the icon its MIME type (by name, via
+shared-mime-info's `globs2`) or its kind (folder, symlink, special file)
+maps to in the XDG icon theme. Nothing else is drawn: no emblems (a
+symlink shows `inode-symlink`, never its target's icon; an unreadable
+or read-only entry gets no overlay), no per-file sniffing (an
+extension-less script is `text-x-generic`), and no `.xpm` icons (no
+decoder; modern themes ship SVG/PNG). Changing the desktop's icon theme
+or `appearance.icon_theme` takes effect on the next launch, not live.
+
+**Root cause:** scope. T-4.2.6's ACs are type icons for common types,
+NFR-05 scrolling, and a bounded atlas; emblems, magic-byte sniffing and
+thumbnails are design.md §9.8's later `duet-meta` tasks (T-9.1.5 for
+thumbnails), and live theme reload needs the settings watcher that
+`appearance.*` keys don't have yet (they are all read once at startup).
+
+**Why deferred:** the panel is already correct for the overwhelming
+majority of entries; each of the gaps is its own bounded task with its
+own AC and none blocks the view-mode work that follows.
+
+**To close this out:** emblem compositing (a second `img` layered in the
+16 px slot) once `duet-meta` reports link targets and permissions per
+entry; hook `appearance.icon_theme` to the config watcher and rebuild
+the `IconCache` (drop every image, clear the memo) on change.
