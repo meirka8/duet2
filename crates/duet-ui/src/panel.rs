@@ -32,6 +32,7 @@ use crate::columns::ColumnLayoutStore;
 use crate::file_table::{
     FileTable, FileTableEvent, FileTableSettings, LockedNavigationHandler, TabRestore,
 };
+use crate::view_mode::ViewMode;
 
 /// `duet_config::SessionSortColumn` -> `duet_index::SortColumn`, for
 /// restoring a tab's sort from `session.json`.
@@ -119,6 +120,7 @@ struct ClosedTab {
     lock_dir_change: bool,
     cursor_name: Option<String>,
     sort: (SortColumn, bool),
+    view: ViewMode,
 }
 
 /// The per-side tab container. See the module doc comment.
@@ -182,6 +184,13 @@ impl Panel {
                     sort_column_from_session(tab.sort_column),
                     tab.sort_ascending,
                 ),
+                // T-4.2.5: `panels.remember_view_per_tab` decides whether
+                // the saved mode or `panels.default_view` wins.
+                view: if panel.file_table_settings.remember_view_per_tab {
+                    ViewMode::from_settings_str(&tab.view)
+                } else {
+                    panel.file_table_settings.default_view
+                },
             };
             panel.add_tab_entry(
                 tab.dir,
@@ -244,7 +253,7 @@ impl Panel {
         cx.subscribe(
             &table,
             |_this, _table, event: &FileTableEvent, cx| match event {
-                FileTableEvent::DirectoryChanged => cx.notify(),
+                FileTableEvent::DirectoryChanged | FileTableEvent::ViewModeChanged => cx.notify(),
             },
         )
         .detach();
@@ -349,6 +358,7 @@ impl Panel {
         let restore = TabRestore {
             cursor_name: None,
             sort: self.active_table().read(cx).sort_state(cx),
+            view: self.active_table().read(cx).view_mode(),
         };
         let ix = self.add_tab_entry(dir, false, false, restore, window, cx);
         self.active = ix;
@@ -370,6 +380,7 @@ impl Panel {
         let restore = TabRestore {
             cursor_name: None,
             sort: self.active_table().read(cx).sort_state(cx),
+            view: self.active_table().read(cx).view_mode(),
         };
         let ix = self.add_tab_entry(dir, false, false, restore, window, cx);
         self.active = ix;
@@ -388,6 +399,7 @@ impl Panel {
         let restore = TabRestore {
             cursor_name: active.table.read(cx).cursor_entry_name(cx),
             sort: active.table.read(cx).sort_state(cx),
+            view: active.table.read(cx).view_mode(),
         };
         let ix = self.add_tab_entry(dir, locked, lock_dir_change, restore, window, cx);
         self.active = ix;
@@ -411,6 +423,7 @@ impl Panel {
             lock_dir_change: closed.lock_dir_change,
             cursor_name: closed.table.read(cx).cursor_entry_name(cx),
             sort: closed.table.read(cx).sort_state(cx),
+            view: closed.table.read(cx).view_mode(),
         });
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -436,6 +449,7 @@ impl Panel {
                 lock_dir_change: t.lock_dir_change,
                 cursor_name: t.table.read(cx).cursor_entry_name(cx),
                 sort: t.table.read(cx).sort_state(cx),
+                view: t.table.read(cx).view_mode(),
             });
         }
         self.tabs.push(keep);
@@ -456,6 +470,7 @@ impl Panel {
         let restore = TabRestore {
             cursor_name: closed.cursor_name,
             sort: closed.sort,
+            view: closed.view,
         };
         let ix = self.add_tab_entry(
             closed.dir,
@@ -604,6 +619,7 @@ impl Panel {
                         cursor_name: table.cursor_entry_name(cx),
                         sort_column: sort_column_to_session(sort_column),
                         sort_ascending,
+                        view: table.view_mode().key().to_string(),
                     }
                 })
                 .collect(),
@@ -709,6 +725,7 @@ mod tests {
             cursor_name: None,
             sort_column: SessionSortColumn::Name,
             sort_ascending: true,
+            view: "full".to_string(),
         }
     }
 
@@ -769,6 +786,8 @@ mod tests {
             mouse_mode,
             quick_search_default_mode: QuickSearchMode::default(),
             quick_search_idle_timeout: Duration::from_millis(1200),
+            default_view: ViewMode::Full,
+            remember_view_per_tab: true,
         };
         let mut panel_cell: Option<Entity<Panel>> = None;
         let (_root, vcx) = cx.add_window_view(|window, cx| {
@@ -1229,6 +1248,7 @@ mod tests {
                 cursor_name: Some("b_file.txt".to_string()),
                 sort_column: SessionSortColumn::Name,
                 sort_ascending: false,
+                view: "full".to_string(),
             }],
             0,
             |panel, vcx| {
@@ -1275,6 +1295,7 @@ mod tests {
                 cursor_name: Some("this_file_no_longer_exists.txt".to_string()),
                 sort_column: SessionSortColumn::Name,
                 sort_ascending: true,
+                view: "full".to_string(),
             }],
             0,
             |panel, vcx| {

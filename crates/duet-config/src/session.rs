@@ -48,9 +48,7 @@ fn default_true() -> bool {
 
 /// One tab's persisted state: which directory it's showing, its two TC
 /// lock flags (T-4.3.2), and its cursor position + sort state (T-4.3.7).
-/// View mode does *not* appear here -- T-4.2.5 (Full/Brief/Thumbnails/
-/// Tree) was never implemented, so there is nothing to persist; add it
-/// when that task lands, not speculatively ahead of it.
+/// T-4.2.5 added `view` once view modes existed to persist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTab {
     pub dir: PathBuf,
@@ -77,6 +75,15 @@ pub struct SessionTab {
     pub sort_column: SessionSortColumn,
     #[serde(default = "default_true")]
     pub sort_ascending: bool,
+    /// T-4.2.5: the tab's view mode -- `full` | `brief` | `thumbnails` |
+    /// `tree` (`duet_ui`'s `ViewMode` keys); `"full"` when missing, for
+    /// the same backward-compatibility reason as the fields above.
+    #[serde(default = "default_view")]
+    pub view: String,
+}
+
+fn default_view() -> String {
+    "full".to_string()
 }
 
 /// One panel's persisted tab list plus which tab was active.
@@ -157,6 +164,7 @@ mod tests {
                         cursor_name: Some("Documents".to_string()),
                         sort_column: SessionSortColumn::Modified,
                         sort_ascending: false,
+                        view: "full".to_string(),
                     },
                     SessionTab {
                         dir: PathBuf::from("/home/user/projects"),
@@ -165,6 +173,7 @@ mod tests {
                         cursor_name: None,
                         sort_column: SessionSortColumn::Name,
                         sort_ascending: true,
+                        view: "full".to_string(),
                     },
                 ],
                 active_tab: 1,
@@ -177,6 +186,7 @@ mod tests {
                     cursor_name: Some("scratch.txt".to_string()),
                     sort_column: SessionSortColumn::Size,
                     sort_ascending: true,
+                    view: "full".to_string(),
                 }],
                 active_tab: 0,
             },

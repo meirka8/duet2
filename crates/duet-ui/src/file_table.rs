@@ -51,6 +51,7 @@ use duet_index::{DirectoryModel, FilterSpec, SortColumn, extension_of};
 use duet_meta::EntryClass;
 use duet_types::{EntryId, EntryKind, UnixPathBuf, VPath};
 use duet_vfs::{DirEntry, FileSystem, ListFields, ListOpts, LocalFs};
+use duet_widgets::layout::{h_flex, v_flex};
 use duet_widgets::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use duet_widgets::table::{
     Column, ColumnSort, Table, TableDelegate, TableEvent, TableRow, TableState,
@@ -59,16 +60,23 @@ use duet_widgets::theme::{TokenPalette, suppress_row_hover, unsuppress_row_hover
 use futures_util::StreamExt;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, ImageSource, InteractiveElement as _,
-    IntoElement, KeyBinding, Modifiers, MouseButton, ParentElement as _, Render, SharedString,
-    Styled as _, StyledText, WeakEntity, Window, actions, div, img, px,
+    AnyElement, App, AppContext as _, BorrowAppContext as _, ClickEvent, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, ImageSource,
+    InteractiveElement as _, IntoElement, KeyBinding, Modifiers, MouseButton, ParentElement as _,
+    Pixels, Render, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, StyledText, UniformListScrollHandle, WeakEntity,
+    Window, actions, div, img, point, px, uniform_list,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
 use crate::icons::{ICON_PX, IconCache, IconId, IconTables};
+use crate::tree_view::{EnterHandler, TreeView};
+use crate::view_mode::{
+    BRIEF_COLUMN_WIDTH, BRIEF_ROW_HEIGHT, BriefGeometry, GridGeometry, THUMB_CELL_HEIGHT,
+    THUMB_CELL_WIDTH, THUMB_ICON_PX, ViewMode,
+};
 
 /// `RowText::icon` for a row with no icon (icons disabled).
 const ICON_NONE: u32 = u32::MAX;
@@ -729,7 +737,11 @@ impl FileTableDelegate {
     /// reading `gpui-0.2.2/src/elements/div.rs`), so no manual
     /// `event.button ==` check is needed here. Called from `render_tr`
     /// (the `TableDelegate` impl below).
-    fn with_middle_click_new_tab(&self, row: TableRow, model_row: usize) -> TableRow {
+    fn with_middle_click_new_tab<T: gpui::InteractiveElement>(
+        &self,
+        row: T,
+        model_row: usize,
+    ) -> T {
         let Some(handler) = self.new_tab_handler.clone() else {
             return row;
         };
@@ -1474,6 +1486,18 @@ impl FileTableDelegate {
         window: &Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Option<Arc<gpui::RenderImage>> {
+        self.icon_image_px(slot, ICON_PX, window, cx)
+    }
+
+    /// [`Self::icon_image`] at an arbitrary logical size (the Thumbnails
+    /// view draws the same icons at [`THUMB_ICON_PX`]).
+    fn icon_image_px(
+        &self,
+        slot: u32,
+        logical_px: f32,
+        window: &Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Option<Arc<gpui::RenderImage>> {
         if slot >= ICON_UNRESOLVED || !cx.has_global::<IconCache>() {
             return None;
         }
@@ -1482,9 +1506,204 @@ impl FileTableDelegate {
         // into a 16 px box, which is crisper than 1x stretched.
         let scale = window.scale_factor().ceil().max(1.0) as u32;
         cx.update_global::<IconCache, _>(|cache, cx| {
-            cache.get_or_load(&slot.id, &slot.names, ICON_PX as u32, scale, cx)
+            cache.get_or_load(&slot.id, &slot.names, logical_px as u32, scale, cx)
         })
     }
+
+    /// Cursor/selection state of a display row, as `render_tr` paints it.
+    fn row_state(&self, row_ix: usize) -> (bool, bool) {
+        if self.has_parent_row && row_ix == 0 {
+            return (self.cursor_on_parent, false);
+        }
+        let model_row = row_ix - self.parent_offset();
+        let is_cursor = !self.cursor_on_parent && self.cursor_row == Some(model_row);
+        let selected = self
+            .model
+            .order()
+            .get(model_row)
+            .copied()
+            .is_some_and(|ix| self.model.is_selected(EntryId::new(ix)));
+        (is_cursor, selected)
+    }
+
+    /// The icon slot of a display row (the ".." row's folder included).
+    fn display_icon_slot(&mut self, row_ix: usize) -> u32 {
+        if self.has_parent_row && row_ix == 0 {
+            return self.parent_row_icon_slot();
+        }
+        self.row_text
+            .get(row_ix - self.parent_offset())
+            .map_or(ICON_NONE, |row| row.icon)
+    }
+
+    /// The name of a display row with the active quick-search match
+    /// bolded -- the same rule `render_td` applies to the Name column.
+    fn name_text_element(&self, row_ix: usize) -> AnyElement {
+        if self.has_parent_row && row_ix == 0 {
+            return SharedString::from("..").into_any_element();
+        }
+        let model_row = row_ix - self.parent_offset();
+        let text = self
+            .row_text
+            .get(model_row)
+            .map(|row| row.name.clone())
+            .unwrap_or_default();
+        let ranges: Option<Vec<std::ops::Range<usize>>> = (|| {
+            let session = self.quick_search.as_ref()?;
+            match session.mode {
+                QuickSearchMode::Jump => {
+                    let jump_match = session.jump_match.as_ref()?;
+                    (jump_match.model_row == model_row)
+                        .then(|| char_indices_to_byte_ranges(&text, &jump_match.indices))
+                }
+                QuickSearchMode::Filter => {
+                    quick_filter_highlight_range(&text, &session.query).map(|r| vec![r])
+                }
+            }
+        })();
+        match ranges {
+            Some(ranges) => {
+                let highlight = HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                };
+                StyledText::new(text)
+                    .with_highlights(ranges.into_iter().map(|range| (range, highlight)))
+                    .into_any_element()
+            }
+            None => text.into_any_element(),
+        }
+    }
+
+    /// One Brief or Thumbnails cell for a display row (T-4.2.5): icon and
+    /// name, painted with the cursor/selection colours `render_tr` uses,
+    /// middle-click-to-new-tab attached. Click handlers are the
+    /// `FileTable`'s to add (see `attach_cell_handlers`).
+    fn list_cell(
+        &mut self,
+        row_ix: usize,
+        style: CellStyle,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (cursor_bg, cursor_fg, selection_bg) = {
+            let tokens = TokenPalette::current(cx);
+            (
+                tokens.color.cursor_bg,
+                tokens.color.cursor_fg,
+                tokens.color.selection_bg,
+            )
+        };
+        let (is_cursor, selected) = self.row_state(row_ix);
+        let slot = self.display_icon_slot(row_ix);
+        let icons_on = slot != ICON_NONE;
+        let name = self.name_text_element(row_ix);
+        let mut cell =
+            match style {
+                CellStyle::Brief => {
+                    let image = icons_on
+                        .then(|| self.icon_image(slot, window, cx))
+                        .flatten();
+                    h_flex()
+                        .id(("brief-cell", row_ix))
+                        .w(px(BRIEF_COLUMN_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .overflow_hidden()
+                        .when(icons_on, |cell| {
+                            cell.child(div().flex_none().size(px(ICON_PX)).when_some(
+                                image,
+                                |slot, image| {
+                                    slot.child(img(ImageSource::Render(image)).size_full())
+                                },
+                            ))
+                        })
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                }
+                CellStyle::Thumbnail => {
+                    let image = icons_on
+                        .then(|| self.icon_image_px(slot, THUMB_ICON_PX, window, cx))
+                        .flatten();
+                    v_flex()
+                        .id(("thumb-cell", row_ix))
+                        .w(px(THUMB_CELL_WIDTH))
+                        .h(px(THUMB_CELL_HEIGHT))
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .p_1()
+                        .overflow_hidden()
+                        .rounded_sm()
+                        .child(
+                            div().flex_none().size(px(THUMB_ICON_PX)).when_some(
+                                image,
+                                |slot, image| {
+                                    slot.child(img(ImageSource::Render(image)).size_full())
+                                },
+                            ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_xs()
+                                .text_center()
+                                .line_clamp(2)
+                                .overflow_hidden()
+                                .child(name),
+                        )
+                }
+            };
+        if is_cursor {
+            cell = cell.bg(cursor_bg).text_color(cursor_fg);
+        } else if selected {
+            cell = cell.bg(selection_bg);
+        }
+        if self.has_parent_row && row_ix == 0 {
+            cell
+        } else {
+            self.with_middle_click_new_tab(cell, row_ix - self.parent_offset())
+        }
+    }
+}
+
+/// Which grid view a [`FileTableDelegate::list_cell`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellStyle {
+    Brief,
+    Thumbnail,
+}
+
+/// Wires a grid cell's mouse behaviour to the `FileTable`: click moves
+/// the cursor (with the same Shift/Ctrl/mouse-mode rules as a table
+/// row), double-click enters, right-click opens the row context menu
+/// the delegate already builds for the table.
+fn attach_cell_handlers(
+    cell: gpui::Stateful<gpui::Div>,
+    row_ix: usize,
+    table: &WeakEntity<FileTable>,
+    state: &Entity<TableState<FileTableDelegate>>,
+) -> AnyElement {
+    let this = table.clone();
+    let cell = cell.on_click(move |event: &ClickEvent, window, app| {
+        let _ = this.update(app, |table, cx| {
+            if event.click_count() >= 2 {
+                table.move_cursor_to(row_ix, cx);
+                table.enter_cursor_directory(window, cx);
+            } else {
+                table.handle_left_click(row_ix, event.modifiers(), cx);
+            }
+        });
+    });
+    let state = state.clone();
+    cell.context_menu(move |menu, window, cx| {
+        state.update(cx, |state, cx| {
+            state.delegate_mut().context_menu(row_ix, menu, window, cx)
+        })
+    })
+    .into_any_element()
 }
 
 impl TableDelegate for FileTableDelegate {
@@ -2089,6 +2308,21 @@ actions!(
 // overlay dialog), `nav.goto_path`/`nav.path_complete` (breadcrumb/path-
 // bar editing, T-4.3.4's job), and the directory hotlist/bookmarks
 // (T-4.3.5's job, FR-NAV-08's other half) are all deliberately not here.
+// T-4.2.5: view modes and the Left/Right keys the grid and tree views
+// give a meaning to (`nav.cursor_left_or_collapse` /
+// `nav.cursor_right_or_expand`).
+actions!(
+    duet_file_table,
+    [
+        ViewFull,
+        ViewBrief,
+        ViewThumbnails,
+        ToggleTree,
+        CursorLeft,
+        CursorRight
+    ]
+);
+
 actions!(
     duet_file_table,
     [
@@ -2167,6 +2401,16 @@ pub fn bind_file_table_keys(cx: &mut App) {
         KeyBinding::new("alt-right", HistoryForward, Some("FileTable")),
         KeyBinding::new("escape", QuickSearchCancel, Some("FileTable")),
         KeyBinding::new("ctrl-p", QuickFilterToggle, Some("FileTable")),
+        // T-4.2.5 view modes (`view.mode_*` in docs/keymap-tc.csv; Ctrl+3
+        // is TC's Wide view, which FR-NAV-04 doesn't list -- Thumbnails
+        // takes the slot, see task.md's deviation note) and the tree
+        // toggle (`panel.toggle_tree`).
+        KeyBinding::new("ctrl-1", ViewBrief, Some("FileTable")),
+        KeyBinding::new("ctrl-2", ViewFull, Some("FileTable")),
+        KeyBinding::new("ctrl-3", ViewThumbnails, Some("FileTable")),
+        KeyBinding::new("ctrl-f10", ToggleTree, Some("FileTable")),
+        KeyBinding::new("left", CursorLeft, Some("FileTable")),
+        KeyBinding::new("right", CursorRight, Some("FileTable")),
     ]);
 }
 
@@ -2220,6 +2464,20 @@ pub struct FileTable {
     /// idle-timer `cx.spawn` (this struct's own job, not rendering) reads
     /// it.
     quick_search_idle_timeout: Duration,
+    /// T-4.2.5: how the listing is drawn -- see `view_mode.rs`.
+    view_mode: ViewMode,
+    /// The list mode to come back to when leaving `Tree`.
+    list_mode: ViewMode,
+    /// The table body's measured size (the canvas in `render`), which the
+    /// Brief and Thumbnails layouts and the tree's paging need.
+    viewport: Size<Pixels>,
+    thumb_scroll: UniformListScrollHandle,
+    brief_scroll: ScrollHandle,
+    /// The Tree view, created on first use.
+    tree: Option<Entity<TreeView>>,
+    /// The cursor display row the grid views last scrolled to -- see
+    /// [`Self::scroll_grid_to_cursor`].
+    grid_scrolled_cursor: Option<Option<usize>>,
 }
 
 /// `dir` is where the locked tab's navigation attempt was headed;
@@ -2258,6 +2516,9 @@ pub(crate) type NewTabHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTableEvent {
     DirectoryChanged,
+    /// T-4.2.5: the tab switched view mode -- persisted per tab in
+    /// `session.json` exactly like a directory change.
+    ViewModeChanged,
 }
 
 impl EventEmitter<FileTableEvent> for FileTable {}
@@ -2276,6 +2537,8 @@ impl EventEmitter<FileTableEvent> for FileTable {}
 pub(crate) struct TabRestore {
     pub cursor_name: Option<String>,
     pub sort: (SortColumn, bool),
+    /// T-4.2.5: the view mode to open in.
+    pub view: ViewMode,
 }
 
 impl Default for TabRestore {
@@ -2283,6 +2546,7 @@ impl Default for TabRestore {
         Self {
             cursor_name: None,
             sort: (SortColumn::Name, true),
+            view: ViewMode::Full,
         }
     }
 }
@@ -2447,6 +2711,12 @@ pub(crate) struct FileTableSettings {
     pub(crate) mouse_mode: MouseMode,
     pub(crate) quick_search_default_mode: QuickSearchMode,
     pub(crate) quick_search_idle_timeout: Duration,
+    /// T-4.2.5: `panels.default_view`, the mode a tab opens in when its
+    /// session has none (or `remember_view_per_tab` is off).
+    pub(crate) default_view: ViewMode,
+    /// `panels.remember_view_per_tab`: whether a restored tab keeps the
+    /// mode it was closed in.
+    pub(crate) remember_view_per_tab: bool,
 }
 
 impl FileTable {
@@ -2494,6 +2764,7 @@ impl FileTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial_view = restore.view;
         let mut delegate = FileTableDelegate::new(DirectoryModel::new());
         delegate.set_layout_store(layout_store.downgrade());
         delegate.apply_layout(layout_store.read(cx).full().clone());
@@ -2595,7 +2866,7 @@ impl FileTable {
             })
             .detach();
 
-        Self {
+        let mut this = Self {
             state,
             focus_handle,
             current_dir: dir,
@@ -2605,7 +2876,313 @@ impl FileTable {
             history_forward: Vec::new(),
             locked_navigation: None,
             quick_search_idle_timeout: settings.quick_search_idle_timeout,
+            view_mode: ViewMode::Full,
+            list_mode: ViewMode::Full,
+            viewport: Size::default(),
+            thumb_scroll: UniformListScrollHandle::new(),
+            brief_scroll: ScrollHandle::new(),
+            tree: None,
+            grid_scrolled_cursor: None,
+        };
+        this.set_view_mode(initial_view, cx);
+        this
+    }
+
+    /// T-4.2.5: the current view mode.
+    pub(crate) fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_for_test(&self) -> Option<Entity<TreeView>> {
+        self.tree.clone()
+    }
+
+    /// Switches the view mode. Entering `Tree` builds the tree on first
+    /// use and reveals the current directory in it; leaving it goes back
+    /// to whichever list mode was active before. Emits
+    /// [`FileTableEvent::ViewModeChanged`] so the session is saved.
+    pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
         }
+        if mode.is_list() {
+            self.list_mode = mode;
+        }
+        self.view_mode = mode;
+        self.grid_scrolled_cursor = None;
+        if mode == ViewMode::Tree {
+            self.ensure_tree(cx);
+            let dir = self.current_dir.clone();
+            if let Some(tree) = &self.tree {
+                tree.update(cx, |tree, cx| {
+                    tree.reset();
+                    tree.reveal(&dir, cx);
+                });
+            }
+        }
+        cx.emit(FileTableEvent::ViewModeChanged);
+        cx.notify();
+    }
+
+    /// `Ctrl+F10`: Tree on, or back to the list.
+    pub(crate) fn toggle_tree(&mut self, cx: &mut Context<Self>) {
+        if self.view_mode == ViewMode::Tree {
+            self.set_view_mode(self.list_mode, cx);
+        } else {
+            self.set_view_mode(ViewMode::Tree, cx);
+        }
+    }
+
+    fn ensure_tree(&mut self, cx: &mut Context<Self>) {
+        if self.tree.is_some() {
+            return;
+        }
+        let weak = cx.weak_entity();
+        // Enter on a tree node: back to the list mode, showing that
+        // directory. `navigate_to` runs the same locked-tab checks a
+        // listing navigation does.
+        let on_enter: EnterHandler = Rc::new(move |path: PathBuf, window, app| {
+            let _ = weak.update(app, |this, cx| {
+                let back = this.list_mode;
+                this.set_view_mode(back, cx);
+                this.navigate_to(path, true, None, window, cx);
+            });
+        });
+        let tokio_handle = self.tokio_handle.clone();
+        let tree = cx.new(|_| TreeView::new(PathBuf::from("/"), tokio_handle, on_enter));
+        cx.observe(&tree, |_, _, cx| cx.notify()).detach();
+        self.tree = Some(tree);
+    }
+
+    /// The measuring canvas's report -- see the `viewport` field.
+    fn record_viewport(&mut self, size: Size<Pixels>, cx: &mut Context<Self>) {
+        if (self.viewport.width - size.width).abs() >= px(1.0)
+            || (self.viewport.height - size.height).abs() >= px(1.0)
+        {
+            self.viewport = size;
+            self.grid_scrolled_cursor = None;
+            cx.notify();
+        }
+    }
+
+    fn brief_geometry(&self, cx: &App) -> BriefGeometry {
+        let count = self.state.read(cx).delegate().display_rows_count();
+        BriefGeometry::new(count, f32::from(self.viewport.height))
+    }
+
+    fn grid_geometry(&self, cx: &App) -> GridGeometry {
+        let count = self.state.read(cx).delegate().display_rows_count();
+        GridGeometry::new(count, f32::from(self.viewport.width))
+    }
+
+    /// How many rows PageUp/PageDown move in the current mode.
+    fn page_size(&self, cx: &App) -> usize {
+        match self.view_mode {
+            ViewMode::Full => self.state.read(cx).visible_range().rows().len().max(1),
+            ViewMode::Brief => self.brief_geometry(cx).page(f32::from(self.viewport.width)),
+            ViewMode::Thumbnails => self.grid_geometry(cx).page(f32::from(self.viewport.height)),
+            ViewMode::Tree => TreeView::page(f32::from(self.viewport.height)),
+        }
+    }
+
+    /// Keeps the cursor visible in the Brief/Thumbnails views: called
+    /// from their render, once per cursor change (the table's own
+    /// `scroll_to_row` covers Full). Covers every way the cursor moves
+    /// -- keys, clicks, quick-search jumps, a restored position -- without
+    /// each site knowing about the grid.
+    fn scroll_grid_to_cursor(&mut self, cx: &App) {
+        let cursor = self.state.read(cx).delegate().display_row();
+        if self.grid_scrolled_cursor == Some(cursor) {
+            return;
+        }
+        self.grid_scrolled_cursor = Some(cursor);
+        let Some(row) = cursor else {
+            return;
+        };
+        match self.view_mode {
+            ViewMode::Thumbnails => {
+                let grid = self.grid_geometry(cx);
+                self.thumb_scroll
+                    .scroll_to_item(grid.row_of(row), ScrollStrategy::Top);
+            }
+            ViewMode::Brief => {
+                let geometry = self.brief_geometry(cx);
+                let offset = self.brief_scroll.offset();
+                if let Some(x) = geometry.offset_to_reveal(
+                    f32::from(offset.x),
+                    f32::from(self.viewport.width),
+                    row,
+                ) {
+                    self.brief_scroll.set_offset(point(px(x), px(0.0)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Left/Right: a column in Brief, a cell in Thumbnails, collapse/
+    /// expand in Tree, nothing in Full (TC's own default).
+    fn cursor_horizontal(&mut self, direction: i64, cx: &mut Context<Self>) {
+        match self.view_mode {
+            ViewMode::Full => {}
+            ViewMode::Brief => {
+                let rows = self.brief_geometry(cx).rows as i64;
+                self.move_cursor_rows(direction * rows, cx);
+            }
+            ViewMode::Thumbnails => self.move_cursor_rows(direction, cx),
+            ViewMode::Tree => {
+                if let Some(tree) = &self.tree {
+                    tree.update(cx, |tree, cx| {
+                        if direction < 0 {
+                            tree.collapse_cursor(cx);
+                        } else {
+                            tree.expand_cursor(cx);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// The Brief/Thumbnails body -- see `view_mode.rs` for the layouts.
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        match self.view_mode {
+            ViewMode::Full => Table::new(&self.state)
+                .stripe(true)
+                .bordered(true)
+                .into_any_element(),
+            ViewMode::Brief => self.render_brief(window, cx),
+            ViewMode::Thumbnails => self.render_thumbnails(window, cx),
+            ViewMode::Tree => {
+                self.ensure_tree(cx);
+                self.tree
+                    .clone()
+                    .expect("ensure_tree just built it")
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_brief(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.scroll_grid_to_cursor(cx);
+        let count = self.state.read(cx).delegate().display_rows_count();
+        let geometry = self.brief_geometry(cx);
+        let viewport_w = f32::from(self.viewport.width);
+        let offset_x = f32::from(self.brief_scroll.offset().x);
+        let columns = geometry.visible_columns(offset_x, viewport_w);
+        let content_w = geometry.content_width().max(viewport_w);
+        let this = cx.weak_entity();
+        let state = self.state.clone();
+        let rows: Vec<AnyElement> = (0..geometry.rows)
+            .map(|r| {
+                let cells: Vec<(usize, gpui::Stateful<gpui::Div>)> =
+                    state.update(cx, |state, cx| {
+                        columns
+                            .clone()
+                            .filter_map(|c| {
+                                let ix = geometry.index_at(c, r);
+                                (ix < count).then(|| {
+                                    (
+                                        ix,
+                                        state.delegate_mut().list_cell(
+                                            ix,
+                                            CellStyle::Brief,
+                                            window,
+                                            cx,
+                                        ),
+                                    )
+                                })
+                            })
+                            .collect()
+                    });
+                let mut row = h_flex()
+                    .h(px(BRIEF_ROW_HEIGHT))
+                    .w(px(content_w))
+                    .flex_none();
+                if columns.start > 0 {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .w(px(columns.start as f32 * BRIEF_COLUMN_WIDTH)),
+                    );
+                }
+                row.children(
+                    cells
+                        .into_iter()
+                        .map(|(ix, cell)| attach_cell_handlers(cell, ix, &this, &state)),
+                )
+                .into_any_element()
+            })
+            .collect();
+        div()
+            .id("brief-view")
+            .size_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.brief_scroll)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                // A plain wheel scrolls the columns sideways, like TC.
+                let delta = event.delta.pixel_delta(px(BRIEF_ROW_HEIGHT));
+                if delta.x == px(0.0) && delta.y != px(0.0) {
+                    let offset = this.brief_scroll.offset();
+                    let max = this.brief_scroll.max_offset().width;
+                    let x = (offset.x + delta.y).clamp(-max, px(0.0));
+                    this.brief_scroll.set_offset(point(x, offset.y));
+                    cx.notify();
+                }
+            }))
+            .child(v_flex().h_full().w(px(content_w)).children(rows))
+            .into_any_element()
+    }
+
+    fn render_thumbnails(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.scroll_grid_to_cursor(cx);
+        let count = self.state.read(cx).delegate().display_rows_count();
+        let grid = self.grid_geometry(cx);
+        let this = cx.weak_entity();
+        let state = self.state.clone();
+        uniform_list(
+            "thumbnails-view",
+            grid.rows,
+            move |range: std::ops::Range<usize>, window: &mut Window, cx: &mut App| {
+                let cells: Vec<Vec<(usize, gpui::Stateful<gpui::Div>)>> =
+                    state.update(cx, |state, cx| {
+                        range
+                            .clone()
+                            .map(|row| {
+                                (0..grid.columns)
+                                    .filter_map(|c| {
+                                        let ix = row * grid.columns + c;
+                                        (ix < count).then(|| {
+                                            (
+                                                ix,
+                                                state.delegate_mut().list_cell(
+                                                    ix,
+                                                    CellStyle::Thumbnail,
+                                                    window,
+                                                    cx,
+                                                ),
+                                            )
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    });
+                cells
+                    .into_iter()
+                    .map(|row| {
+                        h_flex().h(px(THUMB_CELL_HEIGHT)).w_full().children(
+                            row.into_iter()
+                                .map(|(ix, cell)| attach_cell_handlers(cell, ix, &this, &state)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .size_full()
+        .track_scroll(self.thumb_scroll.clone())
+        .into_any_element()
     }
 
     /// See the `locked_navigation` field's doc comment. `Panel` calls this
@@ -2683,7 +3260,26 @@ impl FileTable {
     /// only placement option is `ScrollStrategy::Top`, which would
     /// otherwise jump the list on every single keystroke instead of only
     /// when the cursor is actually about to leave the viewport.
+    /// Up/Down by `delta` *lines*: a row in Full/Brief, a grid row (one
+    /// cell per column) in Thumbnails, a node in Tree.
     fn move_cursor(&mut self, delta: i64, cx: &mut Context<Self>) {
+        match self.view_mode {
+            ViewMode::Tree => {
+                if let Some(tree) = &self.tree {
+                    tree.update(cx, |tree, cx| tree.move_cursor(delta, cx));
+                }
+            }
+            ViewMode::Thumbnails => {
+                let columns = self.grid_geometry(cx).columns as i64;
+                self.move_cursor_rows(delta * columns, cx);
+            }
+            _ => self.move_cursor_rows(delta, cx),
+        }
+    }
+
+    /// Moves the listing cursor by `delta` display rows, whatever the
+    /// mode draws them as.
+    fn move_cursor_rows(&mut self, delta: i64, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             if let Some(row) = state.delegate_mut().move_cursor_by(delta) {
                 if !state.visible_range().rows().contains(&row) {
@@ -2700,15 +3296,16 @@ impl FileTable {
     /// before the move (not after, like the in-view check), so this can't
     /// simply call `move_cursor` with a precomputed delta.
     fn move_cursor_by_page(&mut self, direction: i64, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            let page = state.visible_range().rows().len().max(1) as i64;
-            if let Some(row) = state.delegate_mut().move_cursor_by(direction * page) {
-                if !state.visible_range().rows().contains(&row) {
-                    state.scroll_to_row(row, cx);
-                }
-                cx.notify();
+        // T-4.2.5: the page is the mode's (see `page_size`), read before
+        // the move for the reason above.
+        let page = self.page_size(cx) as i64;
+        if self.view_mode == ViewMode::Tree {
+            if let Some(tree) = &self.tree {
+                tree.update(cx, |tree, cx| tree.move_cursor(direction * page, cx));
             }
-        });
+            return;
+        }
+        self.move_cursor_rows(direction * page, cx);
     }
 
     /// Home/Ctrl+Home (`row = 0`) and End/Ctrl+End (`row = usize::MAX`,
@@ -2717,6 +3314,18 @@ impl FileTable {
     /// unless the whole listing already fits on screen, in which case
     /// `scroll_to_row` is a harmless no-op.
     fn move_cursor_to(&mut self, row: usize, cx: &mut Context<Self>) {
+        if self.view_mode == ViewMode::Tree {
+            if let Some(tree) = &self.tree {
+                tree.update(cx, |tree, cx| {
+                    if row == 0 {
+                        tree.cursor_home(cx);
+                    } else {
+                        tree.cursor_end(cx);
+                    }
+                });
+            }
+            return;
+        }
         self.state.update(cx, |state, cx| {
             if let Some(row) = state.delegate_mut().move_cursor_to(row) {
                 state.scroll_to_row(row, cx);
@@ -2783,7 +3392,7 @@ impl FileTable {
         // `extend_selection` opens its own `self.state.update` -- calling
         // that from inside an outer `self.state.update` closure here
         // would double-borrow the same entity.
-        let page = self.state.read(cx).visible_range().rows().len().max(1) as i64;
+        let page = self.page_size(cx) as i64;
         self.extend_selection(direction * page, cx);
     }
 
@@ -3199,6 +3808,19 @@ impl FileTable {
     /// other half of plain Enter's real TC behaviour, `nav.open_or_enter`)
     /// are both out of scope here; see the module doc comment.
     fn enter_cursor_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == ViewMode::Tree {
+            // Read the node here rather than going through the tree's
+            // `on_enter` callback: that callback updates this entity, and
+            // this is already inside an update of it (the mouse path,
+            // from the tree's own click listener, uses the callback).
+            let Some(path) = self.tree.as_ref().map(|tree| tree.read(cx).cursor_path()) else {
+                return;
+            };
+            let back = self.list_mode;
+            self.set_view_mode(back, cx);
+            self.navigate_to(path, true, None, window, cx);
+            return;
+        }
         if self.state.read(cx).delegate().cursor_on_parent() {
             self.navigate_to_parent(window, cx);
             return;
@@ -3278,7 +3900,7 @@ impl Focusable for FileTable {
 }
 
 impl Render for FileTable {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // T-4.2.6: rows listed before the icon tables finished loading get
         // their icons on the first frame after (a flag check per frame,
         // one pass over the rows once).
@@ -3288,6 +3910,8 @@ impl Render for FileTable {
             }
         });
         let state = self.state.clone();
+        let this = cx.weak_entity();
+        let body = self.render_body(window, cx);
         div()
             .size_full()
             .key_context("FileTable")
@@ -3344,6 +3968,9 @@ impl Render for FileTable {
             })
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    if this.view_mode == ViewMode::Tree {
+                        return; // the tree has no quick-search
+                    }
                     let modifiers = &event.keystroke.modifiers;
                     if modifiers.control
                         || modifiers.alt
@@ -3387,6 +4014,26 @@ impl Render for FileTable {
             .on_action(cx.listener(|this, _: &CursorDown, _window, cx| {
                 this.exit_quick_search_if_jump(cx);
                 this.move_cursor(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorLeft, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
+                this.cursor_horizontal(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CursorRight, _window, cx| {
+                this.exit_quick_search_if_jump(cx);
+                this.cursor_horizontal(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewFull, _window, cx| {
+                this.set_view_mode(ViewMode::Full, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewBrief, _window, cx| {
+                this.set_view_mode(ViewMode::Brief, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewThumbnails, _window, cx| {
+                this.set_view_mode(ViewMode::Thumbnails, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTree, _window, cx| {
+                this.toggle_tree(cx);
             }))
             .on_action(cx.listener(|this, _: &CursorHome, _window, cx| {
                 this.exit_quick_search_if_jump(cx);
@@ -3502,7 +4149,7 @@ impl Render for FileTable {
             // this codebase's own tests, the exact coupling this task's
             // click-handling tests (`panel.rs`) were deliberately built
             // to avoid.
-            .child(Table::new(&self.state).stripe(true).bordered(true))
+            .child(body)
             .child(
                 // Measures the panel's real width every frame (the same
                 // canvas-based idiom `gpui-component`'s own
@@ -3525,6 +4172,8 @@ impl Render for FileTable {
                 // painting whatever `columns` looked like at construction.
                 gpui::canvas(
                     move |bounds, _window, cx| {
+                        // T-4.2.5: the grid views size themselves from this.
+                        let _ = this.update(cx, |this, cx| this.record_viewport(bounds.size, cx));
                         state.update(cx, |state, cx| {
                             let delegate = state.delegate_mut();
                             if delegate.apply_responsive_widths(f32::from(bounds.size.width)) {

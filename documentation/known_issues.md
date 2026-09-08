@@ -136,3 +136,31 @@ own AC and none blocks the view-mode work that follows.
 16 px slot) once `duet-meta` reports link targets and permissions per
 entry; hook `appearance.icon_theme` to the config watcher and rebuild
 the `IconCache` (drop every image, clear the memo) on change.
+
+## FR-NAV-04 / T-4.2.5: view-mode gaps -- Tree has no selection or quick-search, Thumbnails show type icons
+
+**Symptom:** in Tree mode the selection keys (Insert, Space, `*`,
+Ctrl+A, Shift+arrows) and typed quick-search do nothing -- the tree
+navigates directories, it doesn't select entries; the listing they
+would act on is the hidden one. Thumbnails mode draws each entry's
+64 px *type* icon, not a rendering of the file. Switching the desktop
+between light and dark keeps the current mode; there is no per-mode
+column layout for Brief/Thumbnails (they have no columns).
+
+**Root cause:** scope. T-4.2.5's brief says "Thumbnails (placeholder
+icons for now)": real thumbnails (freedesktop cache, decoders,
+sandboxed `.thumbnailer` subprocesses) are T-9.1.5. Tree is a
+directory chooser in TC as well; selecting inside it is not a TC
+behaviour this task set out to copy.
+
+**Why deferred:** each list mode already carries the whole selection/
+quick-search model; the tree deliberately doesn't, and a thumbnailer
+pipeline is its own multi-day task with its own safety requirements
+(design.md §11: untrusted decoders in subprocesses).
+
+**To close this out:** T-9.1.5 swaps the icon slot in
+`FileTableDelegate::list_cell` (`CellStyle::Thumbnail`) for a thumbnail
+image once one is cached; if UAT wants it, `Space` in the tree could
+mark a directory for the next operation the way TC's tree `Space`
+computes its size.
+
