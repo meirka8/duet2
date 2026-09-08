@@ -38,6 +38,8 @@ mod recovery_dialog;
 mod rename_dialog;
 mod theme_controller;
 mod trash_dialog;
+mod tree_view;
+mod view_mode;
 mod workspace;
 
 pub use workspace::run;

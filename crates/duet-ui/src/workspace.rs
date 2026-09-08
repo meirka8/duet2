@@ -62,6 +62,7 @@ use crate::recovery_dialog::{RecoveryDialogState, bind_recovery_dialog_keys};
 use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
 use crate::trash_dialog::{TrashDialogState, bind_trash_dialog_keys};
+use crate::view_mode::ViewMode;
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
 // splitter ratio without touching the mouse. Bound below to `ctrl-left`/
@@ -987,6 +988,14 @@ impl Workspace {
                 .as_deref()
                 .map(load_quick_search_idle_timeout)
                 .unwrap_or(Duration::from_millis(1200)),
+            default_view: settings_path
+                .as_deref()
+                .map(load_default_view)
+                .unwrap_or_default(),
+            remember_view_per_tab: settings_path
+                .as_deref()
+                .map(load_remember_view_per_tab)
+                .unwrap_or(true),
         };
         // T-4.2.4: the one column layout every tab in both panels renders
         // from (see `columns.rs`), read once from `[panels.layouts.full]`
@@ -4385,6 +4394,7 @@ fn resolve_panel_session(
             cursor_name: None,
             sort_column: duet_config::SessionSortColumn::Name,
             sort_ascending: true,
+            view: "full".to_string(),
         }],
         0,
     )
@@ -4432,6 +4442,29 @@ fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
             );
             ColumnLayout::default()
         })
+}
+
+/// Reads `panels.default_view` (T-4.2.5) from `settings.toml` at `path`,
+/// same fallback tolerance as [`load_splitter_ratio`].
+fn load_default_view(path: &std::path::Path) -> ViewMode {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| ViewMode::from_settings_str(&settings.panels.default_view))
+        .unwrap_or_else(|err| {
+            tracing::info!(
+                target: "duet_ui::workspace",
+                "using default view mode (settings.toml not loaded yet: {err})"
+            );
+            ViewMode::Full
+        })
+}
+
+/// Reads `panels.remember_view_per_tab` (T-4.2.5), same tolerance.
+fn load_remember_view_per_tab(path: &std::path::Path) -> bool {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| settings.panels.remember_view_per_tab)
+        .unwrap_or(true)
 }
 
 /// Reads `appearance.icon_theme` (`None` for `"system"`) and
@@ -6178,6 +6211,140 @@ mod tests {
         });
     }
 
+    /// T-4.2.5: Ctrl+1/2/3 switch the focused tab's view mode, every mode
+    /// renders, a new tab inherits the mode, the session snapshot carries
+    /// it, and Left/Right mean a cell in Thumbnails.
+    #[gpui::test]
+    fn view_mode_keys_switch_render_inherit_and_persist(cx: &mut TestAppContext) {
+        use crate::file_table::{CursorRight, ViewBrief, ViewFull, ViewThumbnails};
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                std::fs::write(dir.path().join(name), b"x").unwrap();
+            }
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            let mode = |vcx: &mut VisualTestContext| table.read_with(vcx, |t, _| t.view_mode());
+            assert_eq!(mode(vcx), ViewMode::Full);
+
+            vcx.dispatch_action(ViewBrief);
+            assert_eq!(mode(vcx), ViewMode::Brief);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            vcx.dispatch_action(ViewThumbnails);
+            assert_eq!(mode(vcx), ViewMode::Thumbnails);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            // Right moves one cell in the grid.
+            wait_until(vcx, |vcx| {
+                table.read_with(vcx, |t, cx| t.cursor_entry_name(cx).is_some())
+            });
+            let before = table.read_with(vcx, |t, cx| t.cursor_entry_name(cx));
+            vcx.dispatch_action(CursorRight);
+            let after = table.read_with(vcx, |t, cx| t.cursor_entry_name(cx));
+            assert_ne!(before, after, "Right steps to the next cell in Thumbnails");
+
+            // A new tab inherits the active tab's mode; the snapshot
+            // records it per tab.
+            let panel = workspace.read_with(vcx, |ws, _| ws.left_panel.clone());
+            panel.update_in(vcx, |panel, window, cx| panel.new_tab(window, cx));
+            let new_table = panel.read_with(vcx, |panel, _| panel.active_table().clone());
+            assert_eq!(
+                new_table.read_with(vcx, |t, _| t.view_mode()),
+                ViewMode::Thumbnails
+            );
+            let snapshot = panel.read_with(vcx, |panel, cx| panel.snapshot(cx));
+            assert!(
+                snapshot.tabs.iter().all(|tab| tab.view == "thumbnails"),
+                "{snapshot:?}"
+            );
+
+            vcx.dispatch_action(ViewFull);
+            assert_eq!(
+                new_table.read_with(vcx, |t, _| t.view_mode()),
+                ViewMode::Full
+            );
+            assert_eq!(
+                table.read_with(vcx, |t, _| t.view_mode()),
+                ViewMode::Thumbnails,
+                "the mode is per tab"
+            );
+        });
+    }
+
+    /// T-4.2.5 Tree: Ctrl+F10 shows the tree expanded down to the tab's
+    /// directory with the cursor on it; Left goes to the parent, Right
+    /// into the first child; Enter navigates there and returns to the
+    /// list mode the tab was in.
+    #[gpui::test]
+    fn tree_mode_reveals_the_directory_and_enter_navigates_back_to_the_list(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::file_table::{
+            CursorLeft, CursorRight, CursorUp, EnterDirectory, ToggleTree, ViewBrief,
+        };
+        with_workspace(cx, |workspace, vcx| {
+            let root = tempfile::tempdir().unwrap();
+            let a = root.path().join("a");
+            let b = a.join("b");
+            std::fs::create_dir_all(&b).unwrap();
+            std::fs::create_dir_all(a.join("c")).unwrap();
+            focus_left_panel_at(&workspace, vcx, &b);
+            let table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+
+            vcx.dispatch_action(ViewBrief);
+            vcx.dispatch_action(ToggleTree);
+            assert_eq!(table.read_with(vcx, |t, _| t.view_mode()), ViewMode::Tree);
+            let tree = table
+                .read_with(vcx, |t, _| t.tree_for_test())
+                .expect("entering Tree builds the tree");
+            let _ = vcx.update(|window, cx| window.draw(cx));
+
+            // The reveal chain lists / and every ancestor down to `b`.
+            wait_until(vcx, |vcx| {
+                tree.read_with(vcx, |tree, _| tree.visible_paths().contains(&b))
+            });
+            tree.read_with(vcx, |tree, _| {
+                assert!(tree.is_expanded(&a), "ancestors are expanded");
+                assert!(!tree.is_expanded(&b), "the target itself is not");
+                assert_eq!(
+                    tree.visible_paths()[tree.cursor()],
+                    b,
+                    "cursor on the directory"
+                );
+            });
+
+            // Left from a collapsed node: to its parent. Right on the
+            // (expanded) parent: into its first child.
+            vcx.dispatch_action(CursorLeft);
+            tree.read_with(vcx, |tree, _| {
+                assert_eq!(tree.visible_paths()[tree.cursor()], a)
+            });
+            vcx.dispatch_action(CursorRight);
+            tree.read_with(vcx, |tree, _| {
+                assert_eq!(tree.visible_paths()[tree.cursor()], b)
+            });
+            vcx.dispatch_action(CursorUp);
+            tree.read_with(vcx, |tree, _| {
+                assert_eq!(tree.visible_paths()[tree.cursor()], a)
+            });
+            // Left on an expanded node collapses it.
+            vcx.dispatch_action(CursorLeft);
+            tree.read_with(vcx, |tree, _| {
+                assert!(!tree.is_expanded(&a));
+                assert!(!tree.visible_paths().contains(&b));
+            });
+
+            // Enter: navigate to `a`, back in Brief (the mode before Tree).
+            vcx.dispatch_action(EnterDirectory);
+            assert_eq!(table.read_with(vcx, |t, _| t.view_mode()), ViewMode::Brief);
+            wait_until(vcx, |vcx| table.read_with(vcx, |t, _| t.current_dir() == a));
+            let _ = vcx.update(|window, cx| window.draw(cx));
+        });
+    }
+
     fn session_tab(dir: PathBuf, locked: bool) -> SessionTab {
         SessionTab {
             dir,
@@ -6186,6 +6353,7 @@ mod tests {
             cursor_name: None,
             sort_column: duet_config::SessionSortColumn::Name,
             sort_ascending: true,
+            view: "full".to_string(),
         }
     }
 
