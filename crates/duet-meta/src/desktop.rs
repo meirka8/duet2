@@ -115,6 +115,15 @@ impl DesktopEntry {
         })
     }
 
+    /// Whether one invocation takes every file (`%F`/`%U` in `Exec`), as
+    /// opposed to one file per instance (`%f`/`%u`, or no code at all --
+    /// the spec's rule for launching several files with such an entry).
+    pub fn accepts_multiple(&self) -> bool {
+        split_exec(&self.exec)
+            .iter()
+            .any(|token| token == "%F" || token == "%U")
+    }
+
     /// Whether the program the entry launches can be found: `TryExec`
     /// when given, else the first `Exec` word, resolved as an absolute
     /// path or through `$PATH`.
@@ -388,6 +397,7 @@ mod tests {
         assert_eq!(e.name, "Document Viewer");
         assert_eq!(e.exec, "evince %U", "the action's Exec must not override");
         assert_eq!(e.try_exec.as_deref(), Some("evince"));
+        assert!(e.accepts_multiple(), "%U takes every file");
         assert_eq!(e.mime_types, ["application/pdf", "image/tiff"]);
         assert!(e.no_display);
         assert!(!e.terminal);

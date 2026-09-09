@@ -1753,50 +1753,71 @@ impl Workspace {
     /// active tab to `dir`, then closes the overlay. Goes through
     /// `FileTable::navigate_to_path` (T-4.3.5's own new entry point --
     /// `navigate_to` itself is private to `file_table`'s module).
-    /// T-5.3.4: the file under the focused panel's cursor, if any.
-    fn focused_cursor_file(&self, window: &Window, cx: &App) -> Option<PathBuf> {
+    /// T-5.3.4: the files "Open"/"Open With" act on in the focused
+    /// panel -- the selection when the cursor is in it, else the cursor
+    /// file (see `FileTable::open_targets`).
+    fn focused_open_targets(&self, window: &Window, cx: &App) -> Vec<PathBuf> {
         let panel = match self.focused_panel_side(window, cx) {
             PanelSide::Left => &self.left_panel,
             PanelSide::Right => &self.right_panel,
         };
-        panel.read(cx).active_table().read(cx).cursor_file_path(cx)
+        panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .open_targets(cx)
+            .into_iter()
+            .map(|t| t.path)
+            .collect()
     }
 
-    /// `OpenDefault` (`file.open_default`): what Enter does on a file.
+    /// `OpenDefault` (`file.open_default`): the selection or the cursor
+    /// file, each with its default application.
     fn open_cursor_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let panel = match self.focused_panel_side(window, cx) {
             PanelSide::Left => self.left_panel.clone(),
             PanelSide::Right => self.right_panel.clone(),
         };
         let table = panel.read(cx).active_table().clone();
-        table.update(cx, |table, cx| table.open_cursor_file(window, cx));
+        table.update(cx, |table, cx| table.open_selection_or_cursor(window, cx));
     }
 
-    /// `OpenWith` (`file.open_with`): lists the applications for the
-    /// file under the cursor (looked up on the Tokio runtime) in the
+    /// `OpenWith` (`file.open_with`): lists the applications that can
+    /// open every targeted file (looked up on the Tokio runtime) in the
     /// chooser overlay; Enter there launches, Esc closes.
     fn open_open_with(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_with.is_some() {
             return;
         }
-        let Some(path) = self.focused_cursor_file(window, cx) else {
+        let paths = self.focused_open_targets(window, cx);
+        if paths.is_empty() {
             return;
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel::<(String, Vec<launcher::AppChoice>)>();
-        let lookup_path = path.clone();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Vec<String>, Vec<launcher::AppChoice>)>();
+        let lookup_paths = paths.clone();
         self.tokio_handle.spawn(async move {
             let tables = launcher::tables();
-            let _ = tx.send(launcher::choices_for(&tables, &lookup_path));
+            let _ = tx.send(launcher::choices_for_many(&tables, &lookup_paths));
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok((mime, choices)) = rx.await else {
+            let Ok((mimes, choices)) = rx.await else {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 if choices.is_empty() {
                     this.pending_notice.push(PendingNotice {
                         level: NoticeLevel::Warning,
-                        message: format!("No installed application is associated with {mime}"),
+                        message: if mimes.len() > 1 {
+                            format!(
+                                "No installed application handles all of: {}",
+                                mimes.join(", ")
+                            )
+                        } else {
+                            format!(
+                                "No installed application is associated with {}",
+                                mimes.join(", ")
+                            )
+                        },
                     });
                     cx.notify();
                     return;
@@ -1805,7 +1826,7 @@ impl Workspace {
                 let weak_workspace = cx.entity().downgrade();
                 let state = cx.new(|cx| {
                     ListState::new(
-                        OpenWithDelegate::new(path, choices, weak_workspace),
+                        OpenWithDelegate::new(paths, choices, weak_workspace),
                         window,
                         cx,
                     )
@@ -1826,12 +1847,13 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The chooser's Enter: launch `path` with the entry `id`, off the
-    /// UI thread, and report a failure as a toast.
+    /// The chooser's Enter: launch `paths` with the entry `id` (one
+    /// instance, or one per file, per its `Exec`), off the UI thread,
+    /// and report a failure as a toast.
     pub(crate) fn launch_open_with_choice(
         &mut self,
         id: String,
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1839,8 +1861,8 @@ impl Workspace {
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         self.tokio_handle.spawn(async move {
             let tables = launcher::tables();
-            let result = launcher::plan_for_choice(&tables, &id, &path)
-                .and_then(|plan| launcher::launch(&plan));
+            let result = launcher::plans_for_choice_many(&tables, &id, &paths)
+                .and_then(|plans| launcher::launch_all(&plans));
             let _ = tx.send(result);
         });
         cx.spawn(async move |this, cx| {
@@ -3793,14 +3815,17 @@ fn open_with_overlay(
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     let tokens = TokenPalette::current(cx);
-    let title: SharedString = state
-        .read(cx)
-        .delegate()
-        .path
-        .file_name()
-        .map(|n| format!("Open {} with", n.to_string_lossy()))
-        .unwrap_or_else(|| "Open with".to_string())
-        .into();
+    let title: SharedString = {
+        let paths = &state.read(cx).delegate().paths;
+        match paths.as_slice() {
+            [single] => single
+                .file_name()
+                .map(|n| format!("Open {} with", n.to_string_lossy()))
+                .unwrap_or_else(|| "Open with".to_string()),
+            many => format!("Open {} files with", many.len()),
+        }
+        .into()
+    };
     gpui::div()
         .id("open-with-backdrop")
         .absolute()
@@ -6576,7 +6601,10 @@ mod tests {
             let script = data_dir.join("opener.sh");
             std::fs::write(
                 &script,
-                format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", marker.display()),
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                    marker.display()
+                ),
             )
             .unwrap();
             {
@@ -6586,7 +6614,7 @@ mod tests {
             std::fs::write(
                 apps.join("opener.desktop"),
                 format!(
-                    "[Desktop Entry]\nType=Application\nName=Fixture Opener\nExec={} %f\nMimeType=text/plain;\n",
+                    "[Desktop Entry]\nType=Application\nName=Fixture Opener\nExec={} %F\nMimeType=text/plain;\n",
                     script.display()
                 ),
             )
@@ -6616,7 +6644,7 @@ mod tests {
             vcx.dispatch_action(EnterDirectory);
             wait_until(vcx, |_| marker.exists());
             assert_eq!(
-                std::fs::read_to_string(&marker).unwrap(),
+                std::fs::read_to_string(&marker).unwrap().trim_end(),
                 note.to_string_lossy()
             );
             assert_eq!(
@@ -6644,13 +6672,47 @@ mod tests {
             assert_eq!(choices.len(), 1);
             assert_eq!(choices[0].name, "Fixture Opener");
             workspace.update_in(vcx, |ws, window, cx| {
-                ws.launch_open_with_choice("opener.desktop".to_string(), note.clone(), window, cx);
+                ws.launch_open_with_choice(
+                    "opener.desktop".to_string(),
+                    vec![note.clone()],
+                    window,
+                    cx,
+                );
             });
             assert!(
                 workspace.read_with(vcx, |ws, _| ws.open_with.is_none()),
                 "chooser closed"
             );
             wait_until(vcx, |_| marker.exists());
+
+            // A selection that includes the cursor: "Open" launches the
+            // %F entry once with every selected file.
+            std::fs::remove_file(&marker).unwrap();
+            let other = dir.path().join("other.txt");
+            std::fs::write(&other, b"more").unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                table.read_with(vcx, |t, cx| {
+                    t.state().read(cx).delegate().model().order().len() == 2
+                })
+            });
+            table.update(vcx, |table, cx| {
+                table
+                    .state()
+                    .update(cx, |state, _| state.delegate_mut().select_all());
+            });
+            let targets = table.read_with(vcx, |t, cx| t.open_targets(cx));
+            assert_eq!(targets.len(), 2, "both selected files");
+            vcx.dispatch_action(OpenDefault);
+            wait_until(vcx, |_| marker.exists());
+            let recorded = std::fs::read_to_string(&marker).unwrap();
+            assert!(
+                recorded.contains(&*note.to_string_lossy())
+                    && recorded.contains(&*other.to_string_lossy()),
+                "one instance got both files: {recorded:?}"
+            );
 
             unsafe {
                 match prev_data_dirs {

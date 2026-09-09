@@ -133,6 +133,28 @@ pub(crate) fn tables() -> Arc<LaunchTables> {
         .clone()
 }
 
+/// One file to open, with what the launch policy needs to know about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenTarget {
+    pub(crate) path: PathBuf,
+    /// The file has an execute bit for the user.
+    pub(crate) executable: bool,
+}
+
+/// What Enter/"Open" resolved a file to, before grouping.
+enum Resolution {
+    Override(String),
+    Executable(LaunchPlan),
+    Entry(duet_meta::DesktopEntry),
+}
+
+/// Whether a command in `Exec` syntax takes every file at once.
+fn command_accepts_multiple(command: &str) -> bool {
+    duet_meta::split_exec(command)
+        .iter()
+        .any(|token| token == "%F" || token == "%U")
+}
+
 /// An application offered in the "Open With" chooser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppChoice {
@@ -197,68 +219,223 @@ fn is_script(mime: &str) -> bool {
     )
 }
 
-/// The plan Enter on `path` runs -- see the module doc comment.
-/// `executable`: the file has an execute bit for the user.
-pub(crate) fn resolve_open(
+fn resolve_one(
     tables: &LaunchTables,
     overrides: &BTreeMap<String, String>,
     path: &Path,
     executable: bool,
-) -> Result<LaunchPlan, String> {
+) -> Result<Resolution, String> {
     let mime = tables.mime_of(path);
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Some(command) = override_for(overrides, &mime, &file_name) {
-        return LaunchPlan::for_command(command, std::slice::from_ref(&path.to_path_buf()))
-            .ok_or_else(|| format!("empty override command for {mime}"));
+        return Ok(Resolution::Override(command.to_string()));
     }
     if executable && is_binary_executable(&mime) {
-        return Ok(LaunchPlan::for_executable(path, false));
+        return Ok(Resolution::Executable(LaunchPlan::for_executable(
+            path, false,
+        )));
     }
     if executable && is_script(&mime) {
-        return Ok(LaunchPlan::for_executable(path, true));
+        return Ok(Resolution::Executable(LaunchPlan::for_executable(
+            path, true,
+        )));
     }
-    let entry = tables
+    tables
         .associations
         .default_for(&mime)
-        .ok_or_else(|| format!("No application is associated with {mime} ({file_name})"))?;
-    LaunchPlan::for_entry(&entry, std::slice::from_ref(&path.to_path_buf()))
-        .ok_or_else(|| format!("{} has no usable Exec line", entry.name))
+        .map(Resolution::Entry)
+        .ok_or_else(|| format!("No application is associated with {mime} ({file_name})"))
+}
+
+/// The plan Enter on `path` runs -- see the module doc comment.
+/// `executable`: the file has an execute bit for the user.
+#[cfg(test)]
+pub(crate) fn resolve_open(
+    tables: &LaunchTables,
+    overrides: &BTreeMap<String, String>,
+    path: &Path,
+    executable: bool,
+) -> Result<LaunchPlan, String> {
+    let target = OpenTarget {
+        path: path.to_path_buf(),
+        executable,
+    };
+    let (mut plans, errors) = plan_open_many(tables, overrides, std::slice::from_ref(&target));
+    match (plans.pop(), errors.into_iter().next()) {
+        (Some(plan), _) => Ok(plan),
+        (None, Some(err)) => Err(err),
+        (None, None) => Err("nothing to open".to_string()),
+    }
+}
+
+/// The plans for opening several files with their *defaults* -- "Open"
+/// on a selection. Consecutive files that resolve to the same
+/// application are launched together when its `Exec` takes several
+/// files (`%F`/`%U`: one player with a playlist), one instance per file
+/// otherwise; executables and overrides follow the same rule. Files
+/// that can't be resolved are reported, the rest still get their plans.
+pub(crate) fn plan_open_many(
+    tables: &LaunchTables,
+    overrides: &BTreeMap<String, String>,
+    targets: &[OpenTarget],
+) -> (Vec<LaunchPlan>, Vec<String>) {
+    let mut plans: Vec<LaunchPlan> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    // (grouping key, files) runs in selection order.
+    let mut groups: Vec<(String, Resolution, Vec<PathBuf>)> = Vec::new();
+    for target in targets {
+        match resolve_one(tables, overrides, &target.path, target.executable) {
+            Ok(Resolution::Executable(plan)) => plans.push(plan),
+            Ok(resolution) => {
+                let key = match &resolution {
+                    Resolution::Override(command) => format!("override:{command}"),
+                    Resolution::Entry(entry) => format!("entry:{}", entry.id),
+                    Resolution::Executable(_) => unreachable!("handled above"),
+                };
+                match groups.last_mut() {
+                    Some((last_key, _, files)) if *last_key == key => {
+                        files.push(target.path.clone())
+                    }
+                    _ => groups.push((key, resolution, vec![target.path.clone()])),
+                }
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    for (_, resolution, files) in groups {
+        match resolution {
+            Resolution::Override(command) => {
+                let batches: Vec<&[PathBuf]> = if command_accepts_multiple(&command) {
+                    vec![&files[..]]
+                } else {
+                    files.chunks(1).collect()
+                };
+                for batch in batches {
+                    match LaunchPlan::for_command(&command, batch) {
+                        Some(plan) => plans.push(plan),
+                        None => errors.push(format!("empty override command: {command}")),
+                    }
+                }
+            }
+            Resolution::Entry(entry) => {
+                let batches: Vec<&[PathBuf]> = if entry.accepts_multiple() {
+                    vec![&files[..]]
+                } else {
+                    files.chunks(1).collect()
+                };
+                for batch in batches {
+                    match LaunchPlan::for_entry(&entry, batch) {
+                        Some(plan) => plans.push(plan),
+                        None => errors.push(format!("{} has no usable Exec line", entry.name)),
+                    }
+                }
+            }
+            Resolution::Executable(_) => unreachable!("never grouped"),
+        }
+    }
+    (plans, errors)
 }
 
 /// The applications to offer for `path`, default first, and its type.
+#[cfg(test)]
 pub(crate) fn choices_for(tables: &LaunchTables, path: &Path) -> (String, Vec<AppChoice>) {
-    let mime = tables.mime_of(path);
+    let (mimes, choices) = choices_for_many(tables, std::slice::from_ref(&path.to_path_buf()));
+    (mimes.into_iter().next().unwrap_or_default(), choices)
+}
+
+/// The applications that can open *every* one of `paths` -- "Open
+/// With" on a selection: the first file's candidates in their order,
+/// kept only when each other distinct type lists them too; marked
+/// default only when they are the default for all. Returns the distinct
+/// types too (for the "nothing handles" notice).
+pub(crate) fn choices_for_many(
+    tables: &LaunchTables,
+    paths: &[PathBuf],
+) -> (Vec<String>, Vec<AppChoice>) {
+    let mut mimes: Vec<String> = Vec::new();
+    for path in paths {
+        let mime = tables.mime_of(path);
+        if !mimes.contains(&mime) {
+            mimes.push(mime);
+        }
+    }
+    let Some(first) = mimes.first() else {
+        return (mimes, Vec::new());
+    };
+    let others: Vec<Vec<duet_meta::Candidate>> = mimes[1..]
+        .iter()
+        .map(|mime| tables.associations.candidates(mime))
+        .collect();
     let choices = tables
         .associations
-        .candidates(&mime)
+        .candidates(first)
         .into_iter()
-        .map(|c| AppChoice {
-            id: c.entry.id.clone(),
-            name: c.entry.name.clone(),
-            is_default: c.is_default,
-            terminal: c.entry.terminal,
+        .filter_map(|c| {
+            let mut is_default = c.is_default;
+            for list in &others {
+                let same = list.iter().find(|o| o.entry.id == c.entry.id)?;
+                is_default &= same.is_default;
+            }
+            Some(AppChoice {
+                id: c.entry.id.clone(),
+                name: c.entry.name.clone(),
+                is_default,
+                terminal: c.entry.terminal,
+            })
         })
         .collect();
-    (mime, choices)
+    (mimes, choices)
 }
 
 /// The plan for opening `path` with the application `id` picked in the
 /// chooser.
+#[cfg(test)]
 pub(crate) fn plan_for_choice(
     tables: &LaunchTables,
     id: &str,
     path: &Path,
 ) -> Result<LaunchPlan, String> {
+    plans_for_choice_many(tables, id, std::slice::from_ref(&path.to_path_buf()))
+        .and_then(|mut plans| plans.pop().ok_or_else(|| "nothing to open".to_string()))
+}
+
+/// The plans for opening `paths` with the application `id`: one plan
+/// when its `Exec` takes several files, else one per file.
+pub(crate) fn plans_for_choice_many(
+    tables: &LaunchTables,
+    id: &str,
+    paths: &[PathBuf],
+) -> Result<Vec<LaunchPlan>, String> {
     let entry = tables
         .associations
         .desktop()
         .entry(id)
         .ok_or_else(|| format!("{id} is no longer installed"))?;
-    LaunchPlan::for_entry(&entry, std::slice::from_ref(&path.to_path_buf()))
-        .ok_or_else(|| format!("{} has no usable Exec line", entry.name))
+    let batches: Vec<&[PathBuf]> = if entry.accepts_multiple() {
+        vec![paths]
+    } else {
+        paths.chunks(1).collect()
+    };
+    batches
+        .into_iter()
+        .map(|batch| {
+            LaunchPlan::for_entry(&entry, batch)
+                .ok_or_else(|| format!("{} has no usable Exec line", entry.name))
+        })
+        .collect()
+}
+
+/// Launches every plan, collecting the failures into one message.
+pub(crate) fn launch_all(plans: &[LaunchPlan]) -> Result<(), String> {
+    let errors: Vec<String> = plans.iter().filter_map(|plan| launch(plan).err()).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// Starts `plan` detached and reaps it in the background. The error is
@@ -277,17 +454,23 @@ pub(crate) fn launch(plan: &LaunchPlan) -> Result<(), String> {
     Ok(())
 }
 
-/// [`resolve_open`] + [`launch`] with the process-wide tables: the whole
-/// of Enter-on-a-file, for the Tokio runtime.
-pub(crate) fn open_default(
+/// [`plan_open_many`] + launch with the process-wide tables: "Open" on a
+/// selection, for the Tokio runtime. Everything that resolved is
+/// launched; the labels of what ran come back with any failures.
+pub(crate) fn open_default_many(
     overrides: &BTreeMap<String, String>,
-    path: &Path,
-    executable: bool,
-) -> Result<LaunchPlan, String> {
+    targets: &[OpenTarget],
+) -> (Vec<String>, Vec<String>) {
     let tables = tables();
-    let plan = resolve_open(&tables, overrides, path, executable)?;
-    launch(&plan)?;
-    Ok(plan)
+    let (plans, mut errors) = plan_open_many(&tables, overrides, targets);
+    let mut labels = Vec::new();
+    for plan in &plans {
+        match launch(plan) {
+            Ok(()) => labels.push(plan.label.clone()),
+            Err(err) => errors.push(err),
+        }
+    }
+    (labels, errors)
 }
 
 #[cfg(test)]
@@ -436,6 +619,83 @@ mod tests {
         let plan = plan_for_choice(&tables, "editor.desktop", &script).unwrap();
         assert_eq!(plan.label, "Editor");
         assert!(plan_for_choice(&tables, "gone.desktop", &script).is_err());
+    }
+
+    #[test]
+    fn a_selection_is_grouped_per_application_and_per_exec_arity() {
+        let (root, _) = fixture();
+        // A playlist-style entry (%U) next to the per-file editor (%f).
+        std::fs::write(
+            root.path().join("applications/player.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Player\nExec=sh -c true %U\nMimeType=video/mp4;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("applications/mimeinfo.cache"),
+            "[MIME Cache]\ntext/plain=editor.desktop;\napplication/pdf=viewer.desktop;\nvideo/mp4=player.desktop;\n",
+        )
+        .unwrap();
+        let mut mime = MimeDb::default();
+        mime.parse_globs2(
+            "50:text/plain:*.txt\n50:video/mp4:*.mp4\n50:application/x-shellscript:*.sh\n",
+        );
+        let associations = AssociationDb::load(
+            &[],
+            vec![root.path().join("applications")],
+            &[root.path().to_path_buf()],
+        );
+        let tables = LaunchTables::from_parts(mime, associations);
+        let mk = |name: &str, executable: bool| {
+            let path = root.path().join(name);
+            std::fs::write(&path, "x").unwrap();
+            OpenTarget { path, executable }
+        };
+        let targets = vec![
+            mk("a.mp4", false),
+            mk("b.mp4", false),
+            mk("one.txt", false),
+            mk("two.txt", false),
+            mk("run.sh", true),
+            mk("c.mp4", false),
+        ];
+        let (plans, errors) = plan_open_many(&tables, &BTreeMap::new(), &targets);
+        assert!(errors.is_empty(), "{errors:?}");
+        let labels: Vec<&str> = plans.iter().map(|p| p.label.as_str()).collect();
+        // The script runs on its own; the two videos share one player
+        // instance (%U), the two texts get one editor each (%f), the third
+        // video is a new run because it isn't consecutive.
+        assert_eq!(labels, ["run.sh", "Player", "Editor", "Editor", "Player"]);
+        let player = &plans[1];
+        assert_eq!(player.argv.len(), 3 + 2, "sh -c true plus both URIs");
+        assert!(player.argv[3].ends_with("/a.mp4") && player.argv[4].ends_with("/b.mp4"));
+        assert_eq!(plans[2].argv.len(), 3 + 1, "one file per editor instance");
+
+        // Open With on a mixed selection offers only what handles both.
+        let (mimes, choices) =
+            choices_for_many(&tables, &[targets[0].path.clone(), targets[2].path.clone()]);
+        assert_eq!(mimes, ["video/mp4", "text/plain"]);
+        assert!(
+            choices.is_empty(),
+            "player and editor handle different types"
+        );
+        let (_, choices) =
+            choices_for_many(&tables, &[targets[0].path.clone(), targets[1].path.clone()]);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].name, "Player");
+        let plans = plans_for_choice_many(
+            &tables,
+            "player.desktop",
+            &[targets[0].path.clone(), targets[1].path.clone()],
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1, "%U: one playlist");
+        let plans = plans_for_choice_many(
+            &tables,
+            "editor.desktop",
+            &[targets[2].path.clone(), targets[3].path.clone()],
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 2, "%f: one instance per file");
     }
 
     #[test]

@@ -169,7 +169,10 @@ computes its size.
 **Symptom:** a `mimeapps.list` or `.desktop` change made while Duet
 runs (installing an application, changing a default in GNOME Settings)
 is not seen until the next launch. "Open With" is reachable from the
-row context menu and the command palette (`file.open_with`) only.
+row context menu and the command palette (`file.open_with`) only. On a
+selection of mixed types the chooser lists only applications that
+handle every type; there is no "open each with its own default" entry
+in the chooser itself (that is what "Open" does).
 `DBusActivatable=true` entries are started through their `Exec` line
 rather than D-Bus activation, and the desktop-specific
 `<desktop>-mimeapps.list` variants are not consulted.
