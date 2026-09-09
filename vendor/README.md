@@ -96,3 +96,35 @@ nothing either way; rerun it, ideally while moving the pointer over the
 window or changing focus, until a retire shows up. In our runs on
 GNOME/Mutter, six transitions in a row each produced exactly one
 retire-and-recover.
+
+## Patch: custom MIME types on the clipboard (T-5.3.3, `DUET PATCH (T-5.3.3)` hunks)
+
+FR-CFG-05 needs `text/uri-list` and the GNOME/KDE cut markers on the
+system clipboard. Upstream gpui's `ClipboardEntry` has only `String` and
+`Image`, and its Wayland backend offers text types only (S-2). Rather than
+run a second Wayland client beside gpui (S-2's plan), the vendored copy
+carries:
+
+- `platform.rs`: `ClipboardEntry::Custom(ClipboardCustom { payloads })`,
+  `ClipboardItem::new_string_with_custom` / `custom_payload` /
+  `custom_mime_types`, and two `Platform` methods with no-op defaults,
+  `clipboard_mime_types()` and `read_clipboard_mime(mime)`; `app.rs`
+  forwards them.
+- `platform/linux/platform.rs`: the same two methods on `LinuxClient`
+  (defaults) and the `Platform` forwarding.
+- `platform/linux/wayland/client.rs`: `write_to_clipboard` offers every
+  custom type on the data source (text types only when there is text);
+  the two read methods delegate to the clipboard.
+- `platform/linux/wayland/clipboard.rs`: `send` answers a custom type
+  from the item's payload before falling back to text;
+  `offered_mime_types` / `read_mime` read the current offer (our own
+  item from memory when we are the owner).
+- `platform/test/platform.rs`: the test platform round-trips custom
+  payloads so `duet-ui`'s tests cover the paste path.
+- `platform/mac/platform.rs`, `platform/windows/clipboard.rs`: the new
+  variant is ignored (not compiled here; kept exhaustive).
+
+X11 is untouched (`x11-clipboard` serves one target); see
+`documentation/known_issues.md`. Grep for `DUET PATCH (T-5.3.3)` when
+upgrading gpui; upstream tracking issue: none filed yet.
+

@@ -193,3 +193,25 @@ gap, and the same watcher will serve the icon theme (T-4.2.6's note).
 if UAT wants a chord, bind `file.open_with` (Shift+Enter is free and
 TC uses it for "run with parameters", which is close in spirit).
 
+## FR-CFG-05 / T-5.3.3: the file clipboard is Wayland-only; X11 sessions exchange text paths
+
+**Symptom:** under X11 (or XWayland), Ctrl+C in a panel puts the paths
+on the clipboard as plain text only; other file managers see no file
+list, and Ctrl+V in Duet only pastes if the clipboard text is a list of
+absolute paths or `file://` URIs. Under native Wayland (Duet's target
+session) `text/uri-list` and the GNOME/KDE cut markers are offered and
+read.
+
+**Root cause:** gpui's X11 backend serves the selection through the
+`x11-clipboard` crate, whose `store` owns a single target; offering
+several MIME types needs a custom ICCCM selection owner (with `INCR`
+for large lists) -- S-2 already priced that as unbudgeted X11 work.
+
+**Why deferred:** every desktop in the platform matrix's primary row
+runs Wayland; X11 interop is a real gap for the X11+i3 row only.
+
+**To close this out:** replace the `x11-clipboard` `store` path in the
+vendored gpui with a selection owner that answers `TARGETS` with every
+custom type (and the text types), the same DUET PATCH shape as the
+Wayland one.
+

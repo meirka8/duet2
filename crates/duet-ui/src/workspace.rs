@@ -16,9 +16,11 @@ use duet_commands::palette::PaletteIndex;
 use duet_commands::{CommandId, CommandRegistry, register_builtin_commands};
 use duet_config::{HotlistEntry, SessionTab};
 use duet_ops::{
-    ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport, JournalReader, MountScan,
-    ProgressSnapshot, QueueManager, RecoveryReport, TrashEntry, list_trash_entries_with_mounts,
+    CancelToken, ConflictPolicy, ConflictResolver, JobEvent, JobId, JobKind, JobOutcome, JobReport,
+    JournalReader, MountScan, PlanOptions, ProgressSnapshot, QueueManager, RecoveryReport,
+    TrashEntry, list_trash_entries_with_mounts, plan_copy, plan_move,
 };
+use duet_platform::clipboard::CutMarkerConvention;
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
@@ -41,6 +43,7 @@ use gpui::{
 use crate::attributes_dialog::{
     AttributesDialogState, AttributesPrefill, bind_attributes_dialog_keys,
 };
+use crate::clipboard::{self, CutMarks};
 use crate::columns::{ColumnLayout, ColumnLayoutStore};
 use crate::command_palette::CommandPaletteDelegate;
 use crate::conflict_dialog::{
@@ -124,6 +127,16 @@ actions!(
 // but both are in the command palette and the row context menu, and
 // Enter on a file is `OpenDefault`'s everyday form.
 actions!(duet_workspace, [OpenDefault, OpenWith]);
+
+// T-5.3.3 (FR-CFG-05): the file clipboard. `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
+// are bound in the `FileTable` context only (design.md Appendix A.1.1:
+// in an editable field they stay text copy/cut/paste); `Ctrl+Insert` /
+// `Shift+Insert` are the classic alternates. `clipboard.copy_path` /
+// `copy_name` are palette-only.
+actions!(
+    duet_workspace,
+    [CopyFiles, CutFiles, PasteFiles, CopyPaths, CopyNames]
+);
 
 actions!(
     duet_workspace,
@@ -286,6 +299,11 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", AttributesDialog, Some("Workspace")),
         KeyBinding::new("alt-t", OpenTrashDialog, Some("Workspace")),
         KeyBinding::new("ctrl-l", GotoPath, Some("FileTable")),
+        KeyBinding::new("ctrl-c", CopyFiles, Some("FileTable")),
+        KeyBinding::new("ctrl-insert", CopyFiles, Some("FileTable")),
+        KeyBinding::new("ctrl-x", CutFiles, Some("FileTable")),
+        KeyBinding::new("ctrl-v", PasteFiles, Some("FileTable")),
+        KeyBinding::new("shift-insert", PasteFiles, Some("FileTable")),
     ]);
 }
 
@@ -339,6 +357,15 @@ pub fn run() {
             .map(load_icon_settings)
             .unwrap_or((None, true));
         crate::icons::IconCache::install(cx, tokio_handle.clone(), icon_theme, show_icons);
+        // T-5.3.3: which cut markers to emit, read once like the rest.
+        CutMarks::install(
+            cx,
+            duet_config::paths::settings_path()
+                .ok()
+                .as_deref()
+                .map(load_cut_marker_convention)
+                .unwrap_or_default(),
+        );
         // T-5.3.4: `[associations.overrides]`, read once like the rest.
         LaunchSettings::install(
             cx,
@@ -1602,6 +1629,26 @@ impl Workspace {
             PanelSide::Right => self.right_panel.clone(),
         };
         let handled = match id.as_str() {
+            "clipboard.copy" => {
+                self.copy_files_to_clipboard(false, window, cx);
+                true
+            }
+            "clipboard.cut" => {
+                self.copy_files_to_clipboard(true, window, cx);
+                true
+            }
+            "clipboard.paste" => {
+                self.paste_files_from_clipboard(window, cx);
+                true
+            }
+            "clipboard.copy_path" => {
+                self.copy_text_to_clipboard(false, window, cx);
+                true
+            }
+            "clipboard.copy_name" => {
+                self.copy_text_to_clipboard(true, window, cx);
+                true
+            }
             "file.open_default" => {
                 self.open_cursor_default(window, cx);
                 true
@@ -1753,6 +1800,183 @@ impl Workspace {
     /// active tab to `dir`, then closes the overlay. Goes through
     /// `FileTable::navigate_to_path` (T-4.3.5's own new entry point --
     /// `navigate_to` itself is private to `file_table`'s module).
+    /// T-5.3.3 `Ctrl+C` / `Ctrl+X`: the focused panel's selection (or
+    /// cursor entry) goes on the system clipboard as files; a cut marks
+    /// them dimmed until pasted.
+    fn copy_files_to_clipboard(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let paths = panel.read(cx).active_table().read(cx).clipboard_targets(cx);
+        if paths.is_empty() {
+            window.push_notification(Notification::info("Nothing to copy."), cx);
+            return;
+        }
+        let count = paths.len();
+        clipboard::write_files(cx, paths, cut);
+        let what = if count == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{count} items")
+        };
+        let verb = if cut { "Cut" } else { "Copied" };
+        window.push_notification(
+            Notification::info(format!("{verb} {what} to the clipboard.")),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// `clipboard.copy_path` / `clipboard.copy_name`: the selection as
+    /// text, one per line.
+    fn copy_text_to_clipboard(
+        &mut self,
+        names_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let paths = panel.read(cx).active_table().read(cx).clipboard_targets(cx);
+        if paths.is_empty() {
+            window.push_notification(Notification::info("Nothing to copy."), cx);
+            return;
+        }
+        let mut text = String::new();
+        for path in &paths {
+            let line = if names_only {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                path.to_string_lossy().into_owned()
+            };
+            text.push_str(&line);
+            text.push('\n');
+        }
+        clipboard::write_text(cx, text);
+        cx.notify();
+    }
+
+    /// T-5.3.3 `Ctrl+V`: the files on the system clipboard are copied
+    /// (or moved, after a cut) into the focused panel's directory through
+    /// the same planner and queue the F5/F6 dialog uses, conflicts going
+    /// to the interactive resolver. A cut is cleared once its move is
+    /// queued, as Nautilus does.
+    fn paste_files_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(files) = clipboard::read_files(cx) else {
+            window.push_notification(Notification::info("The clipboard holds no files."), cx);
+            return;
+        };
+        let panel = match self.focused_panel_side(window, cx) {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let dest_dir = panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .current_dir()
+            .to_path_buf();
+        let Ok(dest) = crate::file_table::local_vpath(&dest_dir) else {
+            window.push_notification(
+                Notification::warning("This panel isn't a local directory."),
+                cx,
+            );
+            return;
+        };
+        let sources: Vec<VPath> = files
+            .paths
+            .iter()
+            .filter(|p| p.parent() != Some(dest_dir.as_path()) || !files.cut)
+            .filter_map(|p| crate::file_table::local_vpath(p).ok())
+            .collect();
+        if sources.is_empty() {
+            window.push_notification(Notification::info("Those files are already here."), cx);
+            return;
+        }
+        let kind = if files.cut {
+            JobKind::Move
+        } else {
+            JobKind::Copy
+        };
+        self.enqueue_transfer(kind, sources, dest, cx);
+        if files.cut {
+            clipboard::clear(cx);
+            cx.notify();
+        }
+    }
+
+    /// Plans `kind` for `sources` into `dest` off the UI thread and
+    /// queues it -- the copy/move dialog's own confirm path, minus the
+    /// dialog. Failures come back as a toast.
+    fn enqueue_transfer(
+        &mut self,
+        kind: JobKind,
+        sources: Vec<VPath>,
+        dest: VPath,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state_dir) = self.state_dir.clone() else {
+            self.push_pending_notice(
+                NoticeLevel::Error,
+                "Can't run the operation: no writable state directory found \
+                 (is $HOME/$XDG_STATE_HOME set?).",
+                cx,
+            );
+            return;
+        };
+        let options = PlanOptions {
+            default_conflict: ConflictPolicy::Skip,
+            verify: false,
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
+        let queue = self.queue.clone();
+        let conflict_resolver: Arc<dyn ConflictResolver> = self.conflict_resolver.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        self.tokio_handle.spawn(async move {
+            let cancel = CancelToken::new();
+            let plan = match kind {
+                JobKind::Move => plan_move(fs.as_ref(), &sources, &dest, options, &cancel).await,
+                _ => plan_copy(fs.as_ref(), &sources, &dest, options, &cancel).await,
+            };
+            let outcome = match plan {
+                Ok(plan) => {
+                    queue.enqueue(
+                        kind,
+                        plan,
+                        0,
+                        fs,
+                        state_dir,
+                        crate::copy_move_dialog::JOB_CONCURRENCY,
+                        Some(conflict_resolver),
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(crate::copy_move_dialog::describe_planner_error(&err)),
+            };
+            let _ = tx.send(outcome);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx
+                .await
+                .unwrap_or_else(|_| Err("the planning task was dropped".to_string()));
+            if let Err(message) = outcome {
+                let _ = this.update(cx, |this, cx| {
+                    this.push_pending_notice(
+                        NoticeLevel::Error,
+                        format!("Couldn't paste: {message}"),
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+    }
+
     /// T-5.3.4: the files "Open"/"Open With" act on in the focused
     /// panel -- the selection when the cursor is in it, else the cursor
     /// file (see `FileTable::open_targets`).
@@ -3612,6 +3836,21 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &CopyFiles, window, cx| {
+                this.copy_files_to_clipboard(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CutFiles, window, cx| {
+                this.copy_files_to_clipboard(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PasteFiles, window, cx| {
+                this.paste_files_from_clipboard(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyPaths, window, cx| {
+                this.copy_text_to_clipboard(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyNames, window, cx| {
+                this.copy_text_to_clipboard(true, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenDefault, window, cx| {
                 this.open_cursor_default(window, cx);
             }))
@@ -4662,6 +4901,17 @@ fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
             );
             ColumnLayout::default()
         })
+}
+
+/// Reads `clipboard.cut_marker_convention` (T-5.3.3) from `settings.toml`
+/// at `path`, same fallback tolerance as [`load_splitter_ratio`].
+fn load_cut_marker_convention(path: &std::path::Path) -> CutMarkerConvention {
+    duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| {
+            CutMarkerConvention::from_settings_str(&settings.clipboard.cut_marker_convention)
+        })
+        .unwrap_or_default()
 }
 
 /// Reads `[associations.overrides]` (T-5.3.4) from `settings.toml` at
@@ -6720,6 +6970,93 @@ mod tests {
                     None => std::env::remove_var("XDG_DATA_DIRS"),
                 }
             }
+        });
+    }
+
+    /// T-5.3.3 end to end: Ctrl+C in one panel, Ctrl+V in the other
+    /// copies through the real queue; Ctrl+X marks the entries cut and
+    /// Ctrl+V moves them, clearing the marks and the clipboard.
+    #[gpui::test]
+    fn copy_and_cut_paste_between_panels_through_the_clipboard(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let src = tempfile::tempdir().unwrap();
+            let dst = tempfile::tempdir().unwrap();
+            std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+            std::fs::write(src.path().join("b.txt"), b"beta").unwrap();
+
+            // Right panel at the destination, left panel (focused) at the source.
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &right_table, dst.path().to_path_buf());
+            focus_left_panel_at(&workspace, vcx, src.path());
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left_table.read_with(vcx, |t, cx| {
+                    t.state().read(cx).delegate().model().order().len() == 2
+                })
+            });
+            left_table.update(vcx, |table, cx| {
+                table
+                    .state()
+                    .update(cx, |state, _| state.delegate_mut().select_all());
+            });
+            assert_eq!(
+                left_table.read_with(vcx, |t, cx| t.clipboard_targets(cx).len()),
+                2
+            );
+
+            // Copy, then paste into the right panel.
+            vcx.dispatch_action(CopyFiles);
+            let on_clipboard = vcx
+                .update(|_, cx| clipboard::read_files(cx))
+                .expect("files");
+            assert!(!on_clipboard.cut);
+            assert_eq!(on_clipboard.paths.len(), 2);
+            let focus_right = |workspace: &Entity<Workspace>, vcx: &mut VisualTestContext| {
+                workspace.update_in(vcx, |ws, window, cx| {
+                    let handle = ws.right_panel.read(cx).active_focus_handle(cx);
+                    window.focus(&handle);
+                });
+            };
+            focus_right(&workspace, vcx);
+            vcx.dispatch_action(PasteFiles);
+            wait_until(vcx, |_| {
+                dst.path().join("a.txt").exists() && dst.path().join("b.txt").exists()
+            });
+            assert!(
+                src.path().join("a.txt").exists(),
+                "a copy leaves the source"
+            );
+
+            // Cut in the left panel: marks appear; paste moves and clears.
+            std::fs::remove_file(dst.path().join("a.txt")).unwrap();
+            std::fs::remove_file(dst.path().join("b.txt")).unwrap();
+            focus_left_panel_at(&workspace, vcx, src.path());
+            left_table.update(vcx, |table, cx| {
+                table
+                    .state()
+                    .update(cx, |state, _| state.delegate_mut().select_all());
+            });
+            vcx.dispatch_action(CutFiles);
+            let marks = vcx
+                .update(|_, cx| CutMarks::names_for(cx, src.path()))
+                .expect("cut marks for the source dir");
+            assert!(marks.contains("a.txt") && marks.contains("b.txt"));
+            focus_right(&workspace, vcx);
+            vcx.dispatch_action(PasteFiles);
+            wait_until(vcx, |_| {
+                dst.path().join("a.txt").exists() && !src.path().join("a.txt").exists()
+            });
+            assert!(
+                vcx.update(|_, cx| CutMarks::names_for(cx, src.path()))
+                    .is_none(),
+                "marks cleared once the move is queued"
+            );
+            assert!(
+                vcx.update(|_, cx| clipboard::read_files(cx)).is_none(),
+                "the clipboard is emptied after a cut is pasted"
+            );
         });
     }
 

@@ -40,7 +40,7 @@
 //! Caching an owned `SharedString` per name once, alongside size/date,
 //! avoids both the leak and any unsafe lifetime extension.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -72,6 +72,7 @@ use gpui::{
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use crate::clipboard::CutMarks;
 use crate::columns::{ColumnKind, ColumnLayout, ColumnLayoutStore, write_mode};
 use crate::icons::{ICON_PX, IconCache, IconId, IconTables};
 use crate::launcher::{self, LaunchSettings, OpenTarget};
@@ -396,6 +397,9 @@ pub struct FileTableDelegate {
     /// FR-NAV-07/FR-NAV-13: the active quick-search/quick-filter session,
     /// if any. See [`QuickSearchState`]'s doc comment.
     quick_search: Option<QuickSearchState>,
+    /// T-5.3.3: the names in this listing that are cut and not yet
+    /// pasted (see `clipboard::CutMarks`), for dimming. `None` = none.
+    cut_names: Option<Arc<HashSet<String>>>,
     /// Which regime plain typing starts a new session in -- read once
     /// from `settings.toml`'s `navigation.quick_search_mode` by
     /// `FileTable::new`, same "no live-reload path yet" story as
@@ -455,6 +459,7 @@ impl FileTableDelegate {
             mouse_mode: MouseMode::default(),
             new_tab_handler: None,
             quick_search: None,
+            cut_names: None,
             quick_search_default_mode: QuickSearchMode::default(),
             icon_tables: None,
             icon_slots: Vec::new(),
@@ -1195,6 +1200,15 @@ impl FileTableDelegate {
     /// Commander's rule for selection-aware commands); else the cursor
     /// entry alone. Directories are left out -- a launch opens files.
     pub(crate) fn open_targets_info(&self) -> Vec<(String, EntryKind, Option<u32>)> {
+        let mut targets = self.selection_or_cursor_info();
+        targets.retain(|(_, kind, _)| *kind != EntryKind::Directory);
+        targets
+    }
+
+    /// Every selected entry (display order) when the cursor entry is
+    /// selected, else the cursor entry; directories included. The rule
+    /// every selection-aware command shares (open, clipboard).
+    pub(crate) fn selection_or_cursor_info(&self) -> Vec<(String, EntryKind, Option<u32>)> {
         let Some(cursor) = self.cursor_entry_info() else {
             return Vec::new();
         };
@@ -1203,7 +1217,7 @@ impl FileTableDelegate {
             .and_then(|row| self.model.order().get(row))
             .is_some_and(|&ix| self.model.is_selected(EntryId::new(ix)));
         let entries = self.model.entries();
-        let mut targets: Vec<(String, EntryKind, Option<u32>)> = if cursor_selected {
+        let targets: Vec<(String, EntryKind, Option<u32>)> = if cursor_selected {
             self.model
                 .order()
                 .iter()
@@ -1220,8 +1234,23 @@ impl FileTableDelegate {
         } else {
             vec![cursor]
         };
-        targets.retain(|(_, kind, _)| *kind != EntryKind::Directory);
         targets
+    }
+
+    /// See the `cut_names` field.
+    pub(crate) fn set_cut_names(&mut self, names: Option<Arc<HashSet<String>>>) {
+        self.cut_names = names;
+    }
+
+    /// Whether the entry at `model_row` is cut (T-5.3.3).
+    fn is_cut(&self, model_row: usize) -> bool {
+        let Some(names) = &self.cut_names else {
+            return false;
+        };
+        self.model
+            .order()
+            .get(model_row)
+            .is_some_and(|&ix| names.contains(self.model.entries().name(EntryId::new(ix))))
     }
 
     /// Whether the display cursor is on the synthetic ".." row. See the
@@ -1640,12 +1669,13 @@ impl FileTableDelegate {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> gpui::Stateful<gpui::Div> {
-        let (cursor_bg, cursor_fg, selection_bg) = {
+        let (cursor_bg, cursor_fg, selection_bg, disabled_fg) = {
             let tokens = TokenPalette::current(cx);
             (
                 tokens.color.cursor_bg,
                 tokens.color.cursor_fg,
                 tokens.color.selection_bg,
+                tokens.color.disabled_fg,
             )
         };
         let (is_cursor, selected) = self.row_state(row_ix);
@@ -1714,6 +1744,12 @@ impl FileTableDelegate {
             cell = cell.bg(cursor_bg).text_color(cursor_fg);
         } else if selected {
             cell = cell.bg(selection_bg);
+        }
+        if !is_cursor
+            && !(self.has_parent_row && row_ix == 0)
+            && self.is_cut(row_ix - self.parent_offset())
+        {
+            cell = cell.text_color(disabled_fg);
         }
         if self.has_parent_row && row_ix == 0 {
             cell
@@ -1888,6 +1924,13 @@ impl TableDelegate for FileTableDelegate {
                 .text_color(tokens.color.cursor_fg)
         } else if selected {
             row.bg(tokens.color.selection_bg)
+        } else {
+            row
+        };
+        // T-5.3.3: a cut entry is shown dimmed until it is pasted (Nautilus
+        // and Dolphin do the same), unless it is the cursor row.
+        let row = if !is_cursor && self.is_cut(model_row) {
+            row.text_color(tokens.color.disabled_fg)
         } else {
             row
         };
@@ -2556,6 +2599,9 @@ pub struct FileTable {
     /// The cursor display row the grid views last scrolled to -- see
     /// [`Self::scroll_grid_to_cursor`].
     grid_scrolled_cursor: Option<Option<usize>>,
+    /// T-5.3.3: the `CutMarks` generation and directory the delegate's
+    /// cut-name set was last synced for -- see `render`.
+    cut_sync: (u64, PathBuf),
 }
 
 /// `dir` is where the locked tab's navigation attempt was headed;
@@ -2961,6 +3007,7 @@ impl FileTable {
             brief_scroll: ScrollHandle::new(),
             tree: None,
             grid_scrolled_cursor: None,
+            cut_sync: (u64::MAX, PathBuf::new()),
         };
         this.set_view_mode(initial_view, cx);
         this
@@ -3936,6 +3983,19 @@ impl FileTable {
             .collect()
     }
 
+    /// T-5.3.3: what Ctrl+C / Ctrl+X put on the clipboard -- the selection
+    /// when the cursor is in it, else the cursor entry; directories
+    /// included, the ".." row never.
+    pub(crate) fn clipboard_targets(&self, cx: &App) -> Vec<PathBuf> {
+        self.state
+            .read(cx)
+            .delegate()
+            .selection_or_cursor_info()
+            .into_iter()
+            .map(|(name, _, _)| self.current_dir.join(name))
+            .collect()
+    }
+
     /// T-5.3.4: Enter on a file -- the cursor file only, whatever is
     /// selected (Total Commander's rule for Enter).
     pub(crate) fn open_cursor_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4071,6 +4131,15 @@ impl Render for FileTable {
                 cx.notify();
             }
         });
+        // T-5.3.3: re-sync the cut-name set when the marks or the
+        // directory changed (one comparison per frame otherwise).
+        let cut_generation = CutMarks::generation(cx);
+        if self.cut_sync.0 != cut_generation || self.cut_sync.1 != self.current_dir {
+            self.cut_sync = (cut_generation, self.current_dir.clone());
+            let names = CutMarks::names_for(cx, &self.current_dir);
+            self.state
+                .update(cx, |state, _| state.delegate_mut().set_cut_names(names));
+        }
         let state = self.state.clone();
         let this = cx.weak_entity();
         let body = self.render_body(window, cx);

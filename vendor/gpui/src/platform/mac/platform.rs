@@ -1038,6 +1038,9 @@ impl Platform for MacPlatform {
                         ClipboardEntry::Image(image) => {
                             self.write_image_to_clipboard(image);
                         }
+                        // DUET PATCH (T-5.3.3): custom MIME payloads are
+                        // not offered on this backend.
+                        ClipboardEntry::Custom(_) => {}
                     },
                     None => {
                         // Writing an empty list of entries just clears the clipboard.
