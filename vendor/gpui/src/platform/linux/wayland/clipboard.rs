@@ -179,10 +179,54 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        // DUET PATCH (T-5.3.3): a custom payload for the requested type
+        // wins; anything else gets the text, as before.
+        if let Some(bytes) = self
+            .contents
+            .as_ref()
+            .and_then(|contents| contents.custom_payload(&mime_type))
+        {
+            self.send_internal(fd, bytes.to_owned());
+            return;
+        }
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
             self.send_internal(fd, text.as_bytes().to_owned());
         }
+    }
+
+    /// DUET PATCH (T-5.3.3): every MIME type the current selection owner
+    /// offers (our own item's types when we are the owner).
+    pub fn offered_mime_types(&self) -> Vec<String> {
+        let Some(offer) = self.current_offer.as_ref() else {
+            return Vec::new();
+        };
+        if offer.has_mime_type(&self.self_mime) {
+            return self
+                .contents
+                .as_ref()
+                .map(|contents| contents.custom_mime_types())
+                .unwrap_or_default();
+        }
+        offer.mime_types.clone()
+    }
+
+    /// DUET PATCH (T-5.3.3): the bytes the current selection owner serves
+    /// for `mime_type`, or `None` when it isn't offered. Our own item
+    /// answers from memory without a round trip.
+    pub fn read_mime(&self, mime_type: &str) -> Option<Vec<u8>> {
+        let offer = self.current_offer.as_ref()?;
+        if offer.has_mime_type(&self.self_mime) {
+            return self
+                .contents
+                .as_ref()
+                .and_then(|contents| contents.custom_payload(mime_type))
+                .map(<[u8]>::to_vec);
+        }
+        if !offer.has_mime_type(mime_type) {
+            return None;
+        }
+        offer.read_bytes(&self.connection, mime_type)
     }
 
     pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {

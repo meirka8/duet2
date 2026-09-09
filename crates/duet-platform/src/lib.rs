@@ -11,6 +11,10 @@
 //! into to decide where a trashed file's content and `.trashinfo` sidecar
 //! actually go. T-5.3.2 phase 1 adds the read side to the same module:
 //! `trash::list_trash_entries` enumerates what's already there, for
-//! `duet_ops::trash_restore`'s restore/purge planners.
+//! `duet_ops::trash_restore`'s restore/purge planners. T-5.3.3 adds
+//! [`clipboard`]: the file clipboard's wire formats (`text/uri-list` and
+//! the GNOME/KDE cut markers), encode and decode only -- the transport is
+//! `duet-ui`'s, through the vendored gpui's data device.
 
+pub mod clipboard;
 pub mod trash;

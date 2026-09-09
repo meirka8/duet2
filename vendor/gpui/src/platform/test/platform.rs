@@ -412,6 +412,22 @@ impl Platform for TestPlatform {
         self.current_clipboard_item.lock().clone()
     }
 
+    // DUET PATCH (T-5.3.3): custom MIME payloads round-trip in tests too.
+    fn clipboard_mime_types(&self) -> Vec<String> {
+        self.current_clipboard_item
+            .lock()
+            .as_ref()
+            .map(|item| item.custom_mime_types())
+            .unwrap_or_default()
+    }
+
+    fn read_clipboard_mime(&self, mime_type: &str) -> Option<Vec<u8>> {
+        self.current_clipboard_item
+            .lock()
+            .as_ref()
+            .and_then(|item| item.custom_payload(mime_type).map(<[u8]>::to_vec))
+    }
+
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
         Task::ready(Ok(()))
     }
