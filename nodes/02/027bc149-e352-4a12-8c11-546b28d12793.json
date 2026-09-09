@@ -1,0 +1,24 @@
+{
+  "interaction": {
+    "id": "027bc149-e352-4a12-8c11-546b28d12793",
+    "conversation_id": "9db9539b-15bf-4643-9d44-652179cf0e7b",
+    "parent_id": null,
+    "timestamp": "2026-09-09T18:22:33Z",
+    "author": "agent",
+    "user_prompt": "T-5.3.3 UAT bug: Ctrl+C after Insert-selecting copies the cursor entry, not the selection (branch feature/T-5.3.3-clipboard, PR #74)",
+    "model_name": "agent",
+    "model_cot": "Owner's UAT: Insert selects and advances the cursor (TC behaviour), so after selecting two files the cursor sits on the third, unselected entry; Ctrl+C then copied that third file. Cause: the \"act on the selection only when the cursor entry is itself selected\" rule I introduced for Open/Open With (PR #72) and reused for the clipboard. That rule is Explorer's context-menu semantics, not TC's: in TC every selection-aware command (F5/F6/F8, and the clipboard) acts on the selection whenever one exists and falls back to the cursor entry only when nothing is selected -- exactly what this codebase's own `copy_move_dialog::resolve_source_names` already implements for F5/F6. Decision: one rule everywhere, selection wins when non-empty; `selection_or_cursor_info` drops the cursor-in-selection condition, so Ctrl+C/X, Open, Open With and the palette all agree with F5/F6. Consequence accepted: right-clicking an unselected row while a selection exists acts on the selection (TC's own context menu does the same). Regression test reproduces the owner's exact steps: Insert, Insert, cursor lands on the third row, Ctrl+C yields the two selected paths.\n\nContext Summary:\ncrates/duet-ui/src/file_table.rs selection_or_cursor_info; tests in workspace.rs; task.md wording for T-5.3.3/T-5.3.4 rows.",
+    "model_response": null,
+    "source_request_id": null
+  },
+  "context_items": [],
+  "tool_executions": [],
+  "artifact_links": [
+    {
+      "interaction_id": "027bc149-e352-4a12-8c11-546b28d12793",
+      "git_commit_hash": "d8d7d4b652df9592a3e01a97cb6aca0dd06295d5",
+      "link_type": "temporal",
+      "linked_by": "meir.kanevskiy@gmail.com"
+    }
+  ]
+}
