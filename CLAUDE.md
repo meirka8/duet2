@@ -25,8 +25,15 @@ not a substitute.
 - Reference the WBS task id (`T-x.y.z`) and the branch in the entry.
 - When working in a git worktree, pass the worktree path as `cwd`.
 - If a CVC tool reports missing storage or hooks, call `setup_cvc`.
-- Publication to the remote is consent-gated (`cvc privacy status`);
-  never change that setting without being asked.
+- Thoughts are only persisted once capture has been acknowledged on the
+  machine (`cvc privacy status` shows `capture_acknowledged: true`).
+  The acknowledgement needs an interactive terminal:
+  `cvc privacy acknowledge-capture`. Until it is given, `commit_thought`
+  returns an id but the hooks never see the entry -- check
+  `cvc status` after the first commit of a session and say so if the
+  count didn't move.
+- Publication to the remote is consent-gated (`cvc privacy status`,
+  `auto_push`); never change that setting without being asked.
 
 PRs #58–#71 (September 2026) carry no thoughts because those sessions
 never called `commit_thought`. Don't repeat that.
