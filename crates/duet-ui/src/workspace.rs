@@ -1978,7 +1978,7 @@ impl Workspace {
     }
 
     /// T-5.3.4: the files "Open"/"Open With" act on in the focused
-    /// panel -- the selection when the cursor is in it, else the cursor
+    /// panel -- the selection when there is one, else the cursor
     /// file (see `FileTable::open_targets`).
     fn focused_open_targets(&self, window: &Window, cx: &App) -> Vec<PathBuf> {
         let panel = match self.focused_panel_side(window, cx) {
@@ -7005,6 +7005,54 @@ mod tests {
                 left_table.read_with(vcx, |t, cx| t.clipboard_targets(cx).len()),
                 2
             );
+            // The owner's UAT steps: Insert selects *and advances*, so the
+            // cursor ends up below the selection -- the selection must
+            // still be what Ctrl+C takes, not the row under the cursor.
+            left_table.update(vcx, |table, cx| {
+                table.state().update(cx, |state, _| {
+                    state.delegate_mut().deselect_all();
+                    state.delegate_mut().move_cursor_to(0);
+                });
+            });
+            std::fs::write(src.path().join("c.txt"), b"gamma").unwrap();
+            navigate_panel_to(vcx, &left_table, src.path().to_path_buf());
+            wait_until(vcx, |vcx| {
+                left_table.read_with(vcx, |t, cx| {
+                    t.state().read(cx).delegate().model().order().len() == 3
+                })
+            });
+            use crate::file_table::ToggleSelectionAndAdvance;
+            vcx.dispatch_action(ToggleSelectionAndAdvance);
+            vcx.dispatch_action(ToggleSelectionAndAdvance);
+            left_table.read_with(vcx, |t, cx| {
+                assert_eq!(
+                    t.cursor_entry_name(cx).as_deref(),
+                    Some("c.txt"),
+                    "cursor moved on"
+                );
+                let targets = t.clipboard_targets(cx);
+                let names: Vec<String> = targets
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(
+                    names,
+                    ["a.txt", "b.txt"],
+                    "the selection, not the cursor row"
+                );
+            });
+            std::fs::remove_file(src.path().join("c.txt")).unwrap();
+            navigate_panel_to(vcx, &left_table, src.path().to_path_buf());
+            wait_until(vcx, |vcx| {
+                left_table.read_with(vcx, |t, cx| {
+                    t.state().read(cx).delegate().model().order().len() == 2
+                })
+            });
+            left_table.update(vcx, |table, cx| {
+                table
+                    .state()
+                    .update(cx, |state, _| state.delegate_mut().select_all());
+            });
 
             // Copy, then paste into the right panel.
             vcx.dispatch_action(CopyFiles);

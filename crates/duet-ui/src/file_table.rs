@@ -1205,36 +1205,34 @@ impl FileTableDelegate {
         targets
     }
 
-    /// Every selected entry (display order) when the cursor entry is
-    /// selected, else the cursor entry; directories included. The rule
-    /// every selection-aware command shares (open, clipboard).
+    /// Every selected entry (display order) when anything is selected,
+    /// else the cursor entry; directories included. Total Commander's
+    /// rule for every selection-aware command, the same one F5/F6 use
+    /// (`copy_move_dialog::resolve_source_names`): `Insert` selects and
+    /// moves the cursor on, so the cursor is normally *not* on a selected
+    /// row when the user has finished selecting -- the selection still
+    /// wins (UAT of T-5.3.3 caught the earlier "only if the cursor is in
+    /// it" rule copying the wrong file).
     pub(crate) fn selection_or_cursor_info(&self) -> Vec<(String, EntryKind, Option<u32>)> {
-        let Some(cursor) = self.cursor_entry_info() else {
-            return Vec::new();
-        };
-        let cursor_selected = self
-            .cursor_row
-            .and_then(|row| self.model.order().get(row))
-            .is_some_and(|&ix| self.model.is_selected(EntryId::new(ix)));
         let entries = self.model.entries();
-        let targets: Vec<(String, EntryKind, Option<u32>)> = if cursor_selected {
-            self.model
-                .order()
-                .iter()
-                .map(|&ix| EntryId::new(ix))
-                .filter(|&id| self.model.is_selected(id))
-                .map(|id| {
-                    (
-                        entries.name(id).to_string(),
-                        entries.kind(id),
-                        entries.mode(id),
-                    )
-                })
-                .collect()
-        } else {
-            vec![cursor]
-        };
-        targets
+        let selected: Vec<(String, EntryKind, Option<u32>)> = self
+            .model
+            .order()
+            .iter()
+            .map(|&ix| EntryId::new(ix))
+            .filter(|&id| self.model.is_selected(id))
+            .map(|id| {
+                (
+                    entries.name(id).to_string(),
+                    entries.kind(id),
+                    entries.mode(id),
+                )
+            })
+            .collect();
+        if !selected.is_empty() {
+            return selected;
+        }
+        self.cursor_entry_info().into_iter().collect()
     }
 
     /// See the `cut_names` field.
@@ -1340,7 +1338,7 @@ impl FileTableDelegate {
     }
 
     /// Ctrl+Num- (T-4.2.3): unconditionally clears the selection.
-    fn deselect_all(&mut self) {
+    pub(crate) fn deselect_all(&mut self) {
         self.model.clear_selection();
     }
 
@@ -3968,8 +3966,8 @@ impl FileTable {
     }
 
     /// What "Open"/"Open With" act on -- see
-    /// `FileTableDelegate::open_targets_info`: the selection when the
-    /// cursor is in it, else the cursor file; never directories.
+    /// `FileTableDelegate::open_targets_info`: the selection when there
+    /// is one, else the cursor file; never directories.
     pub(crate) fn open_targets(&self, cx: &App) -> Vec<OpenTarget> {
         self.state
             .read(cx)
@@ -3984,8 +3982,8 @@ impl FileTable {
     }
 
     /// T-5.3.3: what Ctrl+C / Ctrl+X put on the clipboard -- the selection
-    /// when the cursor is in it, else the cursor entry; directories
-    /// included, the ".." row never.
+    /// when there is one, else the cursor entry; directories included,
+    /// the ".." row never.
     pub(crate) fn clipboard_targets(&self, cx: &App) -> Vec<PathBuf> {
         self.state
             .read(cx)
