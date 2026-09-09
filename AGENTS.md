@@ -19,13 +19,14 @@ When decomposing goals into sub-tasks, delegate work to these specialized subage
 
 ---
 
-## 2. Volute MCP Thought Tracking Directive
+## 2. CVC (Cognitive Version Control) Thought Tracking Directive
 
-To maintain cognitive context across complex multi-step refactors, long-running agent tasks, and phase transitions:
+To maintain cognitive context across complex multi-step refactors, long-running agent tasks, and phase transitions, use the CVC MCP tools (`read_history`, `sync_history`, `commit_thought`, `setup_cvc`); the repository's git hooks link each recorded thought to the commit that follows it and publish thoughts on `git push`:
 
-1. **Continuous Intent Logging:** Whenever taking on a non-trivial architectural decision, starting a new WBS task (`T-x.x.x`), or evaluating a trade-off, call the Volute MCP tool to log your immediate thoughts, intentions, and structural reasoning.
-2. **Phase Boundary Summaries:** At the completion of each task or milestone, log a Volute thought summarizing what was accomplished, any technical debt introduced, and instructions for the next agent session.
-3. **Branch/Context Tagging:** Ensure thought entries reference the active git branch or phase task ID so architectural decisions remain traceable.
+1. **Start from the record:** At the start of a task call `read_history` (after `sync_history` when the checkout may be behind) before assuming a blank slate.
+2. **Continuous Intent Logging:** Whenever taking on a non-trivial architectural decision, starting a new WBS task (`T-x.x.x`), rejecting an approach, or evaluating a trade-off, call `commit_thought` with the reasoning -- *before* the commit it belongs to, so the hook can link it.
+3. **Phase Boundary Summaries:** At the completion of each task or milestone, log a thought summarizing what was accomplished, any technical debt introduced, and instructions for the next agent session.
+4. **Branch/Context Tagging:** Ensure thought entries reference the active git branch or phase task ID so architectural decisions remain traceable; in a git worktree pass the worktree path as `cwd`.
 
 ---
 
@@ -70,5 +71,5 @@ When the user provides a `/goal` prompt:
    - **Testing:** Have `@qa-chaos` write unit, conformance, or fault-injection tests before marking a task complete.
 5. **Completion Gate:**
    - Ensure small, logical commits are made during execution.
-   - Run Volute MCP to capture closing thoughts and summaries.
+   - Call CVC `commit_thought` to capture closing thoughts and summaries.
    - Open a PR via `gh pr create` and request user review when reaching a Phase Gate.
