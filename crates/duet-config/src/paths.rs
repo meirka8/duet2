@@ -96,6 +96,13 @@ pub fn session_path() -> Result<PathBuf> {
     Ok(duet_state_dir()?.join("session.json"))
 }
 
+/// `~/.local/state/duet/history/cmdline` -- the command line's recall
+/// history (design.md §10's `history/`; T-5.3.5). One entry per line,
+/// oldest first.
+pub fn cmdline_history_path() -> Result<PathBuf> {
+    Ok(duet_state_dir()?.join("history").join("cmdline"))
+}
+
 /// `~/.config/duet/settings.toml`.
 pub fn settings_path() -> Result<PathBuf> {
     Ok(duet_config_dir()?.join("settings.toml"))

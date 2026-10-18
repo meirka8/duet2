@@ -20,6 +20,7 @@
 mod attributes_dialog;
 mod clipboard;
 mod columns;
+mod command_line;
 mod command_palette;
 mod conflict_dialog;
 mod copy_move_dialog;
