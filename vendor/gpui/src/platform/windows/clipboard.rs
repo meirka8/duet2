@@ -159,6 +159,9 @@ fn write_to_clipboard_inner(item: ClipboardItem) -> Result<()> {
             ClipboardEntry::Image(image) => {
                 write_image_to_clipboard(image)?;
             }
+            // DUET PATCH (T-5.3.3): custom MIME payloads are not offered
+            // on this backend.
+            ClipboardEntry::Custom(_) => {}
         },
         None => {
             // Writing an empty list of entries just clears the clipboard.

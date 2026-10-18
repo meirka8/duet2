@@ -1054,6 +1054,18 @@ impl App {
         self.platform.read_from_clipboard()
     }
 
+    /// DUET PATCH (T-5.3.3): the MIME types the current clipboard owner
+    /// offers (empty on backends without custom-type support).
+    pub fn clipboard_mime_types(&self) -> Vec<String> {
+        self.platform.clipboard_mime_types()
+    }
+
+    /// DUET PATCH (T-5.3.3): the bytes the current clipboard owner serves
+    /// for `mime_type`, if offered.
+    pub fn read_clipboard_mime(&self, mime_type: &str) -> Option<Vec<u8>> {
+        self.platform.read_clipboard_mime(mime_type)
+    }
+
     /// Writes credentials to the platform keychain.
     pub fn write_credentials(
         &self,

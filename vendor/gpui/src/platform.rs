@@ -265,6 +265,19 @@ pub(crate) trait Platform: 'static {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    /// DUET PATCH (T-5.3.3): the MIME types the current clipboard owner
+    /// offers, for negotiating a custom-format paste. Empty where the
+    /// backend has no such notion.
+    fn clipboard_mime_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// DUET PATCH (T-5.3.3): the raw bytes the current clipboard owner
+    /// serves for `mime_type`, or `None` when it doesn't offer it (or the
+    /// backend can't ask). Blocks for the transfer, like
+    /// `read_from_clipboard`.
+    fn read_clipboard_mime(&self, _mime_type: &str) -> Option<Vec<u8>> {
+        None
+    }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
@@ -1512,6 +1525,19 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// DUET PATCH (T-5.3.3): arbitrary MIME-typed payloads offered
+    /// alongside the entry's text -- `text/uri-list` and the GNOME/KDE
+    /// file-clipboard markers. Backends that can't offer custom types
+    /// ignore it.
+    Custom(ClipboardCustom),
+}
+
+/// DUET PATCH (T-5.3.3): custom MIME payloads for a clipboard item, in
+/// offer order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardCustom {
+    /// `(mime type, bytes)` pairs; each type is offered once.
+    pub payloads: Vec<(String, Vec<u8>)>,
 }
 
 impl ClipboardItem {
@@ -1546,6 +1572,44 @@ impl ClipboardItem {
         Self {
             entries: vec![ClipboardEntry::Image(image.clone())],
         }
+    }
+
+    /// DUET PATCH (T-5.3.3): an item carrying `text` for ordinary paste
+    /// targets plus custom MIME payloads for applications that negotiate
+    /// them (file managers reading `text/uri-list`).
+    pub fn new_string_with_custom(text: String, payloads: Vec<(String, Vec<u8>)>) -> Self {
+        Self {
+            entries: vec![
+                ClipboardEntry::String(ClipboardString::new(text)),
+                ClipboardEntry::Custom(ClipboardCustom { payloads }),
+            ],
+        }
+    }
+
+    /// DUET PATCH (T-5.3.3): the custom payload for `mime_type`, if this
+    /// item carries one.
+    pub fn custom_payload(&self, mime_type: &str) -> Option<&[u8]> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Custom(custom) => custom
+                .payloads
+                .iter()
+                .find(|(mime, _)| mime == mime_type)
+                .map(|(_, bytes)| bytes.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// DUET PATCH (T-5.3.3): every custom MIME type this item offers.
+    pub fn custom_mime_types(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .flat_map(|entry| match entry {
+                ClipboardEntry::Custom(custom) => {
+                    custom.payloads.iter().map(|(mime, _)| mime.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     /// Concatenates together all the ClipboardString entries in the item.

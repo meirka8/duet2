@@ -70,6 +70,14 @@ pub trait LinuxClient {
     fn write_to_clipboard(&self, item: ClipboardItem);
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    /// DUET PATCH (T-5.3.3): see `Platform::clipboard_mime_types`.
+    fn clipboard_mime_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// DUET PATCH (T-5.3.3): see `Platform::read_clipboard_mime`.
+    fn read_clipboard_mime(&self, _mime_type: &str) -> Option<Vec<u8>> {
+        None
+    }
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
@@ -587,6 +595,16 @@ impl<P: LinuxClient + 'static> Platform for P {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.read_from_clipboard()
+    }
+
+    // DUET PATCH (T-5.3.3)
+    fn clipboard_mime_types(&self) -> Vec<String> {
+        LinuxClient::clipboard_mime_types(self)
+    }
+
+    // DUET PATCH (T-5.3.3)
+    fn read_clipboard_mime(&self, mime_type: &str) -> Option<Vec<u8>> {
+        LinuxClient::read_clipboard_mime(self, mime_type)
     }
 
     fn add_recent_document(&self, _path: &Path) {}

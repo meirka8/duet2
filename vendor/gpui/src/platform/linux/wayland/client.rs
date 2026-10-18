@@ -828,15 +828,34 @@ impl LinuxClient for WaylandClient {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+            // DUET PATCH (T-5.3.3): custom MIME payloads are offered
+            // alongside the text; text types only when there is text.
+            let custom_mime_types = item.custom_mime_types();
+            let has_text = item.text().is_some();
             state.clipboard.set(item);
             let serial = state.serial_tracker.get(SerialKind::KeyPress);
             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
-            for mime_type in TEXT_MIME_TYPES {
-                data_source.offer(mime_type.to_string());
+            if has_text || custom_mime_types.is_empty() {
+                for mime_type in TEXT_MIME_TYPES {
+                    data_source.offer(mime_type.to_string());
+                }
+            }
+            for mime_type in custom_mime_types {
+                data_source.offer(mime_type);
             }
             data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial);
         }
+    }
+
+    // DUET PATCH (T-5.3.3)
+    fn clipboard_mime_types(&self) -> Vec<String> {
+        self.0.borrow_mut().clipboard.offered_mime_types()
+    }
+
+    // DUET PATCH (T-5.3.3)
+    fn read_clipboard_mime(&self, mime_type: &str) -> Option<Vec<u8>> {
+        self.0.borrow_mut().clipboard.read_mime(mime_type)
     }
 
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
