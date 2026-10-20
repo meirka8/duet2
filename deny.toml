@@ -26,6 +26,11 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste via gpui-component, pulp and rav1e (gpui image stack)" },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via stacksafe-macro, a gpui dependency" },
     { id = "RUSTSEC-2024-0384", reason = "instant via notify-types 1.0 (notify 7); revisit at the next notify bump" },
+    # Published 2026-10; all four reach us only through gpui/gpui-component.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml <- rust-i18n <- gpui-component 0.5.1" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant via zbus <- oo7 (keyring) <- gpui 0.2.2; Duet does not use gpui's credential API" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names via zbus <- oo7 <- gpui 0.2.2" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via zbus <- oo7 <- gpui 0.2.2" },
 ]
 
 [licenses]
