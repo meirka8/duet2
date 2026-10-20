@@ -215,3 +215,28 @@ vendored gpui with a selection owner that answers `TARGETS` with every
 custom type (and the text types), the same DUET PATCH shape as the
 Wayland one.
 
+## FR-TOOL-06 / T-5.3.5: the command line has no job control and captures output only
+
+**Symptom:** a command started with Enter runs to completion; there is
+no key to interrupt or kill it (Ctrl+C in the field is text copy, per
+Appendix A.1.1), and a command that waits for input (`sudo`, `vim`,
+`less` without a pipe) sits there with stdin closed. The output pane
+shows the last 2000 lines of combined stdout/stderr as plain text:
+no colours, no cursor control. Alt+F8 focuses the line and recalls the
+newest entry; there is no scrollable history *dropdown* as in TC's
+command line.
+
+**Root cause:** scope. The capture pane is a pipe reader, not a PTY;
+the real terminal (T-9.1.11, `alacritty_terminal`) is where interactive
+and screen-oriented commands belong, and Shift+Enter already hands such
+a command to the user's terminal emulator. A kill needs process-group
+signalling plumbed through the pane header, a small follow-up once the
+embedded terminal's own job model exists.
+
+**Why deferred:** the AC (`make` from the panel, Ctrl+Enter, persistent
+history) is met; interactive commands have a working route (Shift+Enter).
+
+**To close this out:** a "stop" control in the output pane header that
+sends SIGTERM to the command's process group; the history dropdown as a
+`List` overlay reusing the hotlist pattern when a TC user asks for it.
+
