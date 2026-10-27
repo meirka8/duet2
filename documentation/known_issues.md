@@ -223,8 +223,8 @@ Appendix A.1.1), and a command that waits for input (`sudo`, `vim`,
 `less` without a pipe) sits there with stdin closed. The output pane
 shows the last 2000 lines of combined stdout/stderr as plain text:
 no colours, no cursor control. Alt+F8 focuses the line and recalls the
-newest entry; there is no scrollable history *dropdown* as in TC's
-command line.
+newest entry and Ctrl+` toggles focus between panel and command line;
+there is no scrollable history *dropdown* as in TC's command line.
 
 **Root cause:** scope. The capture pane is a pipe reader, not a PTY;
 the real terminal (T-9.1.11, `alacritty_terminal`) is where interactive

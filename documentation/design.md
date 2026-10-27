@@ -807,13 +807,14 @@ Both are marked `Adopt, friction flagged` in the table below rather than `Adopt`
 
 ### A.4 Additions beyond TC (net-new bindings; not in `docs/keymap-tc.csv` because they are not TC bindings)
 
-These three are Duet-only additions layered on top of the TC-faithful base, chosen because they occupy chords TC does **not** claim at the panel level (so nothing gets clobbered) and each maps to an extremely well-established, near-universal Linux desktop convention:
+These four are Duet-only additions layered on top of the TC-faithful base, chosen because they occupy chords TC does **not** claim at the panel level (so nothing gets clobbered) and each maps to an extremely well-established, near-universal Linux desktop convention:
 
 | Key | Command | Rationale |
 |---|---|---|
 | `Ctrl+H` | `panel.toggle_hidden` | Universal GTK/Nautilus/Thunar/PCManFM convention for toggling hidden-file visibility. TC's own binding for this is `uncertain` in the source table (best guess `Ctrl+F8`, unverified) — Duet ships `Ctrl+H` as the reliable primary and keeps `Ctrl+F8` as a secondary alias once/if verified, rather than leaving the feature bound only to an unconfirmed chord. |
 | `Ctrl+L` | `cmdline.focus_path` | Universal browser/Nautilus convention for jumping to a location/address bar. TC does not bind bare `Ctrl+L` to anything at the panel level. |
 | `F11` | `window.toggle_fullscreen` | Universal Linux desktop convention for fullscreen toggle. Not bound by TC by default. |
+| `Ctrl+`` | `cmdline.focus` (toggle) | Focus the command line from a panel, or the active panel from the command line, without touching the line's text. The VS Code / terminal-toggle convention. TC needs no such key because typed letters go to its command line; in Duet typed letters are quick-search (FR-NAV-13), so a dedicated chord is required. `Alt+F8` keeps its TC meaning (focus + recall). Added after T-5.3.5 UAT. |
 
 None of these override existing P1 muscle memory, since TC never claimed the chords in the first place — they're pure additions, not deviations, and are listed here rather than in `docs/keymap-tc.csv` because that file is scoped to TC's *own* keymap, not Duet's superset.
 

@@ -137,7 +137,12 @@ actions!(duet_workspace, [OpenDefault, OpenWith]);
 // palette.
 actions!(
     duet_workspace,
-    [CmdlineInsertName, CmdlineInsertPath, CmdlineFocusHistory]
+    [
+        CmdlineInsertName,
+        CmdlineInsertPath,
+        CmdlineFocusHistory,
+        CmdlineToggleFocus
+    ]
 );
 
 // T-5.3.3 (FR-CFG-05): the file clipboard. `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
@@ -319,6 +324,11 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-enter", CmdlineInsertName, Some("FileTable")),
         KeyBinding::new("ctrl-shift-enter", CmdlineInsertPath, Some("FileTable")),
         KeyBinding::new("alt-f8", CmdlineFocusHistory, Some("Workspace")),
+        // Duet addition (design.md Appendix A.4): a plain focus toggle
+        // between the active panel and the command line. TC needs none
+        // because typed letters go to its command line; here they are
+        // quick-search (FR-NAV-13). The VS Code / terminal-toggle chord.
+        KeyBinding::new("ctrl-`", CmdlineToggleFocus, Some("Workspace")),
     ]);
 }
 
@@ -3813,6 +3823,23 @@ impl Workspace {
         });
     }
 
+    /// `Ctrl+`` (`cmdline.focus` as a toggle, Appendix A.4): into the
+    /// command line when a panel has focus, back to the last-active panel
+    /// when the command line has it. No recall, no text change -- the
+    /// keyboard-only counterpart of clicking the field.
+    fn toggle_command_line_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let in_command_line = self
+            .command_line
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        if in_command_line {
+            self.focus_active_panel(window, cx);
+        } else {
+            self.focus_command_line(false, window, cx);
+        }
+    }
+
     fn status_bar_row(&self, cx: &Context<Self>) -> impl IntoElement {
         let tokens = TokenPalette::current(cx);
         let status_text: SharedString = match &self.demo {
@@ -4009,6 +4036,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CmdlineFocusHistory, window, cx| {
                 this.focus_command_line(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CmdlineToggleFocus, window, cx| {
+                this.toggle_command_line_focus(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopyFiles, window, cx| {
                 this.copy_files_to_clipboard(false, window, cx);
@@ -7307,6 +7337,42 @@ mod tests {
             cl.replace_text(text.to_string(), window, cx)
         });
         cl
+    }
+
+    /// `Ctrl+`` toggles keyboard focus between the active panel and the
+    /// command line without touching the line's text (UAT of T-5.3.5:
+    /// Alt+F8 recalls, Esc peels layers -- neither is a plain jump).
+    #[gpui::test]
+    fn ctrl_backtick_toggles_focus_between_panel_and_command_line(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let cl = workspace.read_with(vcx, |ws, _| ws.command_line.clone());
+            let cl_focused = |vcx: &mut VisualTestContext| {
+                let handle = cl.read_with(vcx, |cl, cx| cl.focus_handle(cx));
+                vcx.update(|window, _| handle.is_focused(window))
+            };
+            let panel_focused = |vcx: &mut VisualTestContext| {
+                let handle = workspace
+                    .read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+                vcx.update(|window, _| handle.is_focused(window))
+            };
+            assert!(panel_focused(vcx) && !cl_focused(vcx));
+
+            vcx.dispatch_action(CmdlineToggleFocus);
+            assert!(cl_focused(vcx), "first press: into the command line");
+            assert_eq!(
+                cl.read_with(vcx, |cl, cx| cl.value(cx)),
+                "",
+                "no recall, no text"
+            );
+
+            vcx.dispatch_action(CmdlineToggleFocus);
+            assert!(
+                panel_focused(vcx) && !cl_focused(vcx),
+                "second press: back to the panel"
+            );
+        });
     }
 
     /// Enter runs the line in the active panel's directory, the output
