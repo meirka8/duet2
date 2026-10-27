@@ -24,7 +24,6 @@ use duet_platform::clipboard::CutMarkerConvention;
 use duet_types::{UnixPathBuf, VPath};
 use duet_vfs::{FileSystem, ListOpts, LocalFs};
 use duet_widgets::{
-    input::{Input, InputState},
     layout::{Root, TitleBar, WindowExt, h_flex, v_flex},
     list::{IndexPath, List, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel},
@@ -45,6 +44,7 @@ use crate::attributes_dialog::{
 };
 use crate::clipboard::{self, CutMarks};
 use crate::columns::{ColumnLayout, ColumnLayoutStore};
+use crate::command_line::CommandLineState;
 use crate::command_palette::CommandPaletteDelegate;
 use crate::conflict_dialog::{
     ConflictDialogState, ConflictRequest, InteractiveConflictResolver, bind_conflict_dialog_keys,
@@ -127,6 +127,23 @@ actions!(
 // but both are in the command palette and the row context menu, and
 // Enter on a file is `OpenDefault`'s everyday form.
 actions!(duet_workspace, [OpenDefault, OpenWith]);
+
+// T-5.3.5 (FR-TOOL-06): the command line's panel-side keys. `Ctrl+Enter`
+// / `Ctrl+Shift+Enter` insert the cursor entry (TC's `cmdline.insert_name`
+// / `insert_path`); `Alt+F8` (TC's `cmdline.history`) focuses the command
+// line with the newest entry recalled. `Ctrl+P` (`cmdline.insert_
+// current_path`, an *inferred* TC chord) is deliberately not bound: it is
+// the quick-filter toggle here (FR-NAV-07, UAT'd); the command is in the
+// palette.
+actions!(
+    duet_workspace,
+    [
+        CmdlineInsertName,
+        CmdlineInsertPath,
+        CmdlineFocusHistory,
+        CmdlineToggleFocus
+    ]
+);
 
 // T-5.3.3 (FR-CFG-05): the file clipboard. `Ctrl+C`/`Ctrl+X`/`Ctrl+V`
 // are bound in the `FileTable` context only (design.md Appendix A.1.1:
@@ -304,6 +321,14 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", CutFiles, Some("FileTable")),
         KeyBinding::new("ctrl-v", PasteFiles, Some("FileTable")),
         KeyBinding::new("shift-insert", PasteFiles, Some("FileTable")),
+        KeyBinding::new("ctrl-enter", CmdlineInsertName, Some("FileTable")),
+        KeyBinding::new("ctrl-shift-enter", CmdlineInsertPath, Some("FileTable")),
+        KeyBinding::new("alt-f8", CmdlineFocusHistory, Some("Workspace")),
+        // Duet addition (design.md Appendix A.4): a plain focus toggle
+        // between the active panel and the command line. TC needs none
+        // because typed letters go to its command line; here they are
+        // quick-search (FR-NAV-13). The VS Code / terminal-toggle chord.
+        KeyBinding::new("ctrl-`", CmdlineToggleFocus, Some("Workspace")),
     ]);
 }
 
@@ -338,6 +363,7 @@ pub fn run() {
     Application::new().run(move |cx: &mut App| {
         duet_widgets::init(cx);
         bind_workspace_keys(cx);
+        crate::command_line::bind_command_line_keys(cx);
         crate::file_table::bind_file_table_keys(cx);
         bind_panel_keys(cx);
         bind_copy_move_dialog_keys(cx);
@@ -500,7 +526,7 @@ fn spawn_window_chrome_cycle_if_requested(window: &mut Window, cx: &mut App) {
 /// consumer for the concrete case this exists for. GPUI's executors have
 /// no `yield_now` of their own; this is the minimal, executor-agnostic
 /// equivalent.
-fn yield_once() -> impl std::future::Future<Output = ()> {
+pub(crate) fn yield_once() -> impl std::future::Future<Output = ()> {
     let mut yielded = false;
     std::future::poll_fn(move |cx| {
         if yielded {
@@ -610,7 +636,12 @@ pub struct Workspace {
     right_panel: Entity<Panel>,
 
     function_keys: Vec<FKeySlot>,
-    command_line: Entity<InputState>,
+    /// T-5.3.5: the command line (`command_line.rs`).
+    command_line: Entity<CommandLineState>,
+    /// The panel that last held keyboard focus -- what the command line
+    /// runs in and inserts from, since the panels have no focus while the
+    /// command line is being typed into. Updated in `render`.
+    last_active_side: PanelSide,
 
     /// `~/.config/duet/settings.toml` (or `None` if `$HOME`/
     /// `$XDG_CONFIG_HOME` can't be resolved -- splitter-ratio persistence
@@ -1075,9 +1106,23 @@ impl Workspace {
             .map(load_delete_default_permanent)
             .unwrap_or(false);
 
+        // T-5.3.5: the command line runs `terminal.shell` with the active
+        // panel's directory as cwd; its history lives under the state dir.
+        let shell = settings_path
+            .as_deref()
+            .map(load_shell)
+            .unwrap_or_else(|| crate::command_line::resolve_shell("$SHELL"));
+        let history_path = duet_config::paths::cmdline_history_path().ok();
+        let weak_workspace = cx.weak_entity();
         let command_line = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Command line (not wired to a shell yet -- T-5.3.5)")
+            CommandLineState::new(
+                weak_workspace,
+                tokio_handle.clone(),
+                shell,
+                history_path,
+                window,
+                cx,
+            )
         });
 
         // T-4.2.1: the process's current directory is every fallback tab's
@@ -1405,6 +1450,7 @@ impl Workspace {
             right_panel,
             function_keys: function_bar::build_function_bar(),
             command_line,
+            last_active_side: PanelSide::Left,
             settings_path,
             session_path,
             pending_notice,
@@ -1629,6 +1675,50 @@ impl Workspace {
             PanelSide::Right => self.right_panel.clone(),
         };
         let handled = match id.as_str() {
+            "cmdline.focus" => {
+                self.focus_command_line(false, window, cx);
+                true
+            }
+            "cmdline.execute" => {
+                self.command_line
+                    .update(cx, |cl, cx| cl.execute(false, window, cx));
+                true
+            }
+            "cmdline.insert_name" => {
+                self.insert_cursor_name_into_command_line(false, window, cx);
+                true
+            }
+            "cmdline.insert_path" => {
+                self.insert_cursor_name_into_command_line(true, window, cx);
+                true
+            }
+            "cmdline.insert_current_path" => {
+                let (_, dir, _) = self.command_line_context(cx);
+                let quoted = crate::command_line::shell_quote(&dir.to_string_lossy());
+                self.command_line
+                    .update(cx, |cl, cx| cl.append_token(&quoted, window, cx));
+                true
+            }
+            "cmdline.history_prev" => {
+                self.command_line
+                    .update(cx, |cl, cx| cl.history_prev(window, cx));
+                true
+            }
+            "cmdline.history_next" => {
+                self.command_line
+                    .update(cx, |cl, cx| cl.history_next(window, cx));
+                true
+            }
+            "cmdline.complete" => {
+                self.command_line
+                    .update(cx, |cl, cx| cl.complete(false, window, cx));
+                true
+            }
+            "cmdline.clear" => {
+                self.command_line
+                    .update(cx, |cl, cx| cl.replace_text(String::new(), window, cx));
+                true
+            }
             "clipboard.copy" => {
                 self.copy_files_to_clipboard(false, window, cx);
                 true
@@ -3633,24 +3723,121 @@ impl Workspace {
             )
     }
 
-    fn command_line_row(&self, cx: &Context<Self>) -> impl IntoElement {
-        let tokens = TokenPalette::current(cx);
-        h_flex()
+    /// T-5.3.5: the command line entity, in a wrapper that stops the
+    /// workspace root's focus-on-mouse-down from stealing the click (the
+    /// same `prevent_default` the titlebar needed, PR #60).
+    fn command_line_row(&self, _cx: &Context<Self>) -> impl IntoElement {
+        gpui::div()
             .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .bg(tokens.color.panel_bg_active)
-            .border_t_1()
-            .border_color(tokens.color.border_default)
-            .items_center()
-            .child(
-                gpui::div()
-                    .text_color(tokens.color.accent)
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child("$"),
-            )
-            .child(gpui::div().flex_1().child(Input::new(&self.command_line)))
+            .on_mouse_down(gpui::MouseButton::Left, |_event, window, _cx| {
+                window.prevent_default();
+            })
+            .child(self.command_line.clone())
+    }
+
+    /// Which panel currently holds keyboard focus, if either does.
+    fn panel_side_with_focus(&self, window: &Window, cx: &App) -> Option<PanelSide> {
+        if self
+            .left_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window)
+        {
+            Some(PanelSide::Left)
+        } else if self
+            .right_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window)
+        {
+            Some(PanelSide::Right)
+        } else {
+            None
+        }
+    }
+
+    /// T-5.3.5: what the command line runs in and inserts from -- the last
+    /// active panel's side, directory and cursor entry name.
+    pub(crate) fn command_line_context(&self, cx: &App) -> (PanelSide, PathBuf, Option<String>) {
+        let panel = match self.last_active_side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let table = panel.read(cx).active_table().read(cx);
+        (
+            self.last_active_side,
+            table.current_dir().to_path_buf(),
+            table.cursor_entry_name(cx),
+        )
+    }
+
+    /// Both panels reread on the next frame (a command, like a finished
+    /// job, may have changed either directory).
+    pub(crate) fn request_panel_refresh(&mut self, cx: &mut Context<Self>) {
+        self.pending_panel_refresh = true;
+        cx.notify();
+    }
+
+    /// Focus back to the last active panel (Esc in an empty command line).
+    pub(crate) fn focus_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = match self.last_active_side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let handle = panel.read(cx).active_focus_handle(cx);
+        window.focus(&handle);
+    }
+
+    /// `cmdline.insert_name` / `cmdline.insert_path` (Ctrl+Enter /
+    /// Ctrl+Shift+Enter): the cursor entry's name or full path, shell-
+    /// quoted, appended to the command line. Focus stays where it is, as
+    /// in TC -- the user is either typing a command or picking files.
+    pub(crate) fn insert_cursor_name_into_command_line(
+        &mut self,
+        full_path: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (_, dir, name) = self.command_line_context(cx);
+        let Some(name) = name else {
+            return;
+        };
+        let text = if full_path {
+            dir.join(&name).to_string_lossy().into_owned()
+        } else {
+            name
+        };
+        let quoted = crate::command_line::shell_quote(&text);
+        self.command_line
+            .update(cx, |cl, cx| cl.append_token(&quoted, window, cx));
+    }
+
+    /// `Alt+F8` (`cmdline.history`): focus the command line and recall the
+    /// newest entry -- TC's way into the command line's history.
+    fn focus_command_line(&mut self, recall: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.command_line.update(cx, |cl, cx| {
+            cl.focus(window, cx);
+            if recall {
+                cl.history_prev(window, cx);
+            }
+        });
+    }
+
+    /// `Ctrl+`` (`cmdline.focus` as a toggle, Appendix A.4): into the
+    /// command line when a panel has focus, back to the last-active panel
+    /// when the command line has it. No recall, no text change -- the
+    /// keyboard-only counterpart of clicking the field.
+    fn toggle_command_line_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let in_command_line = self
+            .command_line
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        if in_command_line {
+            self.focus_active_panel(window, cx);
+        } else {
+            self.focus_command_line(false, window, cx);
+        }
     }
 
     fn status_bar_row(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -3809,6 +3996,11 @@ impl Render for Workspace {
         // re-navigates. See `pending_panel_refresh`'s own doc comment for
         // why this always refreshes both panels rather than trying to
         // track exactly which directories a given job touched.
+        // T-5.3.5: remember which panel the user is working in, so the
+        // command line knows its cwd once it has taken the focus itself.
+        if let Some(side) = self.panel_side_with_focus(window, cx) {
+            self.last_active_side = side;
+        }
         if std::mem::take(&mut self.pending_panel_refresh) {
             for panel in [&self.left_panel, &self.right_panel] {
                 let table = panel.read(cx).active_table().clone();
@@ -3835,6 +4027,18 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
                 this.open_command_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CmdlineInsertName, window, cx| {
+                this.insert_cursor_name_into_command_line(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CmdlineInsertPath, window, cx| {
+                this.insert_cursor_name_into_command_line(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CmdlineFocusHistory, window, cx| {
+                this.focus_command_line(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CmdlineToggleFocus, window, cx| {
+                this.toggle_command_line_focus(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopyFiles, window, cx| {
                 this.copy_files_to_clipboard(false, window, cx);
@@ -4903,6 +5107,17 @@ fn load_column_layout(path: &std::path::Path) -> ColumnLayout {
         })
 }
 
+/// Reads `terminal.shell` (T-5.3.5) from `settings.toml` at `path` and
+/// resolves it (`$SHELL` expanded, `/bin/sh` fallback); same tolerance as
+/// [`load_splitter_ratio`].
+fn load_shell(path: &std::path::Path) -> String {
+    let setting = duet_config::settings::load(path)
+        .and_then(|file| file.typed())
+        .map(|settings| settings.terminal.shell)
+        .unwrap_or_else(|_| duet_config::Settings::default().terminal.shell);
+    crate::command_line::resolve_shell(&setting)
+}
+
 /// Reads `clipboard.cut_marker_convention` (T-5.3.3) from `settings.toml`
 /// at `path`, same fallback tolerance as [`load_splitter_ratio`].
 fn load_cut_marker_convention(path: &std::path::Path) -> CutMarkerConvention {
@@ -5467,6 +5682,7 @@ mod tests {
             duet_widgets::theme::TokenPalette::built_in(duet_widgets::theme::ThemeMode::Dark)
                 .install(cx);
             bind_workspace_keys(cx);
+            crate::command_line::bind_command_line_keys(cx);
             crate::file_table::bind_file_table_keys(cx);
             bind_panel_keys(cx);
             bind_copy_move_dialog_keys(cx);
@@ -7105,6 +7321,198 @@ mod tests {
                 vcx.update(|_, cx| clipboard::read_files(cx)).is_none(),
                 "the clipboard is emptied after a cut is pasted"
             );
+        });
+    }
+
+    /// T-5.3.5: focuses the command line and replaces its text.
+    fn type_into_command_line(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        text: &str,
+    ) -> Entity<CommandLineState> {
+        let cl = workspace.read_with(vcx, |ws, _| ws.command_line.clone());
+        let handle = cl.read_with(vcx, |cl, cx| cl.focus_handle(cx));
+        vcx.update(|window, _| window.focus(&handle));
+        cl.update_in(vcx, |cl, window, cx| {
+            cl.replace_text(text.to_string(), window, cx)
+        });
+        cl
+    }
+
+    /// `Ctrl+`` toggles keyboard focus between the active panel and the
+    /// command line without touching the line's text (UAT of T-5.3.5:
+    /// Alt+F8 recalls, Esc peels layers -- neither is a plain jump).
+    #[gpui::test]
+    fn ctrl_backtick_toggles_focus_between_panel_and_command_line(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let cl = workspace.read_with(vcx, |ws, _| ws.command_line.clone());
+            let cl_focused = |vcx: &mut VisualTestContext| {
+                let handle = cl.read_with(vcx, |cl, cx| cl.focus_handle(cx));
+                vcx.update(|window, _| handle.is_focused(window))
+            };
+            let panel_focused = |vcx: &mut VisualTestContext| {
+                let handle = workspace
+                    .read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+                vcx.update(|window, _| handle.is_focused(window))
+            };
+            assert!(panel_focused(vcx) && !cl_focused(vcx));
+
+            vcx.dispatch_action(CmdlineToggleFocus);
+            assert!(cl_focused(vcx), "first press: into the command line");
+            assert_eq!(
+                cl.read_with(vcx, |cl, cx| cl.value(cx)),
+                "",
+                "no recall, no text"
+            );
+
+            vcx.dispatch_action(CmdlineToggleFocus);
+            assert!(
+                panel_focused(vcx) && !cl_focused(vcx),
+                "second press: back to the panel"
+            );
+        });
+    }
+
+    /// Enter runs the line in the active panel's directory, the output
+    /// pane shows what it printed, the exit status is recorded, the line
+    /// is in the history file, and Up recalls it.
+    #[gpui::test]
+    fn command_line_runs_in_the_active_panel_directory_and_keeps_history(cx: &mut TestAppContext) {
+        use crate::command_line::{ExitStatus, HistoryPrev};
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            let line = "printf 'alpha\\nbeta\\n'; pwd; exit 3";
+            let cl = type_into_command_line(&workspace, vcx, line);
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+            wait_until(vcx, |vcx| {
+                cl.read_with(vcx, |cl, _| {
+                    cl.run_info().is_some_and(|r| r.status.is_some())
+                })
+            });
+            cl.read_with(vcx, |cl, cx| {
+                let run = cl.run_info().unwrap();
+                assert_eq!(run.line, line);
+                assert_eq!(run.cwd, dir.path());
+                assert_eq!(run.status.unwrap().0, ExitStatus::Code(3));
+                let lines: Vec<&str> = cl.output_lines().collect();
+                assert!(
+                    lines.contains(&"alpha") && lines.contains(&"beta"),
+                    "{lines:?}"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|l| l.starts_with(dir.path().to_str().unwrap())),
+                    "pwd printed the panel's directory: {lines:?}"
+                );
+                assert_eq!(cl.value(cx), "", "the field is cleared after Enter");
+                assert_eq!(cl.history().get(cl.history().len() - 1), Some(line));
+            });
+            let history_file = duet_config::paths::cmdline_history_path().unwrap();
+            wait_until(vcx, |_| history_file.exists());
+            assert!(
+                std::fs::read_to_string(&history_file)
+                    .unwrap()
+                    .contains(line)
+            );
+
+            vcx.dispatch_action(HistoryPrev);
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), line, "Up recalls");
+        });
+    }
+
+    /// `cd <dir>` never reaches the shell: it navigates the active panel.
+    #[gpui::test]
+    fn command_line_cd_navigates_the_active_panel(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            let sub = dir.path().join("sub dir");
+            std::fs::create_dir(&sub).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            let cl = type_into_command_line(&workspace, vcx, "cd 'sub dir'");
+            vcx.dispatch_action(duet_widgets::input::Enter { secondary: false });
+            let left =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left.read_with(vcx, |t, _| t.current_dir() == sub)
+            });
+            assert!(
+                cl.read_with(vcx, |cl, _| cl.run_info().is_none()),
+                "no process was run"
+            );
+        });
+    }
+
+    /// Ctrl+Enter / Ctrl+Shift+Enter from the panel append the cursor
+    /// entry, quoted when it needs it; Tab completes a path token.
+    #[gpui::test]
+    fn command_line_inserts_the_cursor_entry_and_completes_paths(cx: &mut TestAppContext) {
+        use duet_widgets::input::IndentInline;
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a b.txt"), b"x").unwrap();
+            std::fs::write(dir.path().join("main.rs"), b"x").unwrap();
+            std::fs::create_dir(dir.path().join("my_dir")).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let left =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left.read_with(vcx, |t, cx| {
+                    t.state().read(cx).delegate().model().order().len() == 3
+                })
+            });
+            // Directories sort first: row 0 is `my_dir`, row 1 is `a b.txt`.
+            vcx.dispatch_action(crate::file_table::CursorDown);
+            wait_until(vcx, |vcx| {
+                left.read_with(vcx, |t, cx| {
+                    t.cursor_entry_name(cx).as_deref() == Some("a b.txt")
+                })
+            });
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            let cl = workspace.read_with(vcx, |ws, _| ws.command_line.clone());
+
+            vcx.dispatch_action(CmdlineInsertName);
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), "'a b.txt' ");
+            vcx.dispatch_action(CmdlineInsertPath);
+            let expected_path =
+                crate::command_line::shell_quote(&dir.path().join("a b.txt").to_string_lossy());
+            assert_eq!(
+                cl.read_with(vcx, |cl, cx| cl.value(cx)),
+                format!("'a b.txt' {expected_path} ")
+            );
+            // Inserting never moves focus away from the panel (TC: you are
+            // either picking files or typing; the keys work from both).
+            let panel_handle = left.read_with(vcx, |t, cx| t.focus_handle(cx));
+            assert!(vcx.update(|window, _| panel_handle.is_focused(window)));
+
+            // Tab completion of a path token, typed in the command line.
+            type_into_command_line(&workspace, vcx, "cat ma");
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                cl.read_with(vcx, |cl, cx| cl.value(cx) == "cat main.rs ")
+            });
+            assert!(cl.read_with(vcx, |cl, _| cl.completion_candidates().is_empty()));
+
+            // Ambiguous: no fill, both candidates listed; Tab cycles, Shift+Tab back.
+            type_into_command_line(&workspace, vcx, "cat m");
+            vcx.dispatch_action(IndentInline);
+            wait_until(vcx, |vcx| {
+                cl.read_with(vcx, |cl, _| {
+                    cl.completion_candidates() == ["main.rs", "my_dir"]
+                })
+            });
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), "cat m");
+            vcx.dispatch_action(IndentInline);
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), "cat main.rs ");
+            vcx.dispatch_action(IndentInline);
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), "cat my_dir/");
+            vcx.dispatch_action(duet_widgets::input::OutdentInline);
+            assert_eq!(cl.read_with(vcx, |cl, cx| cl.value(cx)), "cat main.rs ");
         });
     }
 

@@ -71,6 +71,10 @@ mod watch;
 pub use document::ConfigFile;
 pub use error::{ConfigError, Result};
 pub use hotlist::{Hotlist, HotlistEntry, HotlistFile};
+/// The atomic write-then-rename used for every file this crate owns, for
+/// callers that keep their own plain-text state files (the command-line
+/// history, T-5.3.5).
+pub use io::atomic_write;
 pub use migrate::{Migration, MigrationRegistry};
 pub use session::{Session, SessionPanel, SessionSortColumn, SessionTab};
 pub use settings::{ColumnLayout, ColumnSpec, Settings, SettingsFile};

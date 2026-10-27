@@ -208,7 +208,7 @@ Validated with Python's `tomllib` — parses cleanly.
 | `appearance.row_height` | enum | `"compact"` | `compact` \| `comfortable` \| `spacious` | Table row density. |
 | `appearance.icon_theme` | string | `"system"` | `"system"` \| an installed XDG icon theme name | Icon theme resolution root (R-G5, T-4.2.6). `"system"` detects the desktop's theme: `$DUET_ICON_THEME`, then `gtk-icon-theme-name` in `gtk-4.0`/`gtk-3.0/settings.ini`, then `gsettings get org.gnome.desktop.interface icon-theme`, else `Adwaita`; `hicolor` is always the last fallback. Read once at startup. |
 | `appearance.show_icons` | bool | `true` | — | Disable to render text-only rows (accessibility / low-end GPU escape hatch). |
-| `terminal.shell` | string | `"$SHELL"` | any executable path or env-var reference | Shell used by the embedded command line and terminal panel. |
+| `terminal.shell` | string | `"$SHELL"` | any executable path or env-var reference | Shell used by the embedded command line and terminal panel. `$VAR`/`${VAR}` is expanded at startup; an empty or non-executable result falls back to `/bin/sh`. The command line (T-5.3.5) runs each entered line as `<shell> -c <line>` with the active panel's directory as cwd. |
 | `terminal.embedded_terminal_enabled` | bool | `false` | — | FR-TOOL-07 toggle for the embedded terminal panel. |
 | `clipboard.cut_marker_convention` | enum | `"auto"` | `auto` \| `gnome` \| `kde` | Which cut-marker MIME convention to emit/read for FR-CFG-05 interop; `auto` emits both and reads either. |
 | `logging.log_level` | enum | `"info"` | `error` \| `warn` \| `info` \| `debug` \| `trace` | Default `tracing` filter; overridable by `--log-level`/`DUET_LOG`. |
