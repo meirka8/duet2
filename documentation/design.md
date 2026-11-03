@@ -815,6 +815,10 @@ These four are Duet-only additions layered on top of the TC-faithful base, chose
 | `Ctrl+L` | `cmdline.focus_path` | Universal browser/Nautilus convention for jumping to a location/address bar. TC does not bind bare `Ctrl+L` to anything at the panel level. |
 | `F11` | `window.toggle_fullscreen` | Universal Linux desktop convention for fullscreen toggle. Not bound by TC by default. |
 | `Ctrl+`` | `cmdline.focus` (toggle) | Focus the command line from a panel, or the active panel from the command line, without touching the line's text. The VS Code / terminal-toggle convention. TC needs no such key because typed letters go to its command line; in Duet typed letters are quick-search (FR-NAV-13), so a dedicated chord is required. `Alt+F8` keeps its TC meaning (focus + recall). Added after T-5.3.5 UAT. |
+| `Ctrl+E` (viewer) | `view.set_encoding` | Cycle the text encoding override in the viewer (UTF-8, windows-1252/1251/1255, KOI8-R, UTF-16 LE/BE). TC's Lister uses bare letter keys (`A`/`S`/`V`) which are `uncertain` in the source table; one chord that cycles is the smaller surface. Added with T-5.3.6. |
+| `F7` (viewer) | `view.search` | Second key for find in the viewer, next to `Ctrl+F`: TC's Lister binds F7 to Find and many hands reach for it. |
+| `Enter` / `Shift+Enter` (viewer find bar) | `view.search_next` / `view.search_prev` | Find next/previous while the find bar has focus (the browser convention). The viewer body has no find-next key because Appendix A gives F3 to "close" pending hands-on verification. |
+| `Ctrl+4` (viewer) | `view.mode_image` | Image mode, continuing TC's `Ctrl+1/2/3` text/hex/binary row (TC's own image mode is `4`, `uncertain`). |
 
 None of these override existing P1 muscle memory, since TC never claimed the chords in the first place — they're pure additions, not deviations, and are listed here rather than in `docs/keymap-tc.csv` because that file is scoped to TC's *own* keymap, not Duet's superset.
 
