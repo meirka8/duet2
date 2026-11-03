@@ -35,7 +35,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Application, Bounds, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
     WindowOptions, actions, px, size,
 };
 
@@ -68,7 +68,7 @@ use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
 use crate::trash_dialog::{TrashDialogState, bind_trash_dialog_keys};
 use crate::view_mode::ViewMode;
-use crate::viewer::ViewerState;
+use crate::viewer::{QuickTarget, ViewerState};
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
 // splitter ratio without touching the mouse. Bound below to `ctrl-left`/
@@ -291,6 +291,12 @@ actions!(duet_workspace, [GotoPath]);
 // command line, or the viewer itself (where F3 closes).
 actions!(duet_workspace, [ViewFile]);
 
+// T-5.3.8's quick view (`panel.quick_view`, FR-TOOL-02): Ctrl+Q turns the
+// inactive panel into a live preview of the cursor entry, Total
+// Commander's own key. `Workspace` context so a second Ctrl+Q from inside
+// the preview turns it off again.
+actions!(duet_workspace, [QuickViewToggle]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -324,6 +330,10 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("alt-t", OpenTrashDialog, Some("Workspace")),
         KeyBinding::new("ctrl-l", GotoPath, Some("FileTable")),
         KeyBinding::new("f3", ViewFile, Some("FileTable")),
+        KeyBinding::new("ctrl-q", QuickViewToggle, Some("Workspace")),
+        // Tab from inside the quick view goes back to the file panel;
+        // "QuickView" is only on the embedded viewer, never the F3 one.
+        KeyBinding::new("tab", FocusOtherPanel, Some("QuickView")),
         KeyBinding::new("ctrl-c", CopyFiles, Some("FileTable")),
         KeyBinding::new("ctrl-insert", CopyFiles, Some("FileTable")),
         KeyBinding::new("ctrl-x", CutFiles, Some("FileTable")),
@@ -584,6 +594,24 @@ const COPY_MOVE_QUEUE_MAX_CONCURRENT: usize = 2;
 /// The root workspace view: the dual-pane splitter, the function-key bar,
 /// the status bar, and the command-line row (T-4.1.4), themed live by
 /// [`ThemeController`] (T-4.1.5).
+/// T-5.3.8: the quick view's bookkeeping -- see `Workspace::toggle_quick_view`.
+struct QuickView {
+    /// The panel the preview replaces; the other one is followed.
+    side: PanelSide,
+    viewer: Entity<ViewerState>,
+    /// What the preview currently shows.
+    shown: Option<QuickTarget>,
+    /// Bumped per cursor change; a debounced update applies only if it
+    /// is still the latest.
+    generation: u64,
+    observed_table: Option<Entity<FileTable>>,
+    #[allow(dead_code)] // held for their Drop
+    subscriptions: Vec<Subscription>,
+}
+
+/// How long the cursor must rest before the quick view follows it.
+const QUICK_VIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+
 pub struct Workspace {
     demo: DemoState,
     focus_handle: FocusHandle,
@@ -825,6 +853,9 @@ pub struct Workspace {
     viewer: Option<Entity<ViewerState>>,
     viewer_previous_focus: Option<FocusHandle>,
 
+    /// `Some` while T-5.3.8's quick view replaces one panel.
+    quick_view: Option<QuickView>,
+
     /// `Some` while T-5.2.7's symlink *or* hardlink dialog is open -- one
     /// field for both, since one `LinkDialogState` type serves both
     /// commands (see `crate::link_dialog`'s module doc comment) and, like
@@ -1045,6 +1076,15 @@ pub(crate) struct PendingNotice {
 pub(crate) enum PanelSide {
     Left,
     Right,
+}
+
+impl PanelSide {
+    pub(crate) fn other(self) -> Self {
+        match self {
+            PanelSide::Left => PanelSide::Right,
+            PanelSide::Right => PanelSide::Left,
+        }
+    }
 }
 
 /// Progress of the background Tokio task that lists the current
@@ -1492,6 +1532,7 @@ impl Workspace {
             rename_dialog_previous_focus: None,
             viewer: None,
             viewer_previous_focus: None,
+            quick_view: None,
             link_dialog: None,
             link_dialog_previous_focus: None,
             attributes_dialog: None,
@@ -1614,10 +1655,33 @@ impl Workspace {
             .read(cx)
             .active_focus_handle(cx)
             .is_focused(window);
-        let target = if left_focused {
-            &self.right_panel
+        let quick_view_focused = self
+            .quick_view
+            .as_ref()
+            .is_some_and(|qv| qv.viewer.read(cx).focus_handle(cx).is_focused(window));
+        let target_side = if quick_view_focused {
+            // Back to the file panel the preview follows.
+            self.quick_view
+                .as_ref()
+                .map(|qv| qv.side.other())
+                .unwrap_or(self.last_active_side)
+        } else if left_focused {
+            PanelSide::Right
         } else {
-            &self.left_panel
+            PanelSide::Left
+        };
+        if let Some(qv) = &self.quick_view
+            && qv.side == target_side
+        {
+            // T-5.3.8: the other side is the quick view; Tab lands there
+            // so its keys (scroll, hex, wrap) work.
+            let handle = qv.viewer.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            return;
+        }
+        let target = match target_side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
         };
         let handle = target.read(cx).active_focus_handle(cx);
         window.focus(&handle);
@@ -1764,6 +1828,10 @@ impl Workspace {
                 self.open_viewer(window, cx);
                 true
             }
+            "panel.quick_view" => {
+                self.toggle_quick_view(window, cx);
+                true
+            }
             other if other.starts_with("view.") => match self.viewer.clone() {
                 Some(viewer) => {
                     viewer.update(cx, |viewer, cx| viewer.run_command(other, window, cx))
@@ -1860,6 +1928,19 @@ impl Workspace {
             .is_focused(window)
         {
             PanelSide::Right
+        } else if self
+            .left_panel
+            .read(cx)
+            .active_focus_handle(cx)
+            .is_focused(window)
+        {
+            PanelSide::Left
+        } else if let Some(qv) = &self.quick_view
+            && qv.viewer.read(cx).focus_handle(cx).is_focused(window)
+        {
+            // T-5.3.8: commands from inside the preview act on the panel
+            // whose cursor it follows.
+            qv.side.other()
         } else {
             PanelSide::Left
         }
@@ -2888,6 +2969,145 @@ impl Workspace {
         table.update(cx, |table, cx| table.select_file_by_name(name, cx));
     }
 
+    /// The quick view's viewer when it sits on `side`.
+    fn quick_view_on(&self, side: PanelSide) -> Option<&Entity<ViewerState>> {
+        self.quick_view
+            .as_ref()
+            .filter(|qv| qv.side == side)
+            .map(|qv| &qv.viewer)
+    }
+
+    /// Ctrl+Q (`QuickViewToggle`, `panel.quick_view`, T-5.3.8): the panel
+    /// opposite the focused one becomes a live preview of the cursor
+    /// entry; pressing it again (or Esc in the preview) restores the
+    /// panel. Ignored while the F3 viewer is open.
+    fn toggle_quick_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            return;
+        }
+        if let Some(qv) = &self.quick_view {
+            let focused = qv.viewer.read(cx).focus_handle(cx).is_focused(window);
+            self.close_quick_view(focused, window, cx);
+            return;
+        }
+        let source = self.focused_panel_side(window, cx);
+        let side = source.other();
+        let workspace = cx.entity().downgrade();
+        let viewer = cx.new(|cx| ViewerState::new_embedded(side, workspace, window, cx));
+        self.quick_view = Some(QuickView {
+            side,
+            viewer,
+            shown: None,
+            generation: 0,
+            observed_table: None,
+            subscriptions: Vec::new(),
+        });
+        self.resubscribe_quick_view_source(cx);
+        self.sync_quick_view(cx);
+        cx.notify();
+    }
+
+    /// `preview_focused` is passed in rather than read here: the viewer
+    /// calls this from inside its own update (Esc), when reading it would
+    /// panic.
+    pub(crate) fn close_quick_view(
+        &mut self,
+        preview_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(qv) = self.quick_view.take() else {
+            return;
+        };
+        if preview_focused {
+            let source = match qv.side.other() {
+                PanelSide::Left => &self.left_panel,
+                PanelSide::Right => &self.right_panel,
+            };
+            let handle = source.read(cx).active_focus_handle(cx);
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Observes the source panel (tab switches) and its active table
+    /// (every cursor move) so the preview can follow; re-run whenever
+    /// the panel notifies, since its active table may have changed.
+    fn resubscribe_quick_view_source(&mut self, cx: &mut Context<Self>) {
+        let Some(qv) = &self.quick_view else {
+            return;
+        };
+        let panel = match qv.side.other() {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        };
+        let table = panel.read(cx).active_table().clone();
+        if qv.observed_table.as_ref() == Some(&table) {
+            return;
+        }
+        let panel_sub = cx.observe(&panel, |this, _panel, cx| {
+            this.resubscribe_quick_view_source(cx);
+            this.sync_quick_view(cx);
+        });
+        let table_sub = cx.observe(&table, |this, _table, cx| this.sync_quick_view(cx));
+        if let Some(qv) = self.quick_view.as_mut() {
+            qv.observed_table = Some(table);
+            qv.subscriptions = vec![panel_sub, table_sub];
+        }
+    }
+
+    /// What the source panel's cursor is on right now.
+    fn quick_view_target(&self, cx: &App) -> Option<QuickTarget> {
+        let qv = self.quick_view.as_ref()?;
+        let panel = match qv.side.other() {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let table = panel.read(cx).active_table().read(cx);
+        let dir = table.current_dir().to_path_buf();
+        Some(match table.cursor_entry_name(cx) {
+            None => QuickTarget::Nothing,
+            Some(name) => {
+                if table.cursor_file_name(cx).is_some() {
+                    QuickTarget::File(dir.join(name))
+                } else {
+                    QuickTarget::Directory(dir.join(name))
+                }
+            }
+        })
+    }
+
+    /// Applies a cursor change to the preview after a short debounce, so
+    /// a held Down key never opens a file per row; the read itself runs
+    /// on the viewer's worker thread (AC: no stutter).
+    fn sync_quick_view(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.quick_view_target(cx) else {
+            return;
+        };
+        let Some(qv) = self.quick_view.as_mut() else {
+            return;
+        };
+        if qv.shown.as_ref() == Some(&target) {
+            return;
+        }
+        qv.generation += 1;
+        let generation = qv.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(QUICK_VIEW_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(qv) = this.quick_view.as_mut() else {
+                    return;
+                };
+                if qv.generation != generation || qv.shown.as_ref() == Some(&target) {
+                    return;
+                }
+                qv.shown = Some(target.clone());
+                qv.viewer.update(cx, |viewer, cx| viewer.show(target, cx));
+            });
+        })
+        .detach();
+    }
+
     /// F7 (`MkdirDialog`, T-5.2.7, `ops.mkdir`): opens the create-directory
     /// dialog pre-filled with the focused panel's current directory plus a
     /// trailing `/`, so the user types only the new segment(s) --
@@ -3791,27 +4011,37 @@ impl Workspace {
                 resizable_panel()
                     .size(left_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(panel_view(
-                        &self.left_panel,
-                        left_header,
-                        left_footer,
-                        left_active,
-                        tokens,
-                        theme.border,
-                    )),
+                    .child(match self.quick_view_on(PanelSide::Left) {
+                        Some(viewer) => quick_view_pane(viewer, window, cx, tokens, theme.border)
+                            .into_any_element(),
+                        None => panel_view(
+                            &self.left_panel,
+                            left_header,
+                            left_footer,
+                            left_active,
+                            tokens,
+                            theme.border,
+                        )
+                        .into_any_element(),
+                    }),
             )
             .child(
                 resizable_panel()
                     .size(right_w)
                     .size_range(px(160.)..Pixels::MAX)
-                    .child(panel_view(
-                        &self.right_panel,
-                        right_header,
-                        right_footer,
-                        right_active,
-                        tokens,
-                        theme.border,
-                    )),
+                    .child(match self.quick_view_on(PanelSide::Right) {
+                        Some(viewer) => quick_view_pane(viewer, window, cx, tokens, theme.border)
+                            .into_any_element(),
+                        None => panel_view(
+                            &self.right_panel,
+                            right_header,
+                            right_footer,
+                            right_active,
+                            tokens,
+                            theme.border,
+                        )
+                        .into_any_element(),
+                    }),
             )
             .on_resize(
                 cx.listener(|this, state: &Entity<ResizableState>, _window, cx| {
@@ -4184,6 +4414,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ViewFile, window, cx| {
                 this.open_viewer(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickViewToggle, window, cx| {
+                this.toggle_quick_view(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SymlinkDialog, window, cx| {
                 this.open_link_dialog(LinkKind::Symlink, window, cx);
@@ -4575,6 +4808,31 @@ fn mkdir_dialog_overlay(
 
 /// T-5.2.7's Shift+F6 rename overlay -- identical chrome to
 /// [`mkdir_dialog_overlay`]; see that function's doc comment.
+/// T-5.3.8: the quick view in place of a panel -- the same frame
+/// `panel_view` draws, the viewer entity (its own title and status bars)
+/// as the body.
+fn quick_view_pane(
+    viewer: &Entity<ViewerState>,
+    window: &Window,
+    cx: &App,
+    tokens: &TokenPalette,
+    border: gpui::Hsla,
+) -> impl IntoElement {
+    let active = viewer.read(cx).focus_handle(cx).is_focused(window);
+    gpui::div()
+        .size_full()
+        .bg(tokens.color.panel_bg_inactive)
+        .border_1()
+        .border_color(if active {
+            tokens.color.border_focus
+        } else {
+            border
+        })
+        .rounded_md()
+        .overflow_hidden()
+        .child(viewer.clone())
+}
+
 /// T-5.3.6: the viewer fills the window. Total Commander's Lister is a
 /// window of its own; a full-size overlay gives the same "the panels are
 /// exactly where you left them" on Esc without a second window.
@@ -12210,6 +12468,148 @@ mod tests {
                     .as_deref(),
                 Some("a.txt")
             );
+        });
+    }
+
+    // -- Ctrl+Q quick view (T-5.3.8) ---------------------------------------
+
+    fn quick_view_viewer(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<ViewerState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.quick_view.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| {
+                ws.quick_view.as_ref().map(|qv| qv.viewer.clone())
+            })
+            .expect("the quick view must be open by now")
+    }
+
+    /// Lets the debounce timer fire, then waits for `condition`.
+    fn settle_quick_view(
+        vcx: &mut VisualTestContext,
+        mut condition: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        vcx.executor()
+            .advance_clock(QUICK_VIEW_DEBOUNCE + std::time::Duration::from_millis(10));
+        wait_until(vcx, |vcx| condition(vcx));
+    }
+
+    #[gpui::test]
+    fn ctrl_q_previews_the_cursor_file_in_the_other_panel_and_follows_the_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            write_numbered(dir.path(), "a.txt", 100);
+            write_numbered(dir.path(), "b.txt", 3);
+            std::fs::create_dir(dir.path().join("zdir")).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            wait_until(vcx, |vcx| {
+                left_table
+                    .read_with(vcx, |t, cx| t.cursor_entry_name(cx))
+                    .is_some()
+            });
+            left_table.update(vcx, |t, cx| t.select_file_by_name("a.txt", cx));
+
+            vcx.dispatch_action(QuickViewToggle);
+            let viewer = quick_view_viewer(&workspace, vcx);
+            assert_eq!(
+                workspace.read_with(vcx, |ws, _| ws.quick_view.as_ref().map(|qv| qv.side)),
+                Some(PanelSide::Right),
+                "the preview takes the panel opposite the focused one"
+            );
+            assert!(viewer.read_with(vcx, |v, _| v.embedded()));
+            settle_quick_view(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).first().map(String::as_str) == Some("line 1")
+            });
+            assert_eq!(
+                viewer.read_with(vcx, |v, _| v.file_name().to_string()),
+                "a.txt"
+            );
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "the file panel keeps the keyboard"
+                );
+            });
+
+            // The cursor moves: the preview follows after the debounce.
+            left_table.update(vcx, |t, cx| t.select_file_by_name("b.txt", cx));
+            settle_quick_view(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).last().map(String::as_str) == Some("line 3")
+            });
+            assert_eq!(
+                viewer.read_with(vcx, |v, _| v.file_name().to_string()),
+                "b.txt"
+            );
+
+            // A directory shows a label, not a page.
+            left_table.update(vcx, |t, cx| t.select_file_by_name("zdir", cx));
+            settle_quick_view(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| {
+                    v.placeholder().is_some_and(|p| p.starts_with("zdir/"))
+                })
+            });
+            assert!(viewer_rows(&viewer, vcx).is_empty());
+
+            // Ctrl+Q again restores the panel.
+            vcx.dispatch_action(QuickViewToggle);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.quick_view.is_none())
+            });
+            vcx.update(|window, _| assert!(left_handle.is_focused(window)));
+        });
+    }
+
+    #[gpui::test]
+    fn tab_enters_the_quick_view_and_esc_leaves_it(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            write_numbered(dir.path(), "a.txt", 10);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            vcx.dispatch_action(QuickViewToggle);
+            let viewer = quick_view_viewer(&workspace, vcx);
+            settle_quick_view(vcx, |vcx| !viewer_rows(&viewer, vcx).is_empty());
+
+            vcx.dispatch_action(FocusOtherPanel);
+            let viewer_handle = viewer.read_with(vcx, |v, cx| v.focus_handle(cx));
+            vcx.update(|window, _| {
+                assert!(viewer_handle.is_focused(window), "Tab lands on the preview");
+            });
+            // From inside the preview, commands act on the panel it follows.
+            vcx.update(|window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    assert_eq!(ws.focused_panel_side(window, cx), PanelSide::Left);
+                });
+            });
+            vcx.dispatch_action(FocusOtherPanel);
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "Tab again goes back to the panel"
+                );
+            });
+
+            vcx.dispatch_action(FocusOtherPanel);
+            vcx.dispatch_action(crate::viewer::ViewerClose);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.quick_view.is_none())
+            });
+            vcx.update(|window, _| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "Esc in the preview closes it and returns"
+                );
+            });
         });
     }
 }
