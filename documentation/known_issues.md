@@ -240,3 +240,32 @@ history) is met; interactive commands have a working route (Shift+Enter).
 sends SIGTERM to the command's process group; the history dropdown as a
 `List` overlay reusing the hotlist pattern when a TC user asks for it.
 
+## FR-TOOL-01 / T-5.3.6: the viewer's gaps -- detection, wrapping, persistence, zoom
+
+**Symptom:** (1) a legacy single-byte file that isn't valid UTF-8 opens
+as windows-1252; Cyrillic or Hebrew text in another code page shows
+mojibake until Ctrl+E (`view.set_encoding`) cycles to the right one
+(UTF-8, windows-1252/1251/1255, KOI8-R, UTF-16 LE/BE). (2) Wrap mode
+counts characters, not display cells, so a row of CJK or emoji wraps a
+little late. (3) A UTF-16 surrogate pair that straddles a 4 KiB chop in a
+long line shows as two replacement characters (UTF-8 seams are
+repaired). (4) Wrap, hex width, offset base and the encoding override
+reset when the viewer closes; nothing is saved to `settings.toml`. (5)
+Find-next/previous live in the find bar (Enter / Shift+Enter) and the
+palette (`view.search_next/prev`); there is no body key for them, since
+Appendix A gives F3 to "close". (6) Images fit the window; there is no
+zoom or pan. (7) The file is shown as it was when opened; a growing log
+needs Ctrl+PgDn/PgUp (or reopen) to show new data.
+
+**Root cause:** scope. `chardetng` is a new dependency and the manual
+cycle covers the AC ("encoding override works"); cell-width wrapping
+needs `unicode-width`; the rest are small features past the task's AC.
+
+**Why deferred:** the AC is met and measured (see `task.md`); each gap
+has a working route.
+
+**To close this out:** `chardetng` behind the heuristic; `unicode-width`
+in `text::wrap_pieces`; a `[viewer]` settings section; `n`/`Shift+N` or
+a confirmed TC Lister key for find-next once Appendix A's F3 row is
+verified hands-on; zoom/pan in image mode (T-5.3.8's quick view will
+want the same); a reload on Ctrl+R / F2 as TC's Lister does.

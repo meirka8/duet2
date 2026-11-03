@@ -68,6 +68,7 @@ use crate::rename_dialog::RenameDialogState;
 use crate::theme_controller::ThemeController;
 use crate::trash_dialog::{TrashDialogState, bind_trash_dialog_keys};
 use crate::view_mode::ViewMode;
+use crate::viewer::ViewerState;
 
 // FR-NAV-01's "keyboard resize": while the workspace has focus, adjust the
 // splitter ratio without touching the mouse. Bound below to `ctrl-left`/
@@ -284,6 +285,12 @@ actions!(duet_workspace, [OpenTrashDialog]);
 // from inside a dialog or the command line.
 actions!(duet_workspace, [GotoPath]);
 
+// T-5.3.6's internal viewer (`view.open`, FR-TOOL-01): F3 in the panel,
+// Total Commander's own key (design.md Appendix A). Bound in the
+// `FileTable` context so it cannot fire from inside a dialog, the
+// command line, or the viewer itself (where F3 closes).
+actions!(duet_workspace, [ViewFile]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -316,6 +323,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", AttributesDialog, Some("Workspace")),
         KeyBinding::new("alt-t", OpenTrashDialog, Some("Workspace")),
         KeyBinding::new("ctrl-l", GotoPath, Some("FileTable")),
+        KeyBinding::new("f3", ViewFile, Some("FileTable")),
         KeyBinding::new("ctrl-c", CopyFiles, Some("FileTable")),
         KeyBinding::new("ctrl-insert", CopyFiles, Some("FileTable")),
         KeyBinding::new("ctrl-x", CutFiles, Some("FileTable")),
@@ -364,6 +372,7 @@ pub fn run() {
         duet_widgets::init(cx);
         bind_workspace_keys(cx);
         crate::command_line::bind_command_line_keys(cx);
+        crate::viewer::bind_viewer_keys(cx);
         crate::file_table::bind_file_table_keys(cx);
         bind_panel_keys(cx);
         bind_copy_move_dialog_keys(cx);
@@ -809,6 +818,12 @@ pub struct Workspace {
     /// Saved by `open_rename_dialog`, restored and cleared by
     /// `close_rename_dialog`/`close_rename_dialog_deferred`.
     rename_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.3.6's internal viewer (F3) is open -- see
+    /// `crate::viewer`'s module doc comment. A full-window overlay, not a
+    /// dialog: Esc/F3 return to exactly the panel state it left.
+    viewer: Option<Entity<ViewerState>>,
+    viewer_previous_focus: Option<FocusHandle>,
 
     /// `Some` while T-5.2.7's symlink *or* hardlink dialog is open -- one
     /// field for both, since one `LinkDialogState` type serves both
@@ -1475,6 +1490,8 @@ impl Workspace {
             mkdir_dialog_previous_focus: None,
             rename_dialog: None,
             rename_dialog_previous_focus: None,
+            viewer: None,
+            viewer_previous_focus: None,
             link_dialog: None,
             link_dialog_previous_focus: None,
             attributes_dialog: None,
@@ -1743,6 +1760,22 @@ impl Workspace {
                 self.open_cursor_default(window, cx);
                 true
             }
+            "view.open" => {
+                self.open_viewer(window, cx);
+                true
+            }
+            other if other.starts_with("view.") => match self.viewer.clone() {
+                Some(viewer) => {
+                    viewer.update(cx, |viewer, cx| viewer.run_command(other, window, cx))
+                }
+                None => {
+                    window.push_notification(
+                        Notification::info("Open a file in the viewer (F3) first."),
+                        cx,
+                    );
+                    true
+                }
+            },
             "file.open_with" => {
                 self.open_open_with(window, cx);
                 true
@@ -2789,6 +2822,70 @@ impl Workspace {
             PanelSide::Right => &self.right_panel,
         };
         panel.read(cx).active_table().read(cx).cursor_entry_name(cx)
+    }
+
+    /// F3 (`ViewFile`, `view.open`, T-5.3.6): opens the internal viewer on
+    /// the focused panel's cursor entry. Directories are refused with a
+    /// notice (Total Commander's F3 on a directory counts its size, a
+    /// different feature). The viewer also gets the listing's file names,
+    /// so Ctrl+PgDn/PgUp can walk them without coming back here.
+    fn open_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            return;
+        }
+        let side = self.focused_panel_side(window, cx);
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let table = panel.read(cx).active_table().clone();
+        let dir = table.read(cx).current_dir().to_path_buf();
+        let Some(name) = table.read(cx).cursor_file_name(cx) else {
+            window.push_notification(
+                Notification::info("F3 views files; move the cursor onto one."),
+                cx,
+            );
+            return;
+        };
+        let files = table.read(cx).sibling_file_names(cx);
+        let Some(file_ix) = crate::viewer::file_index(&files, &name) else {
+            return;
+        };
+        self.viewer_previous_focus = window.focused(cx);
+        let workspace = cx.entity().downgrade();
+        let state = cx.new(|cx| ViewerState::new(dir, files, file_ix, side, workspace, window, cx));
+        let handle = state.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        self.viewer = Some(state);
+        cx.notify();
+    }
+
+    pub(crate) fn close_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.take().is_none() {
+            return;
+        }
+        let previous = self.viewer_previous_focus.take();
+        if self.command_palette.is_some() {
+            // `view.close` from the palette: the palette closes right
+            // after this and would otherwise refocus the gone viewer.
+            self.palette_previous_focus = previous.clone();
+        }
+        match previous {
+            Some(handle) => window.focus(&handle),
+            None => self.focus_active_panel(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+PgDn/PgUp in the viewer moved on to `name`: the panel's
+    /// cursor follows, as Total Commander's Lister does.
+    pub(crate) fn viewer_moved_to(&mut self, side: PanelSide, name: &str, cx: &mut Context<Self>) {
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let table = panel.read(cx).active_table().clone();
+        table.update(cx, |table, cx| table.select_file_by_name(name, cx));
     }
 
     /// F7 (`MkdirDialog`, T-5.2.7, `ops.mkdir`): opens the create-directory
@@ -4085,6 +4182,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RenameDialog, window, cx| {
                 this.open_rename_dialog(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ViewFile, window, cx| {
+                this.open_viewer(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SymlinkDialog, window, cx| {
                 this.open_link_dialog(LinkKind::Symlink, window, cx);
             }))
@@ -4138,6 +4238,9 @@ impl Render for Workspace {
             .child(self.command_line_row(cx))
             .child(self.status_bar_row(cx))
             .child(self.function_key_bar(cx))
+            .when_some(self.viewer.clone(), |this, state| {
+                this.child(viewer_overlay(&state, cx))
+            })
             .when_some(self.command_palette.clone(), |this, state| {
                 this.child(command_palette_overlay(&state, cx))
             })
@@ -4472,6 +4575,18 @@ fn mkdir_dialog_overlay(
 
 /// T-5.2.7's Shift+F6 rename overlay -- identical chrome to
 /// [`mkdir_dialog_overlay`]; see that function's doc comment.
+/// T-5.3.6: the viewer fills the window. Total Commander's Lister is a
+/// window of its own; a full-size overlay gives the same "the panels are
+/// exactly where you left them" on Esc without a second window.
+fn viewer_overlay(state: &Entity<ViewerState>, _cx: &mut Context<Workspace>) -> impl IntoElement {
+    gpui::div()
+        .id("viewer-overlay")
+        .absolute()
+        .size_full()
+        .occlude()
+        .child(state.clone())
+}
+
 fn rename_dialog_overlay(
     state: &Entity<RenameDialogState>,
     cx: &mut Context<Workspace>,
@@ -5683,6 +5798,7 @@ mod tests {
                 .install(cx);
             bind_workspace_keys(cx);
             crate::command_line::bind_command_line_keys(cx);
+            crate::viewer::bind_viewer_keys(cx);
             crate::file_table::bind_file_table_keys(cx);
             bind_panel_keys(cx);
             bind_copy_move_dialog_keys(cx);
@@ -11868,6 +11984,232 @@ mod tests {
                     "a scan that fails outright must not open the dialog"
                 );
             });
+        });
+    }
+
+    // -- F3 internal viewer (T-5.3.6) --------------------------------------
+
+    fn open_viewer_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<ViewerState> {
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.viewer.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.viewer.clone())
+            .expect("the viewer must be open by now")
+    }
+
+    fn viewer_rows(viewer: &Entity<ViewerState>, vcx: &mut VisualTestContext) -> Vec<String> {
+        viewer.read_with(vcx, |v, _| v.visible_rows())
+    }
+
+    fn write_numbered(dir: &Path, name: &str, lines: usize) {
+        let body: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[gpui::test]
+    fn f3_opens_the_viewer_on_the_cursor_file_and_esc_returns_to_the_panel(
+        cx: &mut TestAppContext,
+    ) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            write_numbered(dir.path(), "a.txt", 100);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+
+            vcx.dispatch_action(ViewFile);
+            let viewer = open_viewer_state(&workspace, vcx);
+            let handle = viewer.read_with(vcx, |v, cx| v.focus_handle(cx));
+            vcx.update(|window, _| {
+                assert!(
+                    handle.is_focused(window),
+                    "F3 hands the keyboard to the viewer"
+                );
+            });
+            wait_until(vcx, |vcx| !viewer_rows(&viewer, vcx).is_empty());
+            let rows = viewer_rows(&viewer, vcx);
+            assert_eq!(rows[0], "line 1");
+            assert!(rows.len() > 1, "a page, not a line: {rows:?}");
+            viewer.read_with(vcx, |v, _| {
+                assert_eq!(v.mode(), Some(crate::viewer::Mode::Text));
+                assert_eq!(v.encoding().map(|e| e.name()), Some("UTF-8"));
+                assert_eq!(v.file_name(), "a.txt");
+            });
+
+            vcx.dispatch_action(crate::viewer::ViewerClose);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.viewer.is_none())
+            });
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _| {
+                assert!(
+                    left_handle.is_focused(window),
+                    "Esc returns focus to the panel F3 was pressed in"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn f3_on_a_directory_opens_nothing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            vcx.dispatch_action(ViewFile);
+            vcx.run_until_parked();
+            assert!(workspace.read_with(vcx, |ws, _| ws.viewer.is_none()));
+        });
+    }
+
+    #[gpui::test]
+    fn viewer_end_home_modes_and_wrap(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            write_numbered(dir.path(), "a.txt", 100);
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            vcx.dispatch_action(ViewFile);
+            let viewer = open_viewer_state(&workspace, vcx);
+            wait_until(vcx, |vcx| !viewer_rows(&viewer, vcx).is_empty());
+
+            vcx.dispatch_action(crate::viewer::ViewerEnd);
+            wait_until(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).last().map(String::as_str) == Some("line 100")
+            });
+            let rows = viewer_rows(&viewer, vcx);
+            assert!(
+                rows.len() > 1 && rows[0] != "line 1",
+                "End shows the last full page"
+            );
+
+            vcx.dispatch_action(crate::viewer::ViewerModeHex);
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.mode() == Some(crate::viewer::Mode::Hex))
+                    && viewer_rows(&viewer, vcx)
+                        .first()
+                        .is_some_and(|r| r.contains("  |"))
+            });
+            let rows = viewer_rows(&viewer, vcx);
+            assert!(
+                rows[0].contains(" 6C 69 6E 65 "),
+                "hex of 'line': {}",
+                rows[0]
+            );
+
+            // The palette's command ids route into the viewer.
+            vcx.update(|window, cx| {
+                viewer.update(cx, |v, cx| {
+                    assert!(v.run_command("view.mode_text", window, cx))
+                });
+            });
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.mode() == Some(crate::viewer::Mode::Text))
+                    && viewer_rows(&viewer, vcx)
+                        .first()
+                        .is_some_and(|r| r.starts_with("line "))
+            });
+
+            vcx.dispatch_action(crate::viewer::ViewerWrap);
+            wait_until(vcx, |vcx| viewer.read_with(vcx, |v, _| v.wrap()));
+            vcx.dispatch_action(crate::viewer::ViewerHome);
+            wait_until(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).first().map(String::as_str) == Some("line 1")
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn viewer_find_highlights_the_hit_and_ctrl_pgdn_walks_the_panel_files(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = tempfile::tempdir().unwrap();
+            write_numbered(dir.path(), "a.txt", 100);
+            write_numbered(dir.path(), "b.txt", 3);
+            std::fs::create_dir(dir.path().join("zdir")).unwrap();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let left_table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            // Directories sort first; park the cursor on a.txt.
+            wait_until(vcx, |vcx| {
+                left_table
+                    .read_with(vcx, |t, cx| t.cursor_entry_name(cx))
+                    .is_some()
+            });
+            left_table.update(vcx, |t, cx| t.select_file_by_name("a.txt", cx));
+            assert_eq!(
+                left_table
+                    .read_with(vcx, |t, cx| t.cursor_entry_name(cx))
+                    .as_deref(),
+                Some("a.txt")
+            );
+
+            vcx.dispatch_action(ViewFile);
+            let viewer = open_viewer_state(&workspace, vcx);
+            wait_until(vcx, |vcx| !viewer_rows(&viewer, vcx).is_empty());
+
+            vcx.dispatch_action(crate::viewer::ViewerFind);
+            assert!(viewer.read_with(vcx, |v, _| v.find_bar_open()));
+            vcx.update(|window, cx| {
+                let input = viewer.read(cx).find_input().clone();
+                input.update(cx, |s, cx| s.set_value("LINE 77", window, cx));
+                viewer.update(cx, |v, cx| v.find(false, cx));
+            });
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.highlight().is_some())
+            });
+            wait_until(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).iter().any(|r| r == "line 77")
+            });
+            let hit = viewer.read_with(vcx, |v, _| v.highlight().unwrap());
+            assert_eq!(hit.end - hit.start, 7, "case-insensitive by default");
+
+            vcx.update(|window, cx| {
+                let input = viewer.read(cx).find_input().clone();
+                input.update(cx, |s, cx| s.set_value("no such text", window, cx));
+                viewer.update(cx, |v, cx| v.find(false, cx));
+            });
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.status() == Some("Not found"))
+            });
+
+            // Esc closes the find bar first, not the viewer.
+            vcx.dispatch_action(crate::viewer::ViewerClose);
+            assert!(!viewer.read_with(vcx, |v, _| v.find_bar_open()));
+            assert!(workspace.read_with(vcx, |ws, _| ws.viewer.is_some()));
+
+            vcx.dispatch_action(crate::viewer::ViewerNextFile);
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.file_name() == "b.txt")
+            });
+            wait_until(vcx, |vcx| {
+                viewer_rows(&viewer, vcx).last().map(String::as_str) == Some("line 3")
+            });
+            assert_eq!(
+                left_table
+                    .read_with(vcx, |t, cx| t.cursor_entry_name(cx))
+                    .as_deref(),
+                Some("b.txt"),
+                "the panel cursor follows the viewer"
+            );
+            // Already at the last file: a no-op.
+            vcx.dispatch_action(crate::viewer::ViewerNextFile);
+            vcx.run_until_parked();
+            assert_eq!(
+                viewer.read_with(vcx, |v, _| v.file_name().to_string()),
+                "b.txt"
+            );
+            vcx.dispatch_action(crate::viewer::ViewerPrevFile);
+            wait_until(vcx, |vcx| {
+                viewer.read_with(vcx, |v, _| v.file_name() == "a.txt")
+            });
+            assert_eq!(
+                left_table
+                    .read_with(vcx, |t, cx| t.cursor_entry_name(cx))
+                    .as_deref(),
+                Some("a.txt")
+            );
         });
     }
 }
