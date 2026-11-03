@@ -3030,9 +3030,11 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Observes the source panel (tab switches) and its active table
-    /// (every cursor move) so the preview can follow; re-run whenever
-    /// the panel notifies, since its active table may have changed.
+    /// Observes the source panel (tab switches), its active table
+    /// (directory changes) and that table's widget state (every cursor
+    /// move -- the `FileTable` entity itself does not notify for those)
+    /// so the preview can follow; re-run whenever the panel notifies,
+    /// since its active table may have changed.
     fn resubscribe_quick_view_source(&mut self, cx: &mut Context<Self>) {
         let Some(qv) = &self.quick_view else {
             return;
@@ -3050,9 +3052,11 @@ impl Workspace {
             this.sync_quick_view(cx);
         });
         let table_sub = cx.observe(&table, |this, _table, cx| this.sync_quick_view(cx));
+        let state = table.read(cx).state_entity();
+        let state_sub = cx.observe(&state, |this, _state, cx| this.sync_quick_view(cx));
         if let Some(qv) = self.quick_view.as_mut() {
             qv.observed_table = Some(table);
-            qv.subscriptions = vec![panel_sub, table_sub];
+            qv.subscriptions = vec![panel_sub, table_sub, state_sub];
         }
     }
 
@@ -12487,14 +12491,21 @@ mod tests {
             .expect("the quick view must be open by now")
     }
 
-    /// Lets the debounce timer fire, then waits for `condition`.
+    /// Waits for `condition`, letting the debounce timer fire on the way:
+    /// the timer is scheduled by an observer callback that runs on the
+    /// next effects flush, so the clock is advanced on every iteration
+    /// (after `wait_until`'s tick), not once up front -- advancing it
+    /// before the timer exists leaves the timer waiting for a clock that
+    /// never moves again.
     fn settle_quick_view(
         vcx: &mut VisualTestContext,
         mut condition: impl FnMut(&mut VisualTestContext) -> bool,
     ) {
-        vcx.executor()
-            .advance_clock(QUICK_VIEW_DEBOUNCE + std::time::Duration::from_millis(10));
-        wait_until(vcx, |vcx| condition(vcx));
+        wait_until(vcx, |vcx| {
+            vcx.executor()
+                .advance_clock(QUICK_VIEW_DEBOUNCE + std::time::Duration::from_millis(10));
+            condition(vcx)
+        });
     }
 
     #[gpui::test]

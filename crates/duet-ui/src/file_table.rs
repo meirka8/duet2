@@ -3387,6 +3387,13 @@ impl FileTable {
         (kind != EntryKind::Directory).then_some(name)
     }
 
+    /// The table widget's state entity: it is what notifies on every
+    /// cursor move (this entity does not), so T-5.3.8's quick view
+    /// observes it to follow the cursor.
+    pub(crate) fn state_entity(&self) -> Entity<TableState<FileTableDelegate>> {
+        self.state.clone()
+    }
+
     /// See `FileTableDelegate::file_names`.
     pub(crate) fn sibling_file_names(&self, cx: &App) -> Vec<String> {
         self.state.read(cx).delegate().file_names()

@@ -279,7 +279,9 @@ tabs and directory still exist (F5 still targets its directory) but
 cannot be switched until Ctrl+Q restores it. (3) A directory under the
 cursor shows a label with its name, not a listing or an entry count.
 (4) The preview inherits the viewer's own gaps (encoding fallback, wrap
-by characters, no image zoom).
+by characters, no image zoom). (5) In the Tree view (Ctrl+F10) the
+cursor lives in the tree widget, which the preview does not observe;
+it follows the table's last cursor instead.
 
 **Root cause:** scope. Persisting the mode needs a per-panel field in the
 session model; a directory preview needs a listing off the UI thread,
