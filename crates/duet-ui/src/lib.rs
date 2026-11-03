@@ -44,6 +44,7 @@ mod theme_controller;
 mod trash_dialog;
 mod tree_view;
 mod view_mode;
+mod viewer;
 mod workspace;
 
 pub use workspace::run;

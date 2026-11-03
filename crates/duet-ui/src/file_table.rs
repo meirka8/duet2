@@ -1141,6 +1141,30 @@ impl FileTableDelegate {
         true
     }
 
+    /// [`Self::select_row_by_name`] plus the display row it landed on,
+    /// for a caller that then scrolls to it.
+    pub(crate) fn select_row_by_name_row(&mut self, name: &str) -> Option<usize> {
+        if self.select_row_by_name(name) {
+            self.display_row()
+        } else {
+            None
+        }
+    }
+
+    /// Names of the non-directory entries in display order -- the files
+    /// T-5.3.6's viewer walks with Ctrl+PgDn/PgUp.
+    pub(crate) fn file_names(&self) -> Vec<String> {
+        let entries = self.model.entries();
+        self.model
+            .order()
+            .iter()
+            .filter_map(|&ix| {
+                let id = EntryId::new(ix);
+                (entries.kind(id) != EntryKind::Directory).then(|| entries.name(id).to_string())
+            })
+            .collect()
+    }
+
     /// The cursor entry's name, if (and only if) it's a directory
     /// (T-4.3.1's Enter-to-descend) -- `None` for files, symlinks
     /// (`nav.follow_symlink` isn't implemented), an empty/cursor-less
@@ -3354,6 +3378,29 @@ impl FileTable {
     /// the cursor onto later.
     pub(crate) fn cursor_entry_name(&self, cx: &App) -> Option<String> {
         self.state.read(cx).delegate().cursor_entry_name()
+    }
+
+    /// The cursor entry's name when it is a file (anything but a
+    /// directory or the ".." row) -- what F3 views (T-5.3.6).
+    pub(crate) fn cursor_file_name(&self, cx: &App) -> Option<String> {
+        let (name, kind, _) = self.state.read(cx).delegate().cursor_entry_info()?;
+        (kind != EntryKind::Directory).then_some(name)
+    }
+
+    /// See `FileTableDelegate::file_names`.
+    pub(crate) fn sibling_file_names(&self, cx: &App) -> Vec<String> {
+        self.state.read(cx).delegate().file_names()
+    }
+
+    /// Moves the cursor onto `name` and scrolls to it: the viewer keeps
+    /// the panel cursor on the file it shows (T-5.3.6).
+    pub(crate) fn select_file_by_name(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if let Some(row) = state.delegate_mut().select_row_by_name_row(name) {
+                state.scroll_to_row(row, cx);
+            }
+            cx.notify();
+        });
     }
 
     /// See `FileTableDelegate::quick_search_indicator_text`'s doc

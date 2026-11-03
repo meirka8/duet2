@@ -83,6 +83,12 @@ duet-platform = { path = "../duet-platform" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 resvg = { version = "0.45", default-features = false }
 usvg = { version = "0.45", default-features = false }
+# T-5.3.6 viewer: row splitting and search are `memchr`/`memmem` over
+# 1 MiB chunks (already in the graph through a dozen crates); text decoding
+# is `encoding_rs` (gpui-component's own dependency, same version). Neither
+# adds a crate to the lock.
+memchr = "2.8"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 # T-4.1.4: exercises splitter-ratio persistence against real temp files
