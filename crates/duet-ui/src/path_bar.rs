@@ -648,10 +648,14 @@ const BREADCRUMB_CHAR_BUDGET: usize = 72;
 
 /// The breadcrumb face of the header. `on_segment` is invoked with the
 /// clicked segment's target; `on_edit` when the header is clicked anywhere
-/// else (or the pencil at its end).
+/// else (or the pencil at its end). `badge`, when set, follows the
+/// segments in the accent colour -- a tab showing fed search results
+/// (T-5.3.7) says so there, and its last segment (the search root) leads
+/// back to the root's own listing.
 pub(crate) fn breadcrumb_header(
     side: PanelSide,
     dir: &Path,
+    badge: Option<SharedString>,
     tokens: &TokenPalette,
     on_segment: SegmentHandler,
     on_edit: EditHandler,
@@ -698,6 +702,18 @@ pub(crate) fn breadcrumb_header(
                     this.child(div().text_color(muted).child("/"))
                 })
         }))
+        .when_some(badge, |this, badge| {
+            this.child(
+                div()
+                    .px_1()
+                    .ml_2()
+                    .rounded_sm()
+                    .bg(hover_bg)
+                    .text_color(accent)
+                    .truncate()
+                    .child(badge),
+            )
+        })
         .child(div().flex_1())
         .child(
             div()

@@ -111,6 +111,12 @@ fn icon_key_for_name<'a>(name: &'a str, tables: &IconTables) -> &'a str {
     }
 }
 
+/// The last component of an entry name -- the name itself, except in a
+/// fed search listing (T-5.3.7), whose entries are relative paths.
+pub(crate) fn base_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
 /// The slot index for a listing entry -- see [`IconSlot`]. A free
 /// function over the delegate's individual fields so it can run inside
 /// `rebuild_row_text`'s loop, which already holds `model` borrowed.
@@ -1456,11 +1462,13 @@ impl FileTableDelegate {
 
             let name = SharedString::new(entries.name(id));
             let icon = match &self.icon_tables {
+                // The base name: a fed search result is named by its
+                // relative path (T-5.3.7), and `a.d/Makefile` is a Makefile.
                 Some(tables) => icon_slot_for(
                     tables,
                     &mut self.icon_by_key,
                     &mut self.icon_slots,
-                    entries.name(id),
+                    base_name(entries.name(id)),
                     kind,
                 ),
                 None => ICON_NONE,
@@ -2278,7 +2286,7 @@ fn char_indices_to_byte_ranges(name: &str, indices: &[u32]) -> Vec<std::ops::Ran
 /// Directories show `<DIR>` (a Total-Commander-style convention) rather
 /// than a byte count -- `Metadata::size`'s own doc comment notes it's not
 /// meaningful for directories on backends that don't report a real one.
-fn write_size(out: &mut String, kind: EntryKind, bytes: u64) {
+pub(crate) fn write_size(out: &mut String, kind: EntryKind, bytes: u64) {
     if kind == EntryKind::Directory {
         out.push_str("<DIR>");
         return;
@@ -2624,6 +2632,29 @@ pub struct FileTable {
     /// T-5.3.3: the `CutMarks` generation and directory the delegate's
     /// cut-name set was last synced for -- see `render`.
     cut_sync: (u64, PathBuf),
+    /// T-5.3.7: set while this tab shows a fed search result set instead
+    /// of `current_dir`'s own listing -- see [`FedListing`].
+    fed: Option<FedListing>,
+}
+
+/// T-5.3.7's "feed to panel": a tab showing search results. Each entry is
+/// named by its path *relative to* `current_dir` (the search root), e.g.
+/// `src/main.rs`, so every `current_dir.join(name)` in this crate -- F5/F6/
+/// F8, Enter, F3, Ctrl+Q, the clipboard, "Open With", Shift+F6 -- resolves
+/// a fed entry exactly as it resolves a listed one, with no second code
+/// path. What differs is only what would re-list the directory:
+///
+/// - a reread (Ctrl+R, or the refresh after a finished job) re-stats the
+///   fed entries in place, dropping the ones that are gone, instead of
+///   replacing them with `current_dir`'s listing ([`FileTable::reread_current_dir`]);
+/// - `..`/Backspace return to `current_dir`'s own listing rather than its
+///   parent (Total Commander's behaviour), and any other navigation leaves
+///   the fed listing the ordinary way ([`FileTable::navigate_to`]).
+#[derive(Debug, Clone)]
+pub(crate) struct FedListing {
+    /// What the panel header says the listing is, e.g. `*.rs` or
+    /// `*.rs containing "todo"`.
+    pub(crate) label: String,
 }
 
 /// `dir` is where the locked tab's navigation attempt was headed;
@@ -3030,6 +3061,7 @@ impl FileTable {
             tree: None,
             grid_scrolled_cursor: None,
             cut_sync: (u64::MAX, PathBuf::new()),
+            fed: None,
         };
         this.set_view_mode(initial_view, cx);
         this
@@ -3895,6 +3927,19 @@ impl FileTable {
         self.navigate_to(dir, true, None, window, cx);
     }
 
+    /// T-5.3.7's "go to file": opens `dir` with the cursor on `name` once
+    /// the listing is in -- `navigate_to_path` plus the select-on-load
+    /// that going up a level already uses.
+    pub(crate) fn navigate_to_and_select(
+        &mut self,
+        dir: PathBuf,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_to(dir, true, Some(name), window, cx);
+    }
+
     /// Re-lists this table's own `current_dir` in place -- no history
     /// entry (this isn't a navigation, `current_dir` doesn't change), and
     /// deliberately bypasses `navigate_to`'s locked-tab redirect: a
@@ -3911,6 +3956,10 @@ impl FileTable {
     /// but not its `window`/lock-redirect handling -- nothing here needs
     /// a live `Window`.
     pub(crate) fn reread_current_dir(&mut self, cx: &mut Context<Self>) {
+        if self.fed.is_some() {
+            self.reread_fed_listing(cx);
+            return;
+        }
         let dir = self.current_dir.clone();
         self.exit_quick_search(cx);
         cx.emit(FileTableEvent::DirectoryChanged);
@@ -3933,6 +3982,137 @@ impl FileTable {
         spawn_volume_stats_load(dir, self.tokio_handle.clone(), generation, cx);
     }
 
+    /// T-5.3.7's "feed to panel": shows `entries` -- search hits named by
+    /// their path relative to `root` -- as this tab's listing, with `root`
+    /// as `current_dir` (see [`FedListing`]). A navigation like any other:
+    /// the previous directory goes onto the history and a quick search
+    /// ends. A locked tab is `Panel::feed_listing`'s business (it opens a
+    /// new tab first), so this does not consult `locked_navigation`.
+    pub(crate) fn show_fed_listing(
+        &mut self,
+        root: PathBuf,
+        label: String,
+        entries: Vec<(String, duet_types::Metadata)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.exit_quick_search(cx);
+        if self.view_mode == ViewMode::Tree {
+            let back = self.list_mode;
+            self.set_view_mode(back, cx);
+        }
+        self.history_back.push(self.current_dir.clone());
+        self.history_forward.clear();
+        self.current_dir = root.clone();
+        self.fed = Some(FedListing { label });
+        cx.emit(FileTableEvent::DirectoryChanged);
+        let generation = self.state.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            let generation = delegate.bump_nav_generation();
+            let sort = delegate.model().sort_options();
+            let mut model = DirectoryModel::new();
+            for (name, metadata) in &entries {
+                model.entries_mut().push(name, metadata);
+            }
+            model.sort_by(sort.column, sort.ascending);
+            delegate.set_model(model);
+            delegate.set_has_parent_row(true);
+            delegate.set_loading(false);
+            if let Some(row) = delegate.display_row() {
+                state.scroll_to_row(row, cx);
+            }
+            state.refresh(cx);
+            cx.notify();
+            generation
+        });
+        spawn_volume_stats_load(root, self.tokio_handle.clone(), generation, cx);
+    }
+
+    /// T-5.3.7: the fed listing this tab shows, if it shows one.
+    pub(crate) fn fed_listing(&self) -> Option<&FedListing> {
+        self.fed.as_ref()
+    }
+
+    /// [`Self::reread_current_dir`] for a fed listing: every entry is
+    /// re-stat'ed off the UI thread; the ones that are gone (moved,
+    /// deleted) drop out, the rest get fresh metadata. The cursor stays
+    /// on the same entry -- or, if that one went, on the same row -- and
+    /// surviving selected entries stay selected, so deleting a few hits
+    /// out of a long result list does not lose the user's place.
+    fn reread_fed_listing(&mut self, cx: &mut Context<Self>) {
+        self.exit_quick_search(cx);
+        let root = self.current_dir.clone();
+        let (generation, names, cursor, selected) = self.state.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            let generation = delegate.bump_nav_generation();
+            let model = delegate.model();
+            let entries = model.entries();
+            let names: Vec<String> = model
+                .full_order()
+                .iter()
+                .map(|&ix| entries.name(EntryId::new(ix)).to_string())
+                .collect();
+            let selected: HashSet<String> = model
+                .full_order()
+                .iter()
+                .map(|&ix| EntryId::new(ix))
+                .filter(|&id| model.is_selected(id))
+                .map(|id| entries.name(id).to_string())
+                .collect();
+            let cursor = (delegate.cursor_entry_name(), delegate.display_row());
+            delegate.set_loading(true);
+            cx.notify();
+            (generation, names, cursor, selected)
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tokio_handle.spawn_blocking(move || {
+            let fresh: Vec<(String, duet_types::Metadata)> = names
+                .into_iter()
+                .filter_map(|name| {
+                    let meta = std::fs::symlink_metadata(root.join(&name)).ok()?;
+                    Some((name, duet_search::metadata_from_std(&meta)))
+                })
+                .collect();
+            let _ = tx.send(fresh);
+        });
+        let state = self.state.clone();
+        cx.spawn(async move |_this, cx| {
+            let Ok(fresh) = rx.await else {
+                return;
+            };
+            let _ = state.update(cx, |state, cx| {
+                let delegate = state.delegate_mut();
+                if delegate.nav_generation() != generation {
+                    return;
+                }
+                let sort = delegate.model().sort_options();
+                let mut model = DirectoryModel::new();
+                let mut keep = Vec::new();
+                for (name, metadata) in &fresh {
+                    let id = model.entries_mut().push(name, metadata);
+                    if selected.contains(name) {
+                        keep.push(id);
+                    }
+                }
+                model.sort_by(sort.column, sort.ascending);
+                model.select_many(keep);
+                delegate.set_model(model);
+                delegate.set_has_parent_row(true);
+                let (cursor_name, cursor_row) = cursor;
+                let found = cursor_name.is_some_and(|name| delegate.select_row_by_name(&name));
+                if !found && let Some(row) = cursor_row {
+                    delegate.move_cursor_to(row);
+                }
+                delegate.set_loading(false);
+                if let Some(row) = delegate.display_row() {
+                    state.scroll_to_row(row, cx);
+                }
+                state.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn navigate_to(
         &mut self,
         dir: PathBuf,
@@ -3945,6 +4125,8 @@ impl FileTable {
             handler(dir, window, cx);
             return;
         }
+        // T-5.3.7: any navigation replaces a fed listing with a real one.
+        self.fed = None;
         // A quick-search session's `JumpMatch`/filter both refer to
         // *this* listing -- navigating away invalidates them outright
         // (this is also the single choke point every other navigation
@@ -4113,6 +4295,13 @@ impl FileTable {
     /// task's own AC). A no-op already at the root (`Path::parent()`
     /// returns `None`).
     fn navigate_to_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // T-5.3.7: `..` in a fed listing leads back to the search root's
+        // own listing (see `FedListing`).
+        if self.fed.is_some() {
+            let root = self.current_dir.clone();
+            self.navigate_to(root, true, None, window, cx);
+            return;
+        }
         let Some(parent) = self.current_dir.parent().map(PathBuf::from) else {
             return;
         };

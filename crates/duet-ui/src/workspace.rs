@@ -65,6 +65,7 @@ use crate::operation_manager::{OperationManagerState, bind_operation_manager_key
 use crate::panel::{Panel, bind_panel_keys};
 use crate::recovery_dialog::{RecoveryDialogState, bind_recovery_dialog_keys};
 use crate::rename_dialog::RenameDialogState;
+use crate::search_dialog::{SearchDialogState, SearchMemory, bind_search_dialog_keys};
 use crate::theme_controller::ThemeController;
 use crate::trash_dialog::{TrashDialogState, bind_trash_dialog_keys};
 use crate::view_mode::ViewMode;
@@ -297,6 +298,13 @@ actions!(duet_workspace, [ViewFile]);
 // the preview turns it off again.
 actions!(duet_workspace, [QuickViewToggle]);
 
+// T-5.3.7's Find Files dialog (`tool.search`, FR-TOOL-04): Alt+F7, Total
+// Commander's own key (`docs/keymap-tc.csv`, "known"). `Workspace` context
+// like every other dialog-opening chord. GNOME's window manager grabs
+// Alt+F7 for "move window" by default (`known_issues.md`); the palette's
+// `tool.search` row is the fallback there.
+actions!(duet_workspace, [OpenSearchDialog]);
+
 /// Registers the workspace's own keybindings. Called once from [`run`],
 /// before any window opens. `Some("Workspace")` scopes the splitter
 /// bindings to elements tagged with that key context -- see the root
@@ -331,6 +339,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("ctrl-l", GotoPath, Some("FileTable")),
         KeyBinding::new("f3", ViewFile, Some("FileTable")),
         KeyBinding::new("ctrl-q", QuickViewToggle, Some("Workspace")),
+        KeyBinding::new("alt-f7", OpenSearchDialog, Some("Workspace")),
         // Tab from inside the quick view goes back to the file panel;
         // "QuickView" is only on the embedded viewer, never the F3 one.
         KeyBinding::new("tab", FocusOtherPanel, Some("QuickView")),
@@ -393,6 +402,7 @@ pub fn run() {
         bind_attributes_dialog_keys(cx);
         bind_recovery_dialog_keys(cx);
         bind_trash_dialog_keys(cx);
+        bind_search_dialog_keys(cx);
 
         // T-4.2.6: the icon tables load on the Tokio runtime; every
         // window refreshes once they are in.
@@ -899,6 +909,20 @@ pub struct Workspace {
     /// actually shows the dialog, restored and cleared by
     /// `close_trash_dialog`.
     trash_dialog_previous_focus: Option<FocusHandle>,
+
+    /// `Some` while T-5.3.7's Find Files dialog is open. See
+    /// `crate::search_dialog`'s module doc comment.
+    search_dialog: Option<Entity<SearchDialogState>>,
+    /// Restored and cleared by `close_search_dialog` -- unless the dialog
+    /// closed by feeding a panel or going to a result, which focus that
+    /// panel instead.
+    search_dialog_previous_focus: Option<FocusHandle>,
+    /// The panel the dialog was opened from: where "go to file" and
+    /// "feed to panel" land.
+    search_target_side: PanelSide,
+    /// The fields and switches of the last search, restored on the next
+    /// Alt+F7 (session-only).
+    search_memory: SearchMemory,
 
     /// `operations.confirm_delete` (`"always"` | `"non_empty_dirs"` |
     /// `"never"`), read once at startup the same way every other
@@ -1541,6 +1565,10 @@ impl Workspace {
             recovery_dialog_previous_focus,
             trash_dialog: None,
             trash_dialog_previous_focus: None,
+            search_dialog: None,
+            search_dialog_previous_focus: None,
+            search_target_side: PanelSide::Left,
+            search_memory: SearchMemory::default(),
             confirm_delete,
             delete_default_permanent,
             tokio_handle: tokio_handle.clone(),
@@ -1830,6 +1858,10 @@ impl Workspace {
             }
             "panel.quick_view" => {
                 self.toggle_quick_view(window, cx);
+                true
+            }
+            "tool.search" => {
+                self.open_search_dialog(window, cx);
                 true
             }
             other if other.starts_with("view.") => match self.viewer.clone() {
@@ -3626,6 +3658,127 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Alt+F7 (`tool.search`): opens the Find Files dialog over the
+    /// focused panel, its *Search in* field set to that panel's folder and
+    /// everything else as the last search left it. A no-op if it is
+    /// already open. See `crate::search_dialog`.
+    fn open_search_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_dialog.is_some() {
+            return;
+        }
+        let side = self.focused_panel_side(window, cx);
+        let panel = match side {
+            PanelSide::Left => &self.left_panel,
+            PanelSide::Right => &self.right_panel,
+        };
+        let base = panel
+            .read(cx)
+            .active_table()
+            .read(cx)
+            .current_dir()
+            .to_path_buf();
+        self.search_target_side = side;
+        self.search_dialog_previous_focus = window.focused(cx);
+        let memory = self.search_memory.clone();
+        let workspace = cx.entity().downgrade();
+        let state = cx.new(|cx| SearchDialogState::new(memory, base, workspace, window, cx));
+        self.search_dialog = Some(state);
+        cx.notify();
+    }
+
+    /// Closes the Find Files dialog (Escape with no search running),
+    /// stopping any search and remembering `memory` -- its fields, which
+    /// the dialog passes in because it is mid-update when it calls this
+    /// and cannot be read -- and gives the focus back to where it was.
+    pub(crate) fn close_search_dialog(
+        &mut self,
+        memory: SearchMemory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = self.search_dialog_previous_focus.take();
+        self.dismiss_search_dialog(memory);
+        if let Some(handle) = previous_focus {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// [`Self::close_search_dialog`] for a click outside the dialog, the
+    /// one close path that does not start inside it.
+    fn close_search_dialog_from_outside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = &self.search_dialog else {
+            return;
+        };
+        let memory = dialog.read(cx).memory(cx);
+        self.close_search_dialog(memory, window, cx);
+    }
+
+    /// Drops the dialog (which cancels its search), keeping `memory`.
+    fn dismiss_search_dialog(&mut self, memory: SearchMemory) {
+        self.search_dialog = None;
+        self.search_dialog_previous_focus = None;
+        self.search_memory = memory;
+    }
+
+    /// The panel the search dialog acts on.
+    fn search_target_panel(&self) -> Entity<Panel> {
+        match self.search_target_side {
+            PanelSide::Left => self.left_panel.clone(),
+            PanelSide::Right => self.right_panel.clone(),
+        }
+    }
+
+    /// Alt+L in the dialog ("feed to panel"): closes it and shows
+    /// `entries` -- named relative to `root` -- as a synthetic listing in
+    /// the panel it was opened from (`Panel::feed_listing`, which also
+    /// focuses that panel). A quick view on that side is closed first: the
+    /// results are meant to be seen.
+    pub(crate) fn feed_search_results(
+        &mut self,
+        memory: SearchMemory,
+        root: PathBuf,
+        label: String,
+        entries: Vec<(String, duet_types::Metadata)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_search_dialog(memory);
+        if self.quick_view_on(self.search_target_side).is_some() {
+            self.toggle_quick_view(window, cx);
+        }
+        let panel = self.search_target_panel();
+        panel.update(cx, |panel, cx| {
+            panel.feed_listing(root, label, entries, window, cx)
+        });
+        cx.notify();
+    }
+
+    /// Enter on a search result ("go to file"): closes the dialog and
+    /// opens the result's folder in the panel it was opened from, with the
+    /// cursor on the result.
+    pub(crate) fn go_to_search_result(
+        &mut self,
+        memory: SearchMemory,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_search_dialog(memory);
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let (dir, name) = (dir.to_path_buf(), name.to_string_lossy().into_owned());
+        let panel = self.search_target_panel();
+        let table = panel.read(cx).active_table().clone();
+        table.update(cx, |table, cx| {
+            table.navigate_to_and_select(dir, name, window, cx);
+        });
+        let handle = table.read(cx).focus_handle(cx);
+        window.focus(&handle);
+        cx.notify();
+    }
+
     /// [`crate::copy_move_dialog::CopyMoveDialogState::try_complete_destination`]'s
     /// "does `parent` match either panel's already-loaded directory" half
     /// -- see that method's own doc comment for the full picture (T-5.2.1's
@@ -3657,7 +3810,7 @@ impl Workspace {
     fn panel_header(
         &self,
         side: PanelSide,
-        dir: &Path,
+        header: PanelHeader,
         tokens: &TokenPalette,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
@@ -3679,8 +3832,15 @@ impl Workspace {
         let on_edit: crate::path_bar::EditHandler = Rc::new(move |window, cx| {
             let _ = weak.update(cx, |this, cx| this.open_path_bar(side, window, cx));
         });
-        crate::path_bar::breadcrumb_header(side, dir, tokens, on_segment, on_edit)
-            .into_any_element()
+        crate::path_bar::breadcrumb_header(
+            side,
+            &header.dir,
+            header.fed,
+            tokens,
+            on_segment,
+            on_edit,
+        )
+        .into_any_element()
     }
 
     /// `Ctrl+L` (`GotoPath`) or a click on the header: opens `side`'s path
@@ -4006,8 +4166,8 @@ impl Workspace {
         let editing = self.path_bar.as_ref().map(|bar| bar.read(cx).side());
         let left_active = left_focused || editing == Some(PanelSide::Left);
         let right_active = right_focused || editing == Some(PanelSide::Right);
-        let left_header = self.panel_header(PanelSide::Left, &left_dir, tokens, cx);
-        let right_header = self.panel_header(PanelSide::Right, &right_dir, tokens, cx);
+        let left_header = self.panel_header(PanelSide::Left, left_dir, tokens, cx);
+        let right_header = self.panel_header(PanelSide::Right, right_dir, tokens, cx);
 
         h_resizable("workspace-splitter")
             .with_state(&self.resizable_state)
@@ -4437,6 +4597,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenTrashDialog, window, cx| {
                 this.open_trash_dialog(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenSearchDialog, window, cx| {
+                this.open_search_dialog(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &GotoPath, window, cx| {
                 let side = this.focused_panel_side(window, cx);
                 this.open_path_bar(side, window, cx);
@@ -4520,7 +4683,46 @@ impl Render for Workspace {
             .when_some(self.trash_dialog.clone(), |this, state| {
                 this.child(trash_dialog_overlay(&state, cx))
             })
+            .when_some(self.search_dialog.clone(), |this, state| {
+                this.child(search_dialog_overlay(&state, cx))
+            })
     }
+}
+
+/// T-5.3.7's Find Files overlay -- the same `.occlude()`-backdrop/card
+/// chrome as [`trash_dialog_overlay`] (see `command_palette_overlay`'s own
+/// doc comment for why), wider and nearer the top: the dialog carries a
+/// form and a result list. A click on the backdrop closes it like Escape.
+fn search_dialog_overlay(
+    state: &Entity<SearchDialogState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let tokens = TokenPalette::current(cx);
+    gpui::div()
+        .id("search-dialog-backdrop")
+        .absolute()
+        .size_full()
+        .occlude()
+        .flex()
+        .items_start()
+        .justify_center()
+        .pt(px(48.))
+        .bg(gpui::hsla(0., 0., 0., 0.5))
+        .child(
+            gpui::div()
+                .id("search-dialog-card")
+                .occlude()
+                .w(px(820.))
+                .max_w(gpui::relative(0.95))
+                .bg(tokens.color.panel_bg_active)
+                .border_1()
+                .border_color(tokens.color.border_focus)
+                .rounded_md()
+                .child(state.clone())
+                .on_mouse_down_out(cx.listener(|this, _event, window, cx| {
+                    this.close_search_dialog_from_outside(window, cx);
+                })),
+        )
 }
 
 /// T-4.3.6: the palette's overlay chrome -- a full-window backdrop behind
@@ -5272,13 +5474,25 @@ fn panel_header_footer_active(
     panel: &Entity<Panel>,
     window: &Window,
     cx: &App,
-) -> (PathBuf, SharedString, bool) {
+) -> (PanelHeader, SharedString, bool) {
     let panel = panel.read(cx);
     let table = panel.active_table().read(cx);
     let active = table.focus_handle(cx).is_focused(window);
-    let header = table.current_dir().to_path_buf();
+    let header = PanelHeader {
+        dir: table.current_dir().to_path_buf(),
+        fed: table
+            .fed_listing()
+            .map(|fed| SharedString::from(format!("\u{2315} Search results: {}", fed.label))),
+    };
     let footer = panel_footer_text(table, cx);
     (header, footer, active)
+}
+
+/// What a panel header shows: the directory, plus -- for a tab showing
+/// fed search results (T-5.3.7) -- a label saying so.
+struct PanelHeader {
+    dir: PathBuf,
+    fed: Option<SharedString>,
 }
 
 /// Wraps a real [`Panel`] (T-4.3.2 -- both sides, now that the right panel
@@ -6071,6 +6285,7 @@ mod tests {
             bind_attributes_dialog_keys(cx);
             bind_recovery_dialog_keys(cx);
             bind_trash_dialog_keys(cx);
+            bind_search_dialog_keys(cx);
         });
 
         let mut workspace_cell: Option<Entity<Workspace>> = None;
@@ -12621,6 +12836,308 @@ mod tests {
                     "Esc in the preview closes it and returns"
                 );
             });
+        });
+    }
+
+    // -- T-5.3.7 search (Alt+F7) and feed to panel -----------------------------
+
+    /// `dir/a.rs`, `dir/sub/b.rs`, `dir/sub/c.txt`.
+    fn search_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), b"fn a() {} // TODO\n").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/b.rs"), b"fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("sub/c.txt"), b"todo list\n").unwrap();
+        dir
+    }
+
+    fn open_search_dialog_state(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+    ) -> Entity<SearchDialogState> {
+        vcx.dispatch_action(OpenSearchDialog);
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.search_dialog.is_some())
+        });
+        workspace
+            .read_with(vcx, |ws, _| ws.search_dialog.clone())
+            .expect("the search dialog must be open by now")
+    }
+
+    /// Types `name` (and `content`) into the dialog, presses Enter in the
+    /// name field and waits for the search to finish.
+    fn run_search(
+        vcx: &mut VisualTestContext,
+        dialog: &Entity<SearchDialogState>,
+        name: &str,
+        content: &str,
+    ) {
+        dialog.update_in(vcx, |dialog, window, cx| {
+            dialog.set_field(0, name, window, cx);
+            dialog.set_field(2, content, window, cx);
+            dialog.focus_name_field(window, cx);
+        });
+        press_enter(vcx);
+        wait_until(vcx, |vcx| {
+            dialog.read_with(vcx, |dialog, _| {
+                !dialog.is_running()
+                    && dialog.form_error().is_none()
+                    && !dialog.results().is_empty()
+            })
+        });
+    }
+
+    fn table_names(vcx: &mut VisualTestContext, table: &Entity<FileTable>) -> Vec<String> {
+        table.read_with(vcx, |table, cx| {
+            let mut names: Vec<String> = table
+                .state()
+                .read(cx)
+                .delegate()
+                .model()
+                .ordered_names()
+                .map(|(_, n)| n.to_string())
+                .collect();
+            names.sort();
+            names
+        })
+    }
+
+    /// Opens the dialog over the left panel at `dir`, searches `*.rs`
+    /// and feeds the results to the panel.
+    fn feed_rs_files(
+        workspace: &Entity<Workspace>,
+        vcx: &mut VisualTestContext,
+        dir: &Path,
+    ) -> Entity<FileTable> {
+        focus_left_panel_at(workspace, vcx, dir);
+        let dialog = open_search_dialog_state(workspace, vcx);
+        run_search(vcx, &dialog, "*.rs", "");
+        vcx.dispatch_action(crate::search_dialog::SearchFeedToPanel);
+        wait_until(vcx, |vcx| {
+            workspace.read_with(vcx, |ws, _| ws.search_dialog.is_none())
+        });
+        workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone())
+    }
+
+    #[gpui::test]
+    fn alt_f7_opens_the_search_dialog_on_the_focused_panels_folder(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            dialog.read_with(vcx, |dialog, cx| {
+                let memory = dialog.memory(cx);
+                assert_eq!(memory.fields.roots, dir.path().to_string_lossy());
+                assert_eq!(memory.fields.name, "*");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn search_streams_name_and_content_matches(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+
+            run_search(vcx, &dialog, "*.rs", "");
+            let mut found: Vec<PathBuf> = dialog.read_with(vcx, |d, _| {
+                d.results().iter().map(|h| h.path.clone()).collect()
+            });
+            found.sort();
+            assert_eq!(
+                found,
+                [dir.path().join("a.rs"), dir.path().join("sub/b.rs")]
+            );
+
+            // Content, case-insensitive by default, across both extensions.
+            run_search(vcx, &dialog, "*", "todo");
+            let mut found: Vec<PathBuf> = dialog.read_with(vcx, |d, _| {
+                d.results().iter().map(|h| h.path.clone()).collect()
+            });
+            found.sort();
+            assert_eq!(
+                found,
+                [dir.path().join("a.rs"), dir.path().join("sub/c.txt")]
+            );
+
+            // Alt+V: case matters now.
+            dialog.update(vcx, |d, _| d.options_mut().case_sensitive = true);
+            run_search(vcx, &dialog, "*", "TODO");
+            let found: Vec<PathBuf> = dialog.read_with(vcx, |d, _| {
+                d.results().iter().map(|h| h.path.clone()).collect()
+            });
+            assert_eq!(found, [dir.path().join("a.rs")]);
+        });
+    }
+
+    #[gpui::test]
+    fn a_bad_field_is_reported_and_starts_nothing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            dialog.update_in(vcx, |dialog, window, cx| {
+                dialog.set_field(3, "lots", window, cx)
+            });
+            press_enter(vcx);
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            dialog.read_with(vcx, |dialog, _| {
+                assert!(dialog.form_error().is_some_and(|e| e.contains("lots")));
+                assert!(!dialog.is_running());
+                assert!(dialog.results().is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn feed_to_panel_lists_results_relative_to_the_search_root(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            let table = feed_rs_files(&workspace, vcx, dir.path());
+
+            assert_eq!(table_names(vcx, &table), ["a.rs", "sub/b.rs"]);
+            table.read_with(vcx, |table, _| {
+                assert_eq!(table.current_dir(), dir.path());
+                assert_eq!(table.fed_listing().map(|f| f.label.as_str()), Some("*.rs"));
+            });
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _| assert!(left_handle.is_focused(window)));
+        });
+    }
+
+    /// The AC's "fully operable synthetic listing": F5 on a nested hit
+    /// copies the real file, through the ordinary copy dialog and queue.
+    #[gpui::test]
+    fn a_fed_listing_is_operable_f5_copies_a_nested_hit(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            let dest = tempfile::tempdir().unwrap();
+            let right_table =
+                workspace.read_with(vcx, |ws, cx| ws.right_panel.read(cx).active_table().clone());
+            navigate_panel_to(vcx, &right_table, dest.path().to_path_buf());
+            let table = feed_rs_files(&workspace, vcx, dir.path());
+
+            table.update(vcx, |table, cx| table.select_file_by_name("sub/b.rs", cx));
+            vcx.dispatch_action(CopyDialog);
+            workspace.read_with(vcx, |ws, _| assert!(ws.copy_move_dialog.is_some()));
+            press_enter(vcx);
+
+            let copied = dest.path().join("b.rs");
+            wait_until(vcx, |vcx| {
+                copied.is_file() && workspace.read_with(vcx, |ws, _| ws.copy_move_dialog.is_none())
+            });
+            assert_eq!(std::fs::read(&copied).unwrap(), b"fn b() {}\n");
+            // The finished job refreshes both panels; the fed one stays fed.
+            wait_until(vcx, |vcx| {
+                table.read_with(vcx, |t, cx| !t.state().read(cx).delegate().loading(cx))
+            });
+            table.read_with(vcx, |table, _| assert!(table.fed_listing().is_some()));
+            assert_eq!(table_names(vcx, &table), ["a.rs", "sub/b.rs"]);
+        });
+    }
+
+    #[gpui::test]
+    fn rereading_a_fed_listing_drops_what_is_gone_and_stays_fed(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            let table = feed_rs_files(&workspace, vcx, dir.path());
+            std::fs::remove_file(dir.path().join("sub/b.rs")).unwrap();
+
+            table.update(vcx, |table, cx| table.reread_current_dir(cx));
+            wait_until(vcx, |vcx| table_names(vcx, &table) == ["a.rs"]);
+            table.read_with(vcx, |table, _| {
+                assert!(table.fed_listing().is_some());
+                assert_eq!(table.current_dir(), dir.path());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dot_dot_in_a_fed_listing_returns_to_the_search_roots_own_listing(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            let table = feed_rs_files(&workspace, vcx, dir.path());
+            vcx.dispatch_action(crate::file_table::NavigateParent);
+            wait_until(vcx, |vcx| table_names(vcx, &table) == ["a.rs", "sub"]);
+            table.read_with(vcx, |table, _| {
+                assert!(table.fed_listing().is_none());
+                assert_eq!(table.current_dir(), dir.path());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn enter_on_a_result_opens_its_folder_with_the_cursor_on_it(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            run_search(vcx, &dialog, "b.rs", "");
+            // A finished search with results moves the focus to the list.
+            let _ = vcx.update(|window, cx| window.draw(cx));
+            vcx.dispatch_action(crate::search_dialog::SearchResultsOpen);
+
+            let table =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_table().clone());
+            let sub = dir.path().join("sub");
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.search_dialog.is_none())
+                    && table.read_with(vcx, |t, cx| {
+                        t.current_dir() == sub && t.cursor_entry_name(cx).as_deref() == Some("b.rs")
+                    })
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_dialog_and_alt_f7_brings_the_fields_back(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            dialog.update_in(vcx, |dialog, window, cx| {
+                dialog.set_field(0, "*.txt", window, cx);
+                dialog.set_field(2, "todo", window, cx);
+                dialog.options_mut().whole_words = true;
+            });
+            press_escape(vcx);
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.search_dialog.is_none())
+            });
+            let left_handle =
+                workspace.read_with(vcx, |ws, cx| ws.left_panel.read(cx).active_focus_handle(cx));
+            vcx.update(|window, _| assert!(left_handle.is_focused(window)));
+
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            dialog.read_with(vcx, |dialog, cx| {
+                let memory = dialog.memory(cx);
+                assert_eq!(memory.fields.name, "*.txt");
+                assert_eq!(memory.fields.content, "todo");
+                assert!(memory.options.whole_words);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn tab_walks_the_fields_then_the_result_list(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            let dialog = open_search_dialog_state(&workspace, vcx);
+            // Shift+Tab from the first field wraps round to the list.
+            vcx.dispatch_action(duet_widgets::input::OutdentInline);
+            let list = dialog.read_with(vcx, |d, cx| d.focus_handle(cx));
+            vcx.update(|window, _| assert!(list.is_focused(window)));
+            // Tab from the list goes back to the first field.
+            vcx.dispatch_action(crate::search_dialog::SearchFocusNext);
+            vcx.update(|window, _| assert!(!list.is_focused(window)));
+            // Eight Tabs from the first field reach the list again.
+            for _ in 0..8 {
+                vcx.dispatch_action(IndentInline);
+            }
+            vcx.update(|window, _| assert!(list.is_focused(window)));
         });
     }
 }
