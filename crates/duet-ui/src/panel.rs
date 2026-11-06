@@ -699,7 +699,7 @@ fn tab_label(tab: &TabEntry, cx: &App) -> SharedString {
     let dir = table.current_dir();
     let name = match table.fed_listing() {
         // T-5.3.7: a fed search result set.
-        Some(fed) => format!("\u{2315} {}", fed.label),
+        Some(fed) => format!("Search: {}", fed.label),
         None => dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())

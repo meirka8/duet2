@@ -3228,6 +3228,10 @@ impl Workspace {
             );
             return;
         };
+        // A fed search result is named by its relative path (T-5.3.7);
+        // the rename happens in its own folder, so only the base name is
+        // edited.
+        let name = crate::file_table::base_name(&name).to_string();
 
         self.rename_dialog_previous_focus = window.focused(cx);
         let workspace = cx.entity().downgrade();
@@ -3299,7 +3303,12 @@ impl Workspace {
             PanelSide::Right => self.left_panel.clone(),
         };
         let dest_dir = dest_panel.read(cx).active_table().read(cx).current_dir();
-        let initial_link_path = dest_dir.join(&name).to_string_lossy().into_owned();
+        // The base name: a fed search result (T-5.3.7) is named by its
+        // relative path, and the link goes straight into `dest_dir`.
+        let initial_link_path = dest_dir
+            .join(crate::file_table::base_name(&name))
+            .to_string_lossy()
+            .into_owned();
 
         self.link_dialog_previous_focus = window.focused(cx);
         let workspace = cx.entity().downgrade();
@@ -5482,7 +5491,7 @@ fn panel_header_footer_active(
         dir: table.current_dir().to_path_buf(),
         fed: table
             .fed_listing()
-            .map(|fed| SharedString::from(format!("\u{2315} Search results: {}", fed.label))),
+            .map(|fed| SharedString::from(format!("Search results: {}", fed.label))),
     };
     let footer = panel_footer_text(table, cx);
     (header, footer, active)
@@ -13117,6 +13126,36 @@ mod tests {
                 assert_eq!(memory.fields.content, "todo");
                 assert!(memory.options.whole_words);
             });
+        });
+    }
+
+    /// Shift+F6 on a nested fed entry edits only its base name and renames
+    /// it inside its own folder (`plan_rename_in_place` takes a plain name).
+    #[gpui::test]
+    fn shift_f6_on_a_fed_entry_renames_it_in_its_own_folder(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            let table = feed_rs_files(&workspace, vcx, dir.path());
+            table.update(vcx, |table, cx| table.select_file_by_name("sub/b.rs", cx));
+
+            vcx.dispatch_action(RenameDialog);
+            let state = open_rename_dialog_state(&workspace, vcx);
+            state.read_with(vcx, |state, cx| {
+                assert_eq!(state.stem_value(cx), "b");
+                assert_eq!(
+                    state.source(),
+                    &crate::file_table::local_vpath(&dir.path().join("sub/b.rs")).unwrap()
+                );
+            });
+            state.update_in(vcx, |state, window, cx| {
+                state.set_stem_value("renamed", window, cx)
+            });
+            press_enter(vcx);
+            let renamed = dir.path().join("sub/renamed.rs");
+            wait_until(vcx, |vcx| {
+                renamed.is_file() && workspace.read_with(vcx, |ws, _| ws.rename_dialog.is_none())
+            });
+            assert!(!dir.path().join("sub/b.rs").exists());
         });
     }
 
