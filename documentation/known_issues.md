@@ -269,3 +269,28 @@ in `text::wrap_pieces`; a `[viewer]` settings section; `n`/`Shift+N` or
 a confirmed TC Lister key for find-next once Appendix A's F3 row is
 verified hands-on; zoom/pan in image mode (T-5.3.8's quick view will
 want the same); a reload on Ctrl+R / F2 as TC's Lister does.
+
+## FR-TOOL-02 / T-5.3.8: quick view is not persisted and previews files only
+
+**Symptom:** (1) Ctrl+Q's preview is gone after a restart; `session.json`
+records the panels' tabs, not that one of them was a quick view. (2)
+While the preview is up, the replaced panel's tab strip is hidden; its
+tabs and directory still exist (F5 still targets its directory) but
+cannot be switched until Ctrl+Q restores it. (3) A directory under the
+cursor shows a label with its name, not a listing or an entry count.
+(4) The preview inherits the viewer's own gaps (encoding fallback, wrap
+by characters, no image zoom). (5) In the Tree view (Ctrl+F10) the
+cursor lives in the tree widget, which the preview does not observe;
+it follows the table's last cursor instead.
+
+**Root cause:** scope. Persisting the mode needs a per-panel field in the
+session model; a directory preview needs a listing off the UI thread,
+which is T-5.3.7's search/listing plumbing or a `DirectoryModel` read.
+
+**Why deferred:** the AC (cursor movement updates the preview without
+stutter; large files preview lazily) is met: the update is debounced and
+read on the worker thread, and the embedded viewer builds no index.
+
+**To close this out:** a `quick_view: Option<side>` in `session.json`;
+a lazy entry count or first-page listing for directories; keep the tab
+strip visible above the preview if a TC user misses it.

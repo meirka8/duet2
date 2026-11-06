@@ -17,6 +17,12 @@
 //! small one does. The line index that makes "line N of M" and
 //! `Ctrl+G <line>` possible is built in the background and is optional.
 //!
+//! T-5.3.8's quick view (Ctrl+Q, FR-TOOL-02) is the same entity in an
+//! embedded flavour ([`ViewerState::new_embedded`]): it sits in place of
+//! the inactive panel, follows the other panel's cursor through
+//! [`ViewerState::show`], builds no line index, and Esc or Tab hand the
+//! keyboard back to the file panel.
+//!
 //! Keys (design.md Appendix A, viewer context): Esc/F3 close, Space /
 //! PgDn and Backspace / PgUp page, arrows line and column, Home/End,
 //! Ctrl+F (and F7) find, Ctrl+G goto, Ctrl+PgDn/PgUp next/previous file,
@@ -154,7 +160,19 @@ pub(crate) struct HexView {
     pub(crate) row_count: u64,
 }
 
+/// What the quick view should show for the cursor entry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum QuickTarget {
+    File(PathBuf),
+    Directory(PathBuf),
+    Nothing,
+}
+
 pub(crate) struct ViewerState {
+    /// The quick view flavour -- see the module doc comment.
+    embedded: bool,
+    /// Shown instead of a page: a directory under the cursor, or none.
+    placeholder: Option<String>,
     dir: PathBuf,
     /// Regular files of the panel in display order; Ctrl+PgDn/PgUp walk
     /// them.
@@ -201,13 +219,51 @@ pub(crate) struct ViewerState {
 }
 
 impl ViewerState {
-    #[allow(clippy::too_many_arguments)] // every argument is a distinct piece of panel context
+    /// The F3 viewer on `files[file_ix]` in `dir`.
     pub(crate) fn new(
         dir: PathBuf,
         files: Vec<String>,
         file_ix: usize,
         side: PanelSide,
         workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::build(dir, files, file_ix, side, workspace, false, window, cx);
+        this.open_current(cx);
+        this
+    }
+
+    /// The quick view, showing nothing until [`Self::show`]. `side` is
+    /// the panel it replaces.
+    pub(crate) fn new_embedded(
+        side: PanelSide,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::build(
+            PathBuf::new(),
+            Vec::new(),
+            0,
+            side,
+            workspace,
+            true,
+            window,
+            cx,
+        );
+        this.placeholder = Some("No file under the cursor".to_string());
+        this
+    }
+
+    #[allow(clippy::too_many_arguments)] // every argument is a distinct piece of panel context
+    fn build(
+        dir: PathBuf,
+        files: Vec<String>,
+        file_ix: usize,
+        side: PanelSide,
+        workspace: WeakEntity<Workspace>,
+        embedded: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -218,7 +274,9 @@ impl ViewerState {
             cx.subscribe_in(&find_input, window, Self::on_find_event),
             cx.subscribe_in(&goto_input, window, Self::on_goto_event),
         ];
-        let mut this = Self {
+        Self {
+            embedded,
+            placeholder: None,
             dir,
             files,
             file_ix,
@@ -260,17 +318,70 @@ impl ViewerState {
             highlight: None,
             search_progress: None,
             _subscriptions,
-        };
-        this.open_current(cx);
-        this
+        }
     }
 
-    pub(crate) fn path(&self) -> PathBuf {
-        self.dir.join(&self.files[self.file_ix])
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        self.files.get(self.file_ix).map(|name| self.dir.join(name))
     }
 
     pub(crate) fn file_name(&self) -> &str {
-        &self.files[self.file_ix]
+        self.files.get(self.file_ix).map_or("", String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn embedded(&self) -> bool {
+        self.embedded
+    }
+
+    /// Quick view: show `target`, replacing whatever is shown. A new
+    /// file reopens the worker; a directory or nothing shows a label.
+    pub(crate) fn show(&mut self, target: QuickTarget, cx: &mut Context<Self>) {
+        match target {
+            QuickTarget::File(path) => {
+                let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                    return;
+                };
+                self.dir = parent.to_path_buf();
+                self.files = vec![name.to_string_lossy().into_owned()];
+                self.file_ix = 0;
+                self.placeholder = None;
+                self.open_current(cx);
+            }
+            QuickTarget::Directory(path) => {
+                self.clear_file(cx);
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.placeholder = Some(format!("{name}/\ndirectory"));
+                cx.notify();
+            }
+            QuickTarget::Nothing => {
+                self.clear_file(cx);
+                self.placeholder = Some("No file under the cursor".to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn clear_file(&mut self, _cx: &mut Context<Self>) {
+        self.worker = None;
+        self.files.clear();
+        self.file_ix = 0;
+        self.len = 0;
+        self.detected = None;
+        self.mime = None;
+        if !self.mode_forced {
+            self.mode = None;
+        }
+        self.text = None;
+        self.hex = None;
+        self.image = None;
+        self.highlight = None;
+        self.status = None;
+        self.search_progress = None;
+        self.index_progress = None;
     }
 
     #[cfg(test)]
@@ -308,11 +419,19 @@ impl ViewerState {
         &self.find_input
     }
 
+    #[cfg(test)]
+    pub(crate) fn placeholder(&self) -> Option<&str> {
+        self.placeholder.as_deref()
+    }
+
     // -- opening -----------------------------------------------------------
 
     /// (Re)opens the current file: a fresh worker, state reset, the
     /// first page requested once the head has been sniffed.
     fn open_current(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.path() else {
+            return;
+        };
         self.worker = None;
         self.len = 0;
         self.detected = None;
@@ -335,7 +454,7 @@ impl ViewerState {
         self.search_progress = None;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Reply>();
-        let handle = worker::spawn(self.path(), tx);
+        let handle = worker::spawn(path, tx, !self.embedded);
         self.worker = Some(handle);
         cx.spawn(async move |this, cx| {
             while let Some(reply) = rx.recv().await {
@@ -849,8 +968,14 @@ impl ViewerState {
     // -- workspace integration ---------------------------------------------
 
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let embedded = self.embedded;
+        let focused = self.focus_handle.is_focused(window);
         let _ = self.workspace.update(cx, |workspace, cx| {
-            workspace.close_viewer(window, cx);
+            if embedded {
+                workspace.close_quick_view(focused, window, cx);
+            } else {
+                workspace.close_viewer(window, cx);
+            }
         });
     }
 

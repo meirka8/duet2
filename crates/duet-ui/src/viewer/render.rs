@@ -186,12 +186,20 @@ impl Render for ViewerState {
         let tokens = TokenPalette::current(cx);
         let colors = tokens.color;
         let this = cx.entity().clone();
-        let title_name: SharedString = format!(
-            "{}  ({} of {})",
-            self.file_name(),
-            self.file_ix + 1,
-            self.files.len()
-        )
+        let title_name: SharedString = if self.embedded {
+            if self.files.is_empty() {
+                "Quick view".to_string()
+            } else {
+                format!("Quick view  {}", self.file_name())
+            }
+        } else {
+            format!(
+                "{}  ({} of {})",
+                self.file_name(),
+                self.file_ix + 1,
+                self.files.len()
+            )
+        }
         .into();
         let size_text: SharedString = human_size(self.len).into();
         let mode_text: SharedString = self.mode_text().into();
@@ -202,7 +210,24 @@ impl Render for ViewerState {
             _ => None,
         };
 
+        let placeholder = self.placeholder.clone();
         let body = match self.mode {
+            _ if placeholder.is_some() => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(colors.statusbar_fg)
+                .child(
+                    div().flex().flex_col().items_center().children(
+                        placeholder
+                            .unwrap_or_default()
+                            .split('\n')
+                            .map(|line| SharedString::from(line.to_string()))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .into_any_element(),
             Some(Mode::Text) => {
                 let rows: Vec<_> = self
                     .text
@@ -313,6 +338,7 @@ impl Render for ViewerState {
         };
 
         let hints: SharedString = match self.mode {
+            _ if self.embedded => "Esc / Ctrl+Q close · Tab back to the panel · Ctrl+2 hex · W wrap".into(),
             Some(Mode::Image) => "Esc close · Ctrl+1 text · Ctrl+2 hex · Ctrl+PgDn/PgUp next/prev file".into(),
             Some(Mode::Hex) | Some(Mode::Binary) => {
                 "Esc close · Ctrl+F find · Ctrl+G offset · Ctrl+1 text · Ctrl+4 image · Ctrl+PgDn/PgUp next/prev file".into()
@@ -320,9 +346,14 @@ impl Render for ViewerState {
             _ => "Esc close · Ctrl+F find · Ctrl+G line · W wrap · Ctrl+E encoding · Ctrl+2 hex · Ctrl+PgDn/PgUp next/prev file".into(),
         };
 
+        let key_context = if self.embedded {
+            "Viewer QuickView"
+        } else {
+            "Viewer"
+        };
         div()
             .id("viewer")
-            .key_context("Viewer")
+            .key_context(key_context)
             .track_focus(&self.focus_handle)
             .size_full()
             .flex()

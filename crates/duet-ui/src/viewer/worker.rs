@@ -137,8 +137,10 @@ impl Drop for WorkerHandle {
 pub(crate) type ReplySender = tokio::sync::mpsc::UnboundedSender<Reply>;
 
 /// Opens `path` on its own thread and serves requests until the handle
-/// is dropped.
-pub(crate) fn spawn(path: PathBuf, replies: ReplySender) -> WorkerHandle {
+/// is dropped. `build_index`: scan the file for line numbers in the
+/// background (the F3 viewer); the quick view passes `false` so a large
+/// file under the cursor costs one page, not a full read.
+pub(crate) fn spawn(path: PathBuf, replies: ReplySender, build_index: bool) -> WorkerHandle {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let search_cancel = Arc::new(AtomicBool::new(false));
@@ -150,7 +152,7 @@ pub(crate) fn spawn(path: PathBuf, replies: ReplySender) -> WorkerHandle {
     let spawned = std::thread::Builder::new()
         .name("duet-viewer".to_string())
         .spawn(move || {
-            serve(&path, rx, replies, stop, search_cancel);
+            serve(&path, rx, replies, stop, search_cancel, build_index);
         });
     if let Err(e) = spawned {
         tracing::error!(target: "duet_ui::viewer", error = %e, "viewer thread failed to start");
@@ -173,6 +175,7 @@ fn serve(
     replies: ReplySender,
     stop: Arc<AtomicBool>,
     search_cancel: Arc<AtomicBool>,
+    build_index: bool,
 ) {
     let src = match FileSource::open(path) {
         Ok(src) => src,
@@ -205,7 +208,7 @@ fn serve(
 
     // The line index, for text that is worth counting.
     let is_image = mime.is_some_and(|m| m.starts_with("image/"));
-    let index = (!detected.binary && !is_image).then(|| {
+    let index = (build_index && !detected.binary && !is_image).then(|| {
         let index = Arc::new(Mutex::new(LineIndex::new(detected.bom, len)));
         let builder_index = index.clone();
         let builder_path = path.to_path_buf();
@@ -578,7 +581,7 @@ mod tests {
     fn open(rt: &tokio::runtime::Runtime, path: &Path) -> (WorkerHandle, UnboundedReceiver<Reply>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = rt;
-        let handle = spawn(path.to_path_buf(), tx);
+        let handle = spawn(path.to_path_buf(), tx, true);
         (handle, rx)
     }
 
