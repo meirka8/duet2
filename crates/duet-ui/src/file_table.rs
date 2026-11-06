@@ -2630,8 +2630,9 @@ pub struct FileTable {
     /// [`Self::scroll_grid_to_cursor`].
     grid_scrolled_cursor: Option<Option<usize>>,
     /// T-5.3.3: the `CutMarks` generation and directory the delegate's
-    /// cut-name set was last synced for -- see `render`.
-    cut_sync: (u64, PathBuf),
+    /// cut-name set was last synced for, and whether the listing was a
+    /// fed one (T-5.3.7) -- see `render`.
+    cut_sync: (u64, PathBuf, bool),
     /// T-5.3.7: set while this tab shows a fed search result set instead
     /// of `current_dir`'s own listing -- see [`FedListing`].
     fed: Option<FedListing>,
@@ -3060,7 +3061,7 @@ impl FileTable {
             brief_scroll: ScrollHandle::new(),
             tree: None,
             grid_scrolled_cursor: None,
-            cut_sync: (u64::MAX, PathBuf::new()),
+            cut_sync: (u64::MAX, PathBuf::new(), false),
             fed: None,
         };
         this.set_view_mode(initial_view, cx);
@@ -4375,9 +4376,19 @@ impl Render for FileTable {
         // T-5.3.3: re-sync the cut-name set when the marks or the
         // directory changed (one comparison per frame otherwise).
         let cut_generation = CutMarks::generation(cx);
-        if self.cut_sync.0 != cut_generation || self.cut_sync.1 != self.current_dir {
-            self.cut_sync = (cut_generation, self.current_dir.clone());
-            let names = CutMarks::names_for(cx, &self.current_dir);
+        let fed = self.fed.is_some();
+        if self.cut_sync.0 != cut_generation
+            || self.cut_sync.1 != self.current_dir
+            || self.cut_sync.2 != fed
+        {
+            self.cut_sync = (cut_generation, self.current_dir.clone(), fed);
+            // A fed listing (T-5.3.7) names entries relative to
+            // `current_dir`, so its cut marks come from the whole subtree.
+            let names = if fed {
+                CutMarks::relative_names_under(cx, &self.current_dir)
+            } else {
+                CutMarks::names_for(cx, &self.current_dir)
+            };
             self.state
                 .update(cx, |state, _| state.delegate_mut().set_cut_names(names));
         }
