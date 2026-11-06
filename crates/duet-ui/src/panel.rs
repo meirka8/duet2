@@ -366,6 +366,30 @@ impl Panel {
         cx.notify();
     }
 
+    /// T-5.3.7's "feed to panel": shows a search result set (entries named
+    /// relative to `root`) in the active tab, which then has keyboard
+    /// focus. A locked tab is not changed: the results open in a new tab,
+    /// the same redirect its navigation would get.
+    pub(crate) fn feed_listing(
+        &mut self,
+        root: PathBuf,
+        label: String,
+        entries: Vec<(String, duet_types::Metadata)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = &self.tabs[self.active];
+        if tab.locked && !tab.lock_dir_change {
+            self.open_redirected_tab(root.clone(), window, cx);
+        }
+        let table = self.active_table().clone();
+        table.update(cx, |table, cx| {
+            table.show_fed_listing(root, label, entries, cx);
+        });
+        self.focus_active_tab(window, cx);
+        cx.notify();
+    }
+
     /// Ctrl+T (`tab.new`): opens a new, unlocked tab at the *active* tab's
     /// current directory (`docs/keymap-tc.csv`'s own description: "a new
     /// tab (duplicate of current directory)") and switches to it. Always
@@ -671,11 +695,16 @@ impl Panel {
 /// rest of the UI's current all-text chrome rather than introducing the
 /// first icon glyph in a tab label specifically.
 fn tab_label(tab: &TabEntry, cx: &App) -> SharedString {
-    let dir = tab.table.read(cx).current_dir();
-    let name = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| dir.display().to_string());
+    let table = tab.table.read(cx);
+    let dir = table.current_dir();
+    let name = match table.fed_listing() {
+        // T-5.3.7: a fed search result set.
+        Some(fed) => format!("Search: {}", fed.label),
+        None => dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string()),
+    };
     match (tab.locked, tab.lock_dir_change) {
         (true, true) => format!("[L+] {name}").into(),
         (true, false) => format!("[L] {name}").into(),

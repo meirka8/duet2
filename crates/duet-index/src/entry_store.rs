@@ -257,7 +257,11 @@ impl EntryStore {
         // this *is* the POSIX convention), so it's derived from the name
         // at push time, once, rather than re-checking `name.starts_with('.')`
         // on every filter evaluation.
-        flags.set_hidden(name.starts_with('.'));
+        // The last path component: a fed search listing (T-5.3.7) names
+        // entries by relative path, and `.config/app.toml` is not hidden
+        // while `src/.env` is.
+        let base = name.rsplit('/').next().unwrap_or(name);
+        flags.set_hidden(base.starts_with('.'));
         self.flags.push(flags);
         self.extended
             .push(has_extended.then(|| Box::new(metadata.clone())));
@@ -405,6 +409,18 @@ mod tests {
             store.extended(a).is_none(),
             "brief metadata shouldn't allocate extended"
         );
+    }
+
+    #[test]
+    fn hidden_is_judged_on_the_last_path_component() {
+        // T-5.3.7: fed search results are named by relative path.
+        let mut store = EntryStore::new();
+        let dotfile = store.push(".bashrc", &brief(EntryKind::File, 1));
+        let under_dotdir = store.push(".config/app.toml", &brief(EntryKind::File, 1));
+        let nested_dotfile = store.push("src/.env", &brief(EntryKind::File, 1));
+        assert!(store.flags(dotfile).hidden());
+        assert!(!store.flags(under_dotdir).hidden());
+        assert!(store.flags(nested_dotfile).hidden());
     }
 
     #[test]
