@@ -8,36 +8,6 @@ boundaries) lives in `AGENTS.md` and applies in full:
 The points below are the ones that have been missed in practice and are
 therefore restated here, where every session reads them.
 
-## Record reasoning in CVC (mandatory)
-
-CVC (Cognitive Version Control) is wired into this repository: git hooks
-link recorded thoughts to the commits they precede and publish them with
-`git push`. Thoughts recorded through its MCP tools are the only durable
-record of *why* something was done; PR bodies and commit messages are
-not a substitute.
-
-- **At the start of a task**, call `read_history` (after `sync_history`
-  if the checkout may be behind) before assuming a blank slate.
-- **After every meaningful step**, call `commit_thought`: a plan formed,
-  a non-trivial decision, an approach rejected, a subtask finished. Do
-  it *before* the commit the reasoning belongs to, so the post-commit
-  hook can link it. One entry per decision; concise, not exhaustive.
-- Reference the WBS task id (`T-x.y.z`) and the branch in the entry.
-- When working in a git worktree, pass the worktree path as `cwd`.
-- If a CVC tool reports missing storage or hooks, call `setup_cvc`.
-- Thoughts are only persisted once capture has been acknowledged on the
-  machine (`cvc privacy status` shows `capture_acknowledged: true`).
-  The acknowledgement needs an interactive terminal:
-  `cvc privacy acknowledge-capture`. Until it is given, `commit_thought`
-  returns an id but the hooks never see the entry -- check
-  `cvc status` after the first commit of a session and say so if the
-  count didn't move.
-- Publication to the remote is consent-gated (`cvc privacy status`,
-  `auto_push`); never change that setting without being asked.
-
-PRs #58–#71 (September 2026) carry no thoughts because those sessions
-never called `commit_thought`. Don't repeat that.
-
 ## Working pattern that this repository relies on
 
 - Small feature branches off `main`, one PR each. Do not stack PRs: a

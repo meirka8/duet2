@@ -19,18 +19,7 @@ When decomposing goals into sub-tasks, delegate work to these specialized subage
 
 ---
 
-## 2. CVC (Cognitive Version Control) Thought Tracking Directive
-
-To maintain cognitive context across complex multi-step refactors, long-running agent tasks, and phase transitions, use the CVC MCP tools (`read_history`, `sync_history`, `commit_thought`, `setup_cvc`); the repository's git hooks link each recorded thought to the commit that follows it and publish thoughts on `git push`:
-
-1. **Start from the record:** At the start of a task call `read_history` (after `sync_history` when the checkout may be behind) before assuming a blank slate.
-2. **Continuous Intent Logging:** Whenever taking on a non-trivial architectural decision, starting a new WBS task (`T-x.x.x`), rejecting an approach, or evaluating a trade-off, call `commit_thought` with the reasoning -- *before* the commit it belongs to, so the hook can link it.
-3. **Phase Boundary Summaries:** At the completion of each task or milestone, log a thought summarizing what was accomplished, any technical debt introduced, and instructions for the next agent session.
-4. **Branch/Context Tagging:** Ensure thought entries reference the active git branch or phase task ID so architectural decisions remain traceable; in a git worktree pass the worktree path as `cwd`.
-
----
-
-## 3. Git & Pull Request Policy
+## 2. Git & Pull Request Policy
 
 All agents and main orchestrators must strictly adhere to this Git workflow:
 
@@ -47,7 +36,7 @@ All agents and main orchestrators must strictly adhere to this Git workflow:
 
 ---
 
-## 4. Architectural Boundaries & Non-Negotiables
+## 3. Architectural Boundaries & Non-Negotiables
 
 1. **Isolation Rule (ADR-002):** Only `duet-ui` and `duet-widgets` may import `gpui` or `gpui-component`[cite: 1]. The core engine must remain completely UI-agnostic[cite: 1].
 2. **UI Thread Discipline:** Never run disk I/O, `stat` calls, network requests, or blocking syscalls on the UI thread[cite: 1]. Always assert the non-blocking guard (`T-3.1.6`)[cite: 2].
@@ -56,20 +45,18 @@ All agents and main orchestrators must strictly adhere to this Git workflow:
 
 ---
 
-## 5. Delegation Playbook for `/goal` Tasks
+## 4. Delegation Playbook for `/goal` Tasks
 
 When the user provides a `/goal` prompt:
 
 1. **Phase Check:** Cross-reference `task.md` to identify which phase and task IDs (`T-x.x.x`) the goal maps to[cite: 2].
-2. **Log Intent:** Record the initial task goal and strategy via the **Volute MCP**.
-3. **Branch Creation:** Ensure a feature branch is checked out before making edits (`git checkout -b feature/...`).
-4. **Plan & Delegate:**
+2. **Branch Creation:** Ensure a feature branch is checked out before making edits (`git checkout -b feature/...`).
+3. **Plan & Delegate:**
    - **Data/Backend Logic:** Delegate file structures, VFS traits, or operations planning to `@backend-rust`.
    - **UI Views & Keybindings:** Delegate panel layouts, table delegates, or command palettes to `@frontend-gpui`.
    - **Extension Interfaces:** Delegate WIT specs or WASM sandboxing to `@plugin-wasm`.
    - **UX & Safety Review:** Have `@ux-psychologist` review visual contrast or friction points on complex dialogs.
    - **Testing:** Have `@qa-chaos` write unit, conformance, or fault-injection tests before marking a task complete.
-5. **Completion Gate:**
+4. **Completion Gate:**
    - Ensure small, logical commits are made during execution.
-   - Call CVC `commit_thought` to capture closing thoughts and summaries.
    - Open a PR via `gh pr create` and request user review when reaching a Phase Gate.
