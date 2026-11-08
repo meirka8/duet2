@@ -299,10 +299,13 @@ actions!(duet_workspace, [ViewFile]);
 actions!(duet_workspace, [QuickViewToggle]);
 
 // T-5.3.7's Find Files dialog (`tool.search`, FR-TOOL-04): Alt+F7, Total
-// Commander's own key (`docs/keymap-tc.csv`, "known"). `Workspace` context
-// like every other dialog-opening chord. GNOME's window manager grabs
-// Alt+F7 for "move window" by default (`known_issues.md`); the palette's
-// `tool.search` row is the fallback there.
+// Commander's own key (`docs/keymap-tc.csv`, "known"), in the `Workspace`
+// context like every other dialog-opening chord. GNOME's window manager
+// grabs Alt+F7 for "move window" by default, so Ctrl+F -- what GNOME
+// Files, Dolphin, Thunar and Nemo search with -- opens it too (design.md
+// Appendix A.4). Ctrl+F is scoped to `FileTable`, the panel itself: the
+// viewer keeps it for find-in-file, and the command line and path bar
+// never see it taken.
 actions!(duet_workspace, [OpenSearchDialog]);
 
 /// Registers the workspace's own keybindings. Called once from [`run`],
@@ -340,6 +343,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("f3", ViewFile, Some("FileTable")),
         KeyBinding::new("ctrl-q", QuickViewToggle, Some("Workspace")),
         KeyBinding::new("alt-f7", OpenSearchDialog, Some("Workspace")),
+        KeyBinding::new("ctrl-f", OpenSearchDialog, Some("FileTable")),
         // Tab from inside the quick view goes back to the file panel;
         // "QuickView" is only on the embedded viewer, never the F3 one.
         KeyBinding::new("tab", FocusOtherPanel, Some("QuickView")),
@@ -12938,6 +12942,21 @@ mod tests {
                 let memory = dialog.memory(cx);
                 assert_eq!(memory.fields.roots, dir.path().to_string_lossy());
                 assert_eq!(memory.fields.name, "*");
+            });
+        });
+    }
+
+    /// Ctrl+F, the GNOME-safe alias (Alt+F7 is GNOME's "move window"), as a
+    /// real keystroke from a focused panel -- safe to simulate for the
+    /// reason `ctrl_a_opens_the_attributes_dialog_...` gives.
+    #[gpui::test]
+    fn ctrl_f_in_a_panel_opens_the_search_dialog(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            vcx.simulate_keystrokes("ctrl-f");
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.search_dialog.is_some())
             });
         });
     }

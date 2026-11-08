@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! T-5.3.7's Find Files dialog (Alt+F7, `tool.search`, FR-TOOL-04): name
+//! T-5.3.7's Find Files dialog (Alt+F7 or Ctrl+F, `tool.search`, FR-TOOL-04): name
 //! masks or a name regex, content search, size/date/kind filters, results
 //! streamed in while the search runs, "go to file", and **feed to panel**.
 //!

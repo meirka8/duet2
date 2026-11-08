@@ -299,8 +299,9 @@ strip visible above the preview if a TC user misses it.
 
 **Symptom:** (1) Alt+F7 does nothing on a stock GNOME session: Mutter
 grabs `<Alt>F7` for "move window" (`org.gnome.desktop.wm.keybindings
-begin-move`) before the application sees it. The command palette's
-`tool.search` row ("Open the search dialog") opens the same dialog. (2)
+begin-move`) before the application sees it. Ctrl+F in a panel opens
+the same dialog (design.md Appendix A.4), as does the palette's
+`tool.search` row; the palette lists only the TC chord. (2)
 Search walks the local filesystem only -- not inside archives (that is
 T-6.1.11) and not through other VFS backends. (3) A regex content search
 is UTF-8 only (the dialog refuses a regex with another encoding chosen);
@@ -334,9 +335,8 @@ listing works with F5/F6/F8, Enter, F3, Ctrl+Q and the clipboard,
 because its entries resolve through the same `current_dir.join(name)`
 as a listed directory's.
 
-**To close this out:** a Duet alias for `tool.search` once Appendix A
-settles one (or document `gsettings set org.gnome.desktop.wm.keybindings
-begin-move "[]"`); T-6.1.11 for archives; a `FileSystem`-based walker
+**To close this out:** show Duet's own additions (Ctrl+F) in the
+palette next to the TC chords; T-6.1.11 for archives; a `FileSystem`-based walker
 for remote backends; per-encoding regex translation for the common
 subset (literal runs plus classes); a `fed` record in `session.json`;
 FR-TOOL-05's saved definitions on top of `SearchSpec`.
