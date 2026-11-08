@@ -28,31 +28,31 @@ const KEY_CHORD: [&str; 12] = [
     "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
 ];
 
-/// `design.md` Appendix A.4: a Duet-only addition layered on top of the TC
-/// base (occupies a chord TC never claimed), so it is deliberately *not* in
-/// `docs/keymap-tc.csv` (that file is scoped to TC's own survey). Named
-/// here as the one manual entry in an otherwise fully data-derived bar.
-const F11_ADDITION: (&str, &str) = ("f11", "window.toggle_fullscreen");
+/// `design.md` Appendix A.4: Duet-only additions layered on top of the TC
+/// base, so they are deliberately *not* in `docs/keymap-tc.csv` (that file
+/// is scoped to TC's own survey). F11 occupies a chord TC never claimed;
+/// F9 replaces TC's "activate the menu above the source panel" -- Duet has
+/// no menu bar -- with Find Files, because GNOME grabs Alt+F7. Each wins
+/// over the survey's row for its key, the way a later keymap layer would.
+/// Named here as the only manual entries in an otherwise data-derived bar.
+const DUET_ADDITIONS: [(&str, &str); 2] =
+    [("f9", "tool.search"), ("f11", "window.toggle_fullscreen")];
 
 /// Short labels for the handful of default-keymap commands that are *not*
-/// in the registered catalogue (`docs/commands.md`) -- `help.show`,
-/// `menu.activate`, and `tbd.f9_unverified` exist only in
-/// `docs/keymap-tc.csv`'s survey data (see that file's own `description`
-/// column, quoted per entry below) plus the one Appendix-A.4 addition,
-/// which is not in either data file. Every other slot's label is derived
-/// live from the registered [`duet_commands::Command::title`] -- this table
-/// exists only because those specific four ids were never given a
-/// catalogue entry to derive a title from.
+/// in the registered catalogue (`docs/commands.md`) -- `help.show` and
+/// `menu.activate` exist only in `docs/keymap-tc.csv`'s survey data (see
+/// that file's own `description` column, quoted per entry below), and
+/// `window.toggle_fullscreen` is an Appendix-A.4 addition in neither data
+/// file. Every other slot's label is derived live from the registered
+/// [`duet_commands::Command::title`] -- this table exists only because
+/// those specific three ids were never given a catalogue entry to derive a
+/// title from.
 fn fallback_label(id: &str) -> &'static str {
     match id {
         // docs/keymap-tc.csv: "Open context-sensitive help"
         "help.show" => "Help",
         // docs/keymap-tc.csv: "Activate/focus the main menu bar ..."
         "menu.activate" => "Menu",
-        // docs/keymap-tc.csv: "Default TC 11 behaviour for bare F9 could
-        // not be confidently recalled ..." -- deliberately flagged as
-        // unresolved rather than guessed, see design.md Appendix A.
-        "tbd.f9_unverified" => "(unverified)",
         // design.md Appendix A.4.
         "window.toggle_fullscreen" => "Fullscreen",
         // Any other unregistered id would be a genuine gap in this
@@ -105,13 +105,15 @@ pub fn build_function_bar() -> Vec<FKeySlot> {
         .zip(KEY_CHORD.iter())
         .map(|(&display, &chord_name)| {
             let chord = KeyChord::parse(chord_name).expect("bare Fn key names always parse");
-            let command_id = resolved
-                .find(&panel_ctx, &chord)
-                .or_else(|| resolved.find(&app_ctx, &chord))
-                .map(|b| b.binding.command.clone())
+            let command_id = DUET_ADDITIONS
+                .iter()
+                .find(|(addition, _)| *addition == chord_name)
+                .map(|(_, id)| CommandId::new(id).expect("valid command id"))
                 .or_else(|| {
-                    (chord_name == F11_ADDITION.0)
-                        .then(|| CommandId::new(F11_ADDITION.1).expect("valid command id"))
+                    resolved
+                        .find(&panel_ctx, &chord)
+                        .or_else(|| resolved.find(&app_ctx, &chord))
+                        .map(|b| b.binding.command.clone())
                 });
 
             let label = command_id
@@ -161,7 +163,7 @@ mod tests {
         assert_eq!(by_key("F8"), "Delete");
     }
 
-    /// F1/F9/F10 are real default TC bindings whose commands are not in the
+    /// F1/F10 are real default TC bindings whose commands are not in the
     /// registered catalogue -- exercised via the documented fallback table,
     /// not silently blank.
     #[test]
@@ -170,18 +172,19 @@ mod tests {
         let by_key = |k: &str| slots.iter().find(|s| s.key == k).unwrap().label.clone();
 
         assert_eq!(by_key("F1"), "Help");
-        assert_eq!(by_key("F9"), "(unverified)");
         assert_eq!(by_key("F10"), "Menu");
     }
 
-    /// F11 is the one design.md Appendix A.4 addition (not in either data
-    /// file this loads); F12 has no documented default anywhere and must
-    /// stay honestly blank rather than fabricate a label.
+    /// F9 and F11 are the design.md Appendix A.4 additions (in neither data
+    /// file this loads; F9's wins over the TC survey's own F9 row); F12 has
+    /// no documented default anywhere and must stay honestly blank rather
+    /// than fabricate a label.
     #[test]
-    fn f11_addition_and_f12_gap_are_handled_honestly() {
+    fn additions_and_the_f12_gap_are_handled_honestly() {
         let slots = build_function_bar();
         let by_key = |k: &str| slots.iter().find(|s| s.key == k).unwrap().label.clone();
 
+        assert_eq!(by_key("F9"), "Search");
         assert_eq!(by_key("F11"), "Fullscreen");
         assert_eq!(by_key("F12"), "");
     }

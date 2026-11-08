@@ -301,11 +301,11 @@ actions!(duet_workspace, [QuickViewToggle]);
 // T-5.3.7's Find Files dialog (`tool.search`, FR-TOOL-04): Alt+F7, Total
 // Commander's own key (`docs/keymap-tc.csv`, "known"), in the `Workspace`
 // context like every other dialog-opening chord. GNOME's window manager
-// grabs Alt+F7 for "move window" by default, so Ctrl+F -- what GNOME
-// Files, Dolphin, Thunar and Nemo search with -- opens it too (design.md
-// Appendix A.4). Ctrl+F is scoped to `FileTable`, the panel itself: the
-// viewer keeps it for find-in-file, and the command line and path bar
-// never see it taken.
+// grabs Alt+F7 for "move window" by default, so bare F9 opens it too
+// (design.md Appendix A.4): TC's F9 activates the menu above the source
+// panel, and Duet has no menu bar. Not Ctrl+F: every text input
+// (gpui-component's) binds that to its own find and swallows it, so it
+// would only work with a panel focused.
 actions!(duet_workspace, [OpenSearchDialog]);
 
 /// Registers the workspace's own keybindings. Called once from [`run`],
@@ -343,7 +343,7 @@ fn bind_workspace_keys(cx: &mut App) {
         KeyBinding::new("f3", ViewFile, Some("FileTable")),
         KeyBinding::new("ctrl-q", QuickViewToggle, Some("Workspace")),
         KeyBinding::new("alt-f7", OpenSearchDialog, Some("Workspace")),
-        KeyBinding::new("ctrl-f", OpenSearchDialog, Some("FileTable")),
+        KeyBinding::new("f9", OpenSearchDialog, Some("Workspace")),
         // Tab from inside the quick view goes back to the file panel;
         // "QuickView" is only on the embedded viewer, never the F3 one.
         KeyBinding::new("tab", FocusOtherPanel, Some("QuickView")),
@@ -12946,15 +12946,34 @@ mod tests {
         });
     }
 
-    /// Ctrl+F, the GNOME-safe alias (Alt+F7 is GNOME's "move window"), as a
+    /// F9, the GNOME-safe alias (Alt+F7 is GNOME's "move window"), as a
     /// real keystroke from a focused panel -- safe to simulate for the
     /// reason `ctrl_a_opens_the_attributes_dialog_...` gives.
     #[gpui::test]
-    fn ctrl_f_in_a_panel_opens_the_search_dialog(cx: &mut TestAppContext) {
+    fn f9_in_a_panel_opens_the_search_dialog(cx: &mut TestAppContext) {
         with_workspace(cx, |workspace, vcx| {
             let dir = search_tree();
             focus_left_panel_at(&workspace, vcx, dir.path());
-            vcx.simulate_keystrokes("ctrl-f");
+            vcx.simulate_keystrokes("f9");
+            wait_until(vcx, |vcx| {
+                workspace.read_with(vcx, |ws, _| ws.search_dialog.is_some())
+            });
+        });
+    }
+
+    /// F9 also works from the command line, where Ctrl+F never could: the
+    /// input binds Ctrl+F to its own find and swallows it.
+    #[gpui::test]
+    fn f9_in_the_command_line_opens_the_search_dialog(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            vcx.dispatch_action(CmdlineToggleFocus);
+            let cl = workspace.read_with(vcx, |ws, _| ws.command_line.clone());
+            let handle = cl.read_with(vcx, |cl, cx| cl.focus_handle(cx));
+            assert!(vcx.update(|window, _| handle.is_focused(window)));
+
+            vcx.simulate_keystrokes("f9");
             wait_until(vcx, |vcx| {
                 workspace.read_with(vcx, |ws, _| ws.search_dialog.is_some())
             });
