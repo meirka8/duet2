@@ -31,6 +31,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant via zbus <- oo7 (keyring) <- gpui 0.2.2; Duet does not use gpui's credential API" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via zbus <- oo7 <- gpui 0.2.2" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via zbus <- oo7 <- gpui 0.2.2" },
+    # Published 2026-11; reaches us only through gpui's http client.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils via async-std <- zed-async-tar <- gpui_http_client <- gpui 0.2.2" },
 ]
 
 [licenses]
