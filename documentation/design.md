@@ -819,8 +819,11 @@ These four are Duet-only additions layered on top of the TC-faithful base, chose
 | `F7` (viewer) | `view.search` | Second key for find in the viewer, next to `Ctrl+F`: TC's Lister binds F7 to Find and many hands reach for it. |
 | `Enter` / `Shift+Enter` (viewer find bar) | `view.search_next` / `view.search_prev` | Find next/previous while the find bar has focus (the browser convention). The viewer body has no find-next key because Appendix A gives F3 to "close" pending hands-on verification. |
 | `Ctrl+4` (viewer) | `view.mode_image` | Image mode, continuing TC's `Ctrl+1/2/3` text/hex/binary row (TC's own image mode is `4`, `uncertain`). |
+| `F9` | `tool.search` | Second key for Find Files, next to TC's `Alt+F7`, which GNOME's window manager grabs for "move window" by default (`org.gnome.desktop.wm.keybindings begin-move`), so on a stock GNOME session the application never sees it. **The one deviation in this table**: TC's own `F9` activates the menu above the source panel (A.6.8), and Duet has no menu bar for it to open; revisit if one is ever added. Not `Ctrl+F`, which was tried first: gpui-component's text input binds `Ctrl+F` to its own find and swallows it even when that find is off, so it only worked with a panel focused. `F9` reaches the workspace from the panels and the command line alike. Added with T-5.3.7. |
+| `Alt+E/X/V/W/O/B/K/H/Y/M`, `Ctrl+E` (Find Files dialog) | the dialog's switches (`search.by_regex`, ...) | Name regex, text regex, case, whole words, not containing, skip binary, files/dirs, hidden, follow symlinks, one filesystem; `Ctrl+E` cycles the text encoding as in the viewer. TC's own dialog uses `Alt+letter` accelerators on its checkboxes, but its letters are not in the source table; these are Duet's, picked so no text-field binding is shadowed. `Alt+L` (feed to panel) is TC's "Feed to listbox" accelerator. Added with T-5.3.7. |
+| `Enter` / `Tab` (Find Files result list) | `search.open_result` / `dlg.next_field` | Enter goes to the result (TC's "Go to file"); Tab walks the fields and then the list. Added with T-5.3.7. |
 
-None of these override existing P1 muscle memory, since TC never claimed the chords in the first place — they're pure additions, not deviations, and are listed here rather than in `docs/keymap-tc.csv` because that file is scoped to TC's *own* keymap, not Duet's superset.
+Except `F9` (see its row), none of these override existing P1 muscle memory, since TC never claimed the chords in the first place — they're pure additions, not deviations, and are listed here rather than in `docs/keymap-tc.csv` because that file is scoped to TC's *own* keymap, not Duet's superset.
 
 ### A.5 Implementation note: the numpad dependency
 
@@ -968,7 +971,7 @@ Every row below is sourced directly from `docs/keymap-tc.csv`; the **Duet decisi
 |---|---|---|---|---|---|---|
 | F1 | global | `help.show` | Open context-sensitive help | known | Adopt |  |
 | F10 | global | `menu.activate` | Activate/focus the main menu bar (standard Win32 system accelerator -- same mechanism as pressing Alt; not TC application code) | known | **Adopt**, caveat noted -> §A.1.3 | See design.md Appendix A -- explicit conflict discussion vs Linux terminal-emulator F10 usage and the mc-lineage 'F10=Quit' convention |
-| F9 | panel | `tbd.f9_unverified` | Default TC 11 behaviour for bare F9 could not be confidently recalled -- historically sometimes unused on the function-key bar | uncertain | Adopt | Explicitly flagged gap rather than guessed; needs hands-on verification |
+| F9 | panel | `menu.source_panel` | Activate the menu above the source panel (left or right) | known | **Replace** -> `tool.search` (§A.4) | TC help, "Keyboard layout": activate menu above source window. Duet has no menu bar; F9 is Find Files instead, since GNOME grabs Alt+F7 |
 | Alt+F4 | global | `app.quit` | Quit Total Commander | known | Adopt |  |
 | Alt | global | `menu.activate` | Activate/focus the main menu bar (alternate to F10) | known | Adopt |  |
 | Shift+F10 | global | `menu.context` | Open the context menu for the item under cursor (Windows-standard 'Application key' equivalent, not TC-specific) | known | Adopt |  |

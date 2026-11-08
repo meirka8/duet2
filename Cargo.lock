@@ -1718,6 +1718,16 @@ version = "0.1.0"
 [[package]]
 name = "duet-search"
 version = "0.1.0"
+dependencies = [
+ "duet-types",
+ "encoding_rs",
+ "memchr",
+ "regex",
+ "rustix 1.1.4",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
 
 [[package]]
 name = "duet-types"
@@ -1742,6 +1752,7 @@ dependencies = [
  "duet-meta",
  "duet-ops",
  "duet-platform",
+ "duet-search",
  "duet-types",
  "duet-vfs",
  "duet-widgets",

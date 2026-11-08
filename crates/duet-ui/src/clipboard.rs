@@ -80,6 +80,28 @@ impl CutMarks {
             .and_then(|m| m.by_dir.get(dir).cloned())
     }
 
+    /// T-5.3.7: the cut entries anywhere under `root`, named by their path
+    /// relative to it -- what a fed search listing (whose entries are
+    /// named that way) compares against.
+    pub(crate) fn relative_names_under(cx: &App, root: &Path) -> Option<Arc<HashSet<String>>> {
+        let marks = cx.try_global::<Self>()?;
+        let names: HashSet<String> = marks
+            .by_dir
+            .iter()
+            .filter_map(|(dir, names)| Some((dir.strip_prefix(root).ok()?, names)))
+            .flat_map(|(rel, names)| {
+                names.iter().map(move |name| {
+                    if rel.as_os_str().is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{name}", rel.to_string_lossy())
+                    }
+                })
+            })
+            .collect();
+        (!names.is_empty()).then(|| Arc::new(names))
+    }
+
     /// Replaces the marks with `paths` (when `cut`) or clears them.
     pub(crate) fn set(cx: &mut App, paths: &[PathBuf], cut: bool) {
         let marks = Self::ensure(cx);
@@ -179,6 +201,13 @@ mod tests {
             let marks = CutMarks::names_for(cx, Path::new("/tmp/dir")).expect("marked");
             assert!(marks.contains("a.txt") && marks.contains("b c.txt"));
             assert!(CutMarks::generation(cx) > generation);
+
+            // A fed search listing rooted above sees them by relative path.
+            let fed = CutMarks::relative_names_under(cx, Path::new("/tmp")).expect("marked");
+            assert!(fed.contains("dir/a.txt") && fed.contains("dir/b c.txt"));
+            let at_root = CutMarks::relative_names_under(cx, Path::new("/tmp/dir")).unwrap();
+            assert!(at_root.contains("a.txt"));
+            assert!(CutMarks::relative_names_under(cx, Path::new("/elsewhere")).is_none());
 
             clear(cx);
             assert!(read_files(cx).is_none());
