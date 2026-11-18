@@ -266,7 +266,7 @@ Total entries: **307**, across 23 categories. Every id named in `design.md` §9.
 
 | id | title | category | precondition | notes |
 |---|---|---|---|---|
-| tool.search | Open the search dialog | Search | `panel` | Alt+F7; FR-TOOL-04 |
+| tool.search | Search for files and folders | Search | `panel` | Alt+F7, F9 (Duet, Appendix A.4); FR-TOOL-04 |
 | search.start | Execute the configured search | Search | `dialog` | |
 | search.cancel | Cancel a running search | Search | `search.running` | |
 | search.by_name_mask | Add a name-mask filter | Search | `dialog` | FR-TOOL-04 |

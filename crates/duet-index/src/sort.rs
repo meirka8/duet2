@@ -52,6 +52,9 @@ pub enum SortColumn {
 /// yields `""` too. Shared by the sorter's `Extension` keys and the
 /// UI's Ext column so the two can never disagree about what counts.
 pub fn extension_of(name: &str) -> &str {
+    // Of the last path component: a fed search listing (T-5.3.7) names
+    // entries by relative path, and `v1.2/Makefile` has no extension.
+    let name = name.rsplit('/').next().unwrap_or(name);
     match name.rfind('.') {
         Some(0) | None => "",
         Some(ix) => &name[ix + 1..],
@@ -491,6 +494,14 @@ mod tests {
         assert_eq!(extension_of(".config.toml"), "toml");
         assert_eq!(extension_of("trailing."), "");
         assert_eq!(extension_of(""), "");
+    }
+
+    #[test]
+    fn extension_of_a_relative_path_is_its_last_components() {
+        // T-5.3.7: fed search results are named by relative path.
+        assert_eq!(extension_of("src/main.rs"), "rs");
+        assert_eq!(extension_of("v1.2/Makefile"), "");
+        assert_eq!(extension_of("a.d/.bashrc"), "");
     }
 
     #[test]

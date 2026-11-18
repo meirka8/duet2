@@ -294,3 +294,50 @@ read on the worker thread, and the embedded viewer builds no index.
 **To close this out:** a `quick_view: Option<side>` in `session.json`;
 a lazy entry count or first-page listing for directories; keep the tab
 strip visible above the preview if a TC user misses it.
+
+## FR-TOOL-04 / T-5.3.7: search is local-only, and a fed listing is not a saved place
+
+**Symptom:** (1) Alt+F7 does nothing on a stock GNOME session: Mutter
+grabs `<Alt>F7` for "move window" (`org.gnome.desktop.wm.keybindings
+begin-move`) before the application sees it. F9 opens the same dialog
+(design.md Appendix A.4) -- TC's F9 opens a menu bar Duet does not have
+-- as does the palette's `tool.search` row; the palette lists only the
+TC chord. (2)
+Search walks the local filesystem only -- not inside archives (that is
+T-6.1.11) and not through other VFS backends. (3) A regex content search
+is UTF-8 only (the dialog refuses a regex with another encoding chosen);
+the UTF-16 and code-page encodings apply to literal text. Whole words
+use ASCII word boundaries and apply to the UTF-8 form only. A match
+cannot span a line break, and a line longer than 1 MiB is searched in
+1 MiB windows overlapping by 4 KiB, so a match longer than 4 KiB inside
+such a line can be missed. (4) With "binary files: skipped", a UTF-16
+file without a byte-order mark counts as binary. (5) Attribute filters
+are the kind (files/directories), hidden and symlink switches; there is
+no permission, owner or "executable" filter. (6) A fed listing is not
+persisted: after a restart the tab shows the search root's own listing.
+It is not in the tab's history either -- Back after leaving it returns to
+the root's listing, not to the results. A reread (Ctrl+R, or the refresh
+after a job) drops entries that are gone but does not add new matches;
+search again for those. That includes an entry renamed with Shift+F6
+(which renames it in its own folder): it drops out of the listing. (7) Saved search definitions (FR-TOOL-05, P2)
+and a "search in results" mode are not implemented. The result list
+shows names, sizes and dates, not the matching line, and has no F3
+view key: Enter goes to the file, Alt+L feeds the panel.
+
+**Root cause:** scope. GNOME's grab is outside the application;
+archive search is its own WBS row; VFS-backed traversal needs the async
+`FileSystem` trait on the walker's hot path; translating an arbitrary
+regex into UTF-16 or a code page is not something the regex engine
+offers; the rest are features past the task's AC.
+
+**Why deferred:** the AC is met and measured (`task.md`): content search
+of a 5 GiB tree streams its first hit well inside 500 ms, and a fed
+listing works with F5/F6/F8, Enter, F3, Ctrl+Q and the clipboard,
+because its entries resolve through the same `current_dir.join(name)`
+as a listed directory's.
+
+**To close this out:** show Duet's own additions (F9) in the
+palette next to the TC chords; T-6.1.11 for archives; a `FileSystem`-based walker
+for remote backends; per-encoding regex translation for the common
+subset (literal runs plus classes); a `fed` record in `session.json`;
+FR-TOOL-05's saved definitions on top of `SearchSpec`.
