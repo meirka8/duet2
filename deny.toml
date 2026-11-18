@@ -33,6 +33,9 @@ ignore = [
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via zbus <- oo7 <- gpui 0.2.2" },
     # Published 2026-11; reaches us only through gpui's http client.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils via async-std <- zed-async-tar <- gpui_http_client <- gpui 0.2.2" },
+    # Published 2026-11. (The same month's rustix and libz-sys advisories
+    # were fixed by `cargo update` instead: both had patched releases.)
+    { id = "RUSTSEC-2026-0543", reason = "chrono via gpui-component 0.5.1; no maintained release exists to move to" },
 ]
 
 [licenses]
