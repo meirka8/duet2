@@ -14,8 +14,9 @@
 //! name), *Search in* (`;`-separated folders, pre-filled with the panel's
 //! folder), *Containing* (text to find inside files; empty means no
 //! content search), size from/to (`10k`, `1.5G`), modified after/before
-//! (`2026-01-31`, `2026-01-31 14:00`, or an age: `7d`, `12h`), and a
-//! depth limit (empty = unlimited, `0` = the folder itself only).
+//! (`2026-01-31`, `2026-01-31 14:00`, or an age: `7d`, `12h`), and
+//! *Subfolder levels*: how deep below each folder to search (empty = every
+//! level, `0` = the folder itself only).
 //!
 //! The switches are `Alt+letter` chords, Total Commander's own dialog
 //! accelerator style, each also clickable in the dialog:
@@ -133,9 +134,10 @@ actions!(
     ]
 );
 
-/// Rows the result list shows at once (it is a fixed-height viewport);
-/// also what PageUp/PageDown move by.
-const RESULT_ROWS: usize = 14;
+/// The result list takes whatever height the dialog has left over (the
+/// workspace sizes the dialog to the window), but never less than this
+/// many rows.
+const MIN_RESULT_ROWS: f32 = 3.0;
 const ROW_HEIGHT: f32 = 20.0;
 
 /// Registers the dialog's chords -- see the module doc comment's table.
@@ -265,10 +267,9 @@ pub(crate) fn build_spec(
     });
     let depth = match fields.depth.trim() {
         "" => None,
-        text => Some(
-            text.parse::<u32>()
-                .map_err(|_| format!("Depth \u{201c}{text}\u{201d} is not a whole number."))?,
-        ),
+        text => Some(text.parse::<u32>().map_err(|_| {
+            format!("Subfolder levels \u{201c}{text}\u{201d} is not a whole number.")
+        })?),
     };
     let name = fields.name.trim();
     Ok(SearchSpec {
@@ -687,6 +688,13 @@ impl SearchDialogState {
         cx.notify();
     }
 
+    /// What PageUp/PageDown move by: one row short of what the result
+    /// list showed when it was last laid out.
+    fn page_rows(&self) -> i64 {
+        let height = self.scroll.0.borrow().base_handle.bounds().size.height;
+        ((height / px(ROW_HEIGHT)) as i64 - 1).max(1)
+    }
+
     fn current_stop(&self, window: &Window, cx: &App) -> Option<Stop> {
         if self.results_focus.is_focused(window) {
             return Some(Stop::Results);
@@ -861,7 +869,13 @@ fn field_row(label: &'static str, input: &Entity<InputState>) -> impl IntoElemen
         .flex()
         .items_center()
         .gap_2()
-        .child(div().w(px(86.)).flex_none().child(label))
+        .child(
+            div()
+                .w(px(104.))
+                .flex_none()
+                .whitespace_nowrap()
+                .child(label),
+        )
         .child(div().flex_1().child(Input::new(input)))
 }
 
@@ -870,7 +884,7 @@ fn small_field(label: &'static str, input: &Entity<InputState>, width: f32) -> i
         .flex()
         .items_center()
         .gap_1()
-        .child(div().flex_none().child(label))
+        .child(div().flex_none().whitespace_nowrap().child(label))
         .child(div().w(px(width)).child(Input::new(input)))
 }
 
@@ -1060,16 +1074,31 @@ impl Render for SearchDialogState {
             .gap_3()
             .child(small_field("Size from", &self.inputs[3], 80.))
             .child(small_field("to", &self.inputs[4], 80.))
-            .child(small_field("Modified after", &self.inputs[5], 120.))
-            .child(small_field("before", &self.inputs[6], 120.))
-            .child(small_field("Depth", &self.inputs[7], 44.));
+            .child(small_field("Modified after", &self.inputs[5], 150.))
+            .child(small_field("before", &self.inputs[6], 150.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(small_field("Subfolder levels", &self.inputs[7], 44.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child("(empty: all, 0: none)"),
+                    ),
+            );
 
         let count = self.results.len();
         let results = div()
             .id("search-results")
             .key_context("SearchResults")
             .track_focus(&self.results_focus)
-            .h(px(ROW_HEIGHT * RESULT_ROWS as f32 + 2.))
+            .flex_1()
+            .min_h(px(ROW_HEIGHT * MIN_RESULT_ROWS + 2.))
             .border_1()
             .border_color(if self.results_focus_is_focused {
                 tokens.color.border_focus
@@ -1102,10 +1131,10 @@ impl Render for SearchDialogState {
             .on_action(cx.listener(|this, _: &SearchResultsUp, _, cx| this.move_cursor(-1, cx)))
             .on_action(cx.listener(|this, _: &SearchResultsDown, _, cx| this.move_cursor(1, cx)))
             .on_action(cx.listener(|this, _: &SearchResultsPageUp, _, cx| {
-                this.move_cursor(-(RESULT_ROWS as i64 - 1), cx)
+                this.move_cursor(-this.page_rows(), cx)
             }))
             .on_action(cx.listener(|this, _: &SearchResultsPageDown, _, cx| {
-                this.move_cursor(RESULT_ROWS as i64 - 1, cx)
+                this.move_cursor(this.page_rows(), cx)
             }))
             .on_action(
                 cx.listener(|this, _: &SearchResultsHome, _, cx| {
@@ -1136,6 +1165,8 @@ impl Render for SearchDialogState {
         div()
             .id("search-dialog")
             .key_context("SearchDialog")
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .gap_2()
@@ -1157,6 +1188,7 @@ impl Render for SearchDialogState {
             })
             .child(
                 div()
+                    .flex_none()
                     .text_size(px(11.))
                     .text_color(status_color)
                     .truncate()
@@ -1165,6 +1197,7 @@ impl Render for SearchDialogState {
             .when_some(self.first_error.clone(), |this, error| {
                 this.child(
                     div()
+                        .flex_none()
                         .text_size(px(11.))
                         .text_color(tokens.color.warning)
                         .truncate()
@@ -1174,6 +1207,8 @@ impl Render for SearchDialogState {
             .child(results)
             .child(
                 div()
+                    .debug_selector(|| "search-dialog-hints".into())
+                    .flex_none()
                     .text_size(px(11.))
                     .text_color(muted)
                     .child(

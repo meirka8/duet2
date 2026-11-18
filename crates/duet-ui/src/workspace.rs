@@ -4453,6 +4453,7 @@ impl Render for Workspace {
         let theme = cx.theme();
         let bg = theme.background;
         let fg = theme.foreground;
+        let viewport_height = window.viewport_size().height;
 
         // T-5.2.1: the one deferred close path with no live `Window` --
         // see `pending_focus_restore`'s doc comment. Drained before the
@@ -4697,20 +4698,34 @@ impl Render for Workspace {
                 this.child(trash_dialog_overlay(&state, cx))
             })
             .when_some(self.search_dialog.clone(), |this, state| {
-                this.child(search_dialog_overlay(&state, cx))
+                this.child(search_dialog_overlay(&state, viewport_height, cx))
             })
     }
 }
+
+/// The Find Files card's height when the window has room for it: the form
+/// plus about fourteen result rows.
+const SEARCH_CARD_HEIGHT: f32 = 700.;
 
 /// T-5.3.7's Find Files overlay -- the same `.occlude()`-backdrop/card
 /// chrome as [`trash_dialog_overlay`] (see `command_palette_overlay`'s own
 /// doc comment for why), wider and nearer the top: the dialog carries a
 /// form and a result list. A click on the backdrop closes it like Escape.
+///
+/// The card gets a definite height -- [`SEARCH_CARD_HEIGHT`], or less in a
+/// shorter window -- and the dialog's result list takes what the form
+/// leaves of it, so the hint line under the list stays on screen. A
+/// `max_h` alone would leave the list's height indefinite, and the
+/// virtualised list needs a definite one.
 fn search_dialog_overlay(
     state: &Entity<SearchDialogState>,
+    viewport_height: Pixels,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    const TOP: f32 = 48.;
+    const BOTTOM: f32 = 16.;
     let tokens = TokenPalette::current(cx);
+    let height = (viewport_height - px(TOP + BOTTOM)).min(px(SEARCH_CARD_HEIGHT));
     gpui::div()
         .id("search-dialog-backdrop")
         .absolute()
@@ -4719,7 +4734,7 @@ fn search_dialog_overlay(
         .flex()
         .items_start()
         .justify_center()
-        .pt(px(48.))
+        .pt(px(TOP))
         .bg(gpui::hsla(0., 0., 0., 0.5))
         .child(
             gpui::div()
@@ -4727,6 +4742,9 @@ fn search_dialog_overlay(
                 .occlude()
                 .w(px(820.))
                 .max_w(gpui::relative(0.95))
+                .h(height)
+                .flex()
+                .flex_col()
                 .bg(tokens.color.panel_bg_active)
                 .border_1()
                 .border_color(tokens.color.border_focus)
@@ -12977,6 +12995,35 @@ mod tests {
             wait_until(vcx, |vcx| {
                 workspace.read_with(vcx, |ws, _| ws.search_dialog.is_some())
             });
+        });
+    }
+
+    /// The card is sized to the window: in a short one the result list
+    /// gives up rows and the hint line under it stays on screen; in a tall
+    /// one the list keeps its full height.
+    #[gpui::test]
+    fn the_search_dialog_fits_the_window_height(cx: &mut TestAppContext) {
+        with_workspace(cx, |workspace, vcx| {
+            let dir = search_tree();
+            focus_left_panel_at(&workspace, vcx, dir.path());
+            open_search_dialog_state(&workspace, vcx);
+
+            for height in [px(560.), px(1000.)] {
+                vcx.simulate_resize(gpui::size(px(1000.), height));
+                vcx.run_until_parked();
+                let hints = vcx
+                    .debug_bounds("search-dialog-hints")
+                    .expect("the hint line is drawn");
+                assert!(hints.bottom() <= height, "{height:?}: hints at {hints:?}");
+            }
+            let hints_bottom = vcx
+                .debug_bounds("search-dialog-hints")
+                .map(|hints| hints.bottom())
+                .unwrap();
+            assert!(
+                hints_bottom > px(SEARCH_CARD_HEIGHT),
+                "a tall window shows the whole card, not a shrunk one: {hints_bottom:?}"
+            );
         });
     }
 
