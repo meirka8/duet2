@@ -187,6 +187,8 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         let mode = RustixMode::from_raw_mode(mode_bits);
         fs::chmodat(CWD, &path, mode, AtFlags::empty()).map_err(|e| rustix_err("chmodat", p, e))?;
     }
+    // T-10.2.1 crash point: mode applied, nothing after it yet.
+    crate::failpoint::hit("vfs.set_meta.phase_done", 1);
 
     // 2. Xattrs -- ACL/SELinux included, via whatever name the caller put
     // in `set_xattrs`/`remove_xattrs` (see module doc comment).
@@ -217,6 +219,9 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         }
     }
 
+    // T-10.2.1 crash point: mode and xattrs applied, timestamps not yet.
+    crate::failpoint::hit("vfs.set_meta.phase_done", 2);
+
     // 3. Timestamps (see module doc comment for why these come before
     // ownership but after everything else above).
     if m.modified.is_some() || m.accessed.is_some() {
@@ -227,6 +232,9 @@ pub fn set_meta(p: &VPath, m: &duet_types::MetaPatch) -> Result<()> {
         fs::utimensat(CWD, &path, &times, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|e| rustix_err("utimensat", p, e))?;
     }
+
+    // T-10.2.1 crash point: everything but ownership applied.
+    crate::failpoint::hit("vfs.set_meta.phase_done", 3);
 
     // 4. Ownership, genuinely last (see this function's own doc comment).
     // Degrades on `EPERM`/`ROFS` rather than hard-failing the whole call --

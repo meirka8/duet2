@@ -154,6 +154,8 @@ fn empty_dir_contents(dir_fd: &OwnedFd) -> std::result::Result<(), Errno> {
                             first_err.get_or_insert(e);
                         }
                     }
+                    // T-10.2.1 crash point: one more entry of the subtree gone.
+                    crate::failpoint::hit("vfs.remove_recursive.unlinked", 0);
                 }
                 Err(e) => {
                     // ELOOP here means the module doc comment's defense
@@ -171,6 +173,8 @@ fn empty_dir_contents(dir_fd: &OwnedFd) -> std::result::Result<(), Errno> {
             {
                 first_err.get_or_insert(e);
             }
+            // T-10.2.1 crash point: one more entry of the subtree gone.
+            crate::failpoint::hit("vfs.remove_recursive.unlinked", 0);
         }
     }
 

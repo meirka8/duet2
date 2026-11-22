@@ -147,7 +147,10 @@ pub use mover::plan_move;
 pub use plan::{Plan, PlanOptions, PlanTotals};
 pub use planner::{CancelToken, PlannerError, plan_copy};
 pub use queue::{QueueError, QueueManager};
-pub use recovery::{orphaned_partial_path, plan_from_recovery};
+pub use recovery::{
+    ResumePlan, discard_orphaned_partials, orphaned_partial_path, plan_from_recovery,
+    prepare_resume,
+};
 pub use rerun::plan_from_report;
 pub use step::{RemoveMode, Step, StepKind, VerifyAlgorithm};
 pub use trash_restore::{plan_trash_purge, plan_trash_restore};

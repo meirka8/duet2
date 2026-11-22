@@ -161,6 +161,9 @@ impl AsyncWriteCommit for LocalWriteHandle {
             .sync_all()
             .map_err(|e| io_err("fsync(temp)", &this.dest_vpath, e))?;
         drop(this.file);
+        // T-10.2.1 crash point: the staged sibling is complete and durable
+        // but not yet published under the destination name.
+        crate::failpoint::hit("vfs.write.before_publish", 0);
 
         let mut flags = RenameFlags::empty();
         if this.no_replace {

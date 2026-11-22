@@ -63,9 +63,46 @@ jobs:
       # reporting -- see .config/nextest.toml. It cannot run doctests, so
       # those still go through `cargo test --doc`.
       - uses: taiki-e/install-action@nextest
+      # The data-safety suite's ENOSPC cases (T-10.2.1) fill a size-limited
+      # tmpfs mounted in a private user+mount namespace. Ubuntu 24.04
+      # restricts unprivileged user namespaces through AppArmor; lift that
+      # for the job. (The suite fails, rather than skips, without them.)
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo build --workspace --all-targets
       - run: cargo nextest run --workspace
       - run: cargo test --workspace --doc
+
+  data-safety-privileged:
+    # T-10.2.1 (design.md §14.4, NFR-08): the cases of the data-safety
+    # suite that need root -- ENOSPC on a real loop-device filesystem, a
+    # block device that starts failing (dm error target), and power loss
+    # (dm-flakey drop_writes). They are `#[ignore]`d in an ordinary
+    # `cargo nextest run` because a developer machine has no passwordless
+    # sudo; this job is where they run, on every PR, with no retries.
+    # The test process stays unprivileged and calls
+    # scripts/data-safety-device.sh through `sudo -n` for device setup.
+    name: data-safety (privileged -- loop device, dm-flakey)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Load dm-flakey
+        run: |
+          sudo modprobe dm-flakey || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm-flakey
+          }
+          sudo dmsetup targets
+          sudo dmsetup targets | grep -q '^flakey'
+      # One at a time: each case owns a loop device and a device-mapper
+      # target.
+      - run: cargo nextest run -p duet-ops --test data_safety --run-ignored ignored-only --test-threads 1 --no-fail-fast
 
   supply-chain:
     name: cargo-deny (advisories, licenses, bans, sources)

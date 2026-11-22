@@ -341,3 +341,96 @@ palette next to the TC chords; T-6.1.11 for archives; a `FileSystem`-based walke
 for remote backends; per-encoding regex translation for the common
 subset (literal runs plus classes); a `fed` record in `session.json`;
 FR-TOOL-05's saved definitions on top of `SearchSpec`.
+
+## FR-OPS-07 / T-10.2.1: a plain copy is not durable against power loss (open decision)
+
+**Found during:** T-10.2.1 (data-safety suite), reading the copy path to
+place crash points.
+
+**Behavior:** `LocalFs::server_side_copy` (reflink / `copy_file_range` /
+sparse buffered -- the path every local copy takes) never `fsync`s what
+it wrote, and the executor publishes the staged file by rename without
+doing so either. A `SIGKILL` cannot observe this (the page cache
+outlives the process, and the whole SIGKILL matrix passes), but a power
+cut a few seconds after a copy "completed" can leave the destination
+under its final name with less than its full content while the job's
+journal records the step as succeeded. The source is untouched, so no
+data is lost; it is the same exposure as `cp`. It does contradict
+FR-OPS-07's "never a silently truncated destination" and
+`docs/crash-safety.md`'s `CopyFile` row 4 ("after the write completes
+and is `fsync`'d") for the power-loss half of their threat model.
+
+**What was fixed instead:** the case where it *is* data loss. A
+cross-device move removed each source on the strength of a copy that
+might exist only in the page cache -- design.md §9.3 says "copy,
+verify, `fsync`, then unlink source". Plans that remove sources gated on
+copies now `fsync` every copy before publishing it and its directory
+after (`FileSystem::sync`); `privileged::dm_flakey_power_loss_mid_move_...`
+checks it under `dm-flakey`.
+
+**Why deferred:** it is a product trade-off, not a bug with one right
+answer. Closing it costs one `fsync` per copied file. On an SSD that is
+a few milliseconds each; on a rotating disk tens of milliseconds, which
+turns a 10 000-small-file copy from seconds into minutes (NFR-07 asks
+for >= 80% of `cp -a` on that corpus, and `cp` does not sync). The
+September journal work (`docs/perf-baseline.md`) removed exactly this
+kind of per-file `fsync` cost from the journal.
+
+**To close this out (owner's call):** either (a) accept `cp` semantics
+for copies and reword FR-OPS-07 / row 4 to say so, (b) `fsync` every
+copy (set `durable_publish` unconditionally in `executor.rs` -- a
+one-line change; measure with `examples/copy_bench.rs` first), or (c)
+batch: copy a window of files, one `syncfs` on the destination, then
+publish and journal the window -- the invariant at near-`cp` speed, at
+the price of restructuring the copy batch loop.
+
+## FR-OPS-07 / T-10.2.1: scratch files survive when their own cleanup fails
+
+**Found during:** T-10.2.1, the I/O-error tier (`faults.rs`).
+
+**Behavior:** every abandoned attempt removes its `.duet-partial-*`
+staging file, and a retry now removes the ones an earlier attempt could
+not. But when a step *fails for good* and the removal of its staging
+file fails too -- the device is gone, not merely slow -- the file stays
+on that device. It is marked (`.duet-partial-*`), never under a real
+name, and holds only a prefix of its source; nothing is lost. But the
+job has finished (with an error), so its journal no longer lists the
+file as an orphan and no later recovery pass offers to discard it.
+
+**Why deferred:** fixing it means remembering "cleanup still owed"
+across the job's end -- a durable record and a startup sweep. The
+freedesktop-style answer (a stale-partial sweep keyed on age) is its own
+small feature and belongs with T-9.1.x's housekeeping, not in the test
+suite's PR.
+
+**To close this out:** record staging paths whose removal failed in the
+step's `Completion`, and have the startup scan offer them alongside
+orphaned partials; or add a "clean up stale `.duet-partial-*` files
+here" command.
+
+## FR-OPS-07 / T-10.2.1: two narrower recovery limitations
+
+**Found during:** T-10.2.1.
+
+- **A resumed symlink with a relative target is reported as a skip.**
+  Recovery recognises a step that had already taken effect before the
+  crash by inspecting the filesystem; for a symlink it compares the
+  stored target. `FileSystem::stat` reports a symlink target as a
+  normalised absolute path, so a relative target cannot be compared, the
+  step is redone, collides with the link it already made, and resolves
+  under the job's conflict policy (`Skip` by default). The link is
+  correct; only the report is off. Closing it needs the raw link text
+  through the VFS trait.
+- **One unreadable journal fails the whole startup scan.**
+  `JournalReader::scan` returns an error for a journal with real
+  corruption (not a torn tail, which it tolerates and which
+  `Journal::open` now repairs before appending), and the UI then shows
+  "couldn't check for interrupted operations" without listing the other
+  jobs. T-10.2.1 removed the way the product itself produced such a
+  journal; a journal damaged by something else still has this effect.
+  Closing it means returning per-journal results.
+- **A crash between enqueueing a resumed job and closing the old
+  journal** (a window of microseconds) leaves both the old and the new
+  job listed as interrupted at the next start. Resuming both is safe --
+  the second finds the first's work done or collides with it and
+  reports skips -- but confusing.

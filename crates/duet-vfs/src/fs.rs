@@ -349,4 +349,32 @@ pub trait FileSystem: Send + Sync {
         to: &VPath,
         on_progress: &(dyn Fn(u64) -> bool + Send + Sync),
     ) -> Result<CopyOutcome>;
+
+    /// Makes `p` durable: for a file, its content and metadata; for a
+    /// directory, its entries (which is what makes a `rename`/`create`
+    /// *inside* it survive power loss, as opposed to merely being visible).
+    /// Does not follow a symlink in the last component.
+    ///
+    /// This is the primitive behind design.md §9.3's "copy, verify,
+    /// `fsync`, then unlink source. Never unlink before the destination is
+    /// durable": [`Self::server_side_copy`] is free to leave the bytes it
+    /// wrote in the page cache (`LocalFs`'s does, exactly like `cp`), so a
+    /// caller that is about to destroy the only other copy calls this
+    /// first.
+    ///
+    /// The provided implementation does nothing and reports success, which
+    /// is correct only for a backend with no volatile state of its own to
+    /// flush (`NullFs`, in-memory test doubles). A backend that persists
+    /// data overrides it.
+    ///
+    /// # Errors
+    /// - `NotFound` — `p` does not exist.
+    /// - `Permission` — `p` cannot be opened for reading.
+    /// - `Space` / `Fatal` — the flush itself failed (`ENOSPC`, `EIO`): the
+    ///   data is *not* known to be durable and the caller must not proceed
+    ///   as if it were.
+    async fn sync(&self, p: &VPath) -> Result<()> {
+        let _ = p;
+        Ok(())
+    }
 }

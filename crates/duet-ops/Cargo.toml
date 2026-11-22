@@ -49,7 +49,19 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macr
 # T-5.1.12: FR-OPS-08's post-copy verification algorithm.
 blake3.workspace = true
 
+[features]
+# T-10.2.1: turns the executor's and the local backend's crash points
+# (`duet_vfs::failpoint`) into real, env-selected SIGKILLs. Never enabled
+# by a shipped build -- only by this crate's own tests, through the self
+# dev-dependency below.
+failpoints = ["duet-vfs/failpoints"]
+
 [dev-dependencies]
+# The data-safety suite (`tests/data_safety`, T-10.2.1) kills a child copy
+# of the test binary at named crash points, which only exist when this
+# crate is built with `failpoints`. A dev-dependency on the crate itself is
+# how a feature is switched on for test builds and nothing else.
+duet-ops = { path = ".", features = ["failpoints"] }
 tempfile = "3.12"
 # T-5.1.3's executor tests need a `FileSystem` test double (wrapping
 # `LocalFs`, overriding `server_side_copy` to force the naive fallback

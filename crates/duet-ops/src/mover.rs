@@ -807,17 +807,23 @@ mod tests {
         assert!(!dst.path().join(src_name).join("a.txt").exists());
     }
 
-    /// Simulates "the first run got interrupted after the copy phase but
-    /// before the remove phase" deterministically (by executing only the
-    /// plan's copy-phase prefix first), then re-runs the *full* plan --
-    /// proving a resumed move still removes sources whose copy already
-    /// durably succeeded, even though the second run's own re-attempted
-    /// `CopyFile` step is `Skipped` (destination already exists), not
-    /// `Succeeded`. This is exactly the scenario
-    /// `dependency_block_reason`'s own doc comment explains gating on
-    /// "not `Failed`" (rather than "`Succeeded`") is for.
+    /// Runs only the plan's copy phase, then the *whole* plan again from
+    /// the top. The second run's `CopyFile` collides with the first run's
+    /// own output and is `Skipped` -- and a `Remove` gated on a skipped
+    /// copy must not run (T-10.2.1): from inside `execute`, "something is
+    /// already at the destination" is no evidence that it is this file,
+    /// and it is exactly the situation of a user answering "skip" to a
+    /// name conflict with an unrelated file. The source therefore stays.
+    ///
+    /// This is deliberately the opposite of what this test asserted before
+    /// T-10.2.1 (gating on "not `Failed`" so that such a blind re-run would
+    /// still delete the sources). A real resume no longer needs that: it
+    /// goes through `recovery::prepare_resume`, which recognises a copy
+    /// that is already in place *by content* and drops it from the plan,
+    /// so the `Remove`'s gate is cleared on evidence -- covered end to end
+    /// by `tests/data_safety`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resuming_after_a_partial_run_still_removes_sources_whose_copy_already_succeeded() {
+    async fn rerunning_a_whole_move_plan_keeps_sources_whose_copy_was_only_skipped() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
         let dst = TempDir::new().unwrap();
@@ -860,15 +866,30 @@ mod tests {
         // and is Skipped, not Succeeded.
         let second = run(Arc::clone(&fs), 6, plan, state.path()).await;
         assert!(second.errors.is_empty(), "{:?}", second.errors);
-        assert_eq!(
-            second.skipped.len(),
-            1,
-            "the re-attempted CopyFile must be Skipped (Conflict), not Succeeded"
+        assert!(
+            second
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("already exists")),
+            "the re-attempted CopyFile must be reported as skipped (Conflict): {:?}",
+            second.skipped
         );
         assert!(
-            !src.path().join("a.txt").exists(),
-            "the Remove must still have proceeded on the second run, even though its \
-             dependency's outcome this time was Skipped rather than Succeeded"
+            second
+                .skipped
+                .iter()
+                .all(|skip| !skip.reason.starts_with("prerequisite")),
+            "the steps gated on the skipped copy are not run, and are not reported as \
+             skips of their own: {:?}",
+            second.skipped
+        );
+        assert!(
+            src.path().join("a.txt").exists(),
+            "a Remove gated on a copy that was only skipped must not run"
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join(src_name).join("a.txt")).unwrap(),
+            b"hello"
         );
     }
 }

@@ -57,7 +57,9 @@
 //! inventing one here would mean the rebuilt plan no longer describes the
 //! same operation the user asked to re-run.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use duet_types::VPath;
 
 use crate::job::JobReport;
 use crate::plan::Plan;
@@ -93,7 +95,70 @@ pub fn plan_from_report(original: &Plan, report: &JobReport) -> Plan {
     redo.extend(report.errors.iter().map(|failure| failure.step_index));
     redo.extend(report.skipped.iter().map(|skip| skip.step_index));
 
+    include_consequences(original, &mut redo);
+
     rebuild_subset(original, redo)
+}
+
+/// Widens a redo set by what redoing those steps entails, so the rebuilt
+/// plan is complete in itself. Shared by [`plan_from_report`] and
+/// [`crate::recovery::prepare_resume`].
+pub(crate) fn include_consequences(original: &Plan, redo: &mut BTreeSet<u32>) {
+    // Redoing a step means redoing what is gated on it. The executor does
+    // not list a step in the report when it was held back only because its
+    // prerequisite was *skipped* (that would report one decision as
+    // several), so those dependents are found here, by the dependency
+    // itself. Dependencies only ever point backwards, so one ascending
+    // pass reaches the whole chain.
+    for (index, step) in original.steps.iter().enumerate() {
+        if step
+            .depends_on()
+            .is_some_and(|dependency| redo.contains(&dependency))
+        {
+            redo.insert(index as u32);
+        }
+    }
+
+    // Creating something inside a directory changes that directory's
+    // mtime. The planner defers every directory's own `SetMeta` to the
+    // very end of the plan for exactly that reason -- but on the first
+    // run those `SetMeta`s *succeeded*, so they are not in the redo set,
+    // and the entries this re-run creates would leave their parent
+    // directories stamped "now" instead of with the source's timestamps
+    // (found by the data-safety suite, T-10.2.1). So: every `SetMeta`
+    // whose target is an ancestor of something a redone step creates is
+    // redone too. They sit after those steps in the original order, which
+    // is the order `rebuild_subset` keeps.
+    let mut touched_dirs: HashSet<VPath> = HashSet::new();
+    for &index in redo.iter() {
+        let created = match original.steps.get(index as usize) {
+            Some(
+                Step::CreateDir { dest, .. }
+                | Step::CopyFile { dest, .. }
+                | Step::Reflink { dest, .. }
+                | Step::Rename { dest, .. }
+                | Step::Link { dest, .. },
+            ) => Some(dest),
+            Some(Step::Symlink { link_path, .. }) => Some(link_path),
+            _ => None,
+        };
+        let mut ancestor = created.and_then(VPath::parent);
+        while let Some(dir) = ancestor {
+            ancestor = dir.parent();
+            if !touched_dirs.insert(dir) {
+                break;
+            }
+        }
+    }
+    if !touched_dirs.is_empty() {
+        for (index, step) in original.steps.iter().enumerate() {
+            if let Step::SetMeta { target, .. } = step
+                && touched_dirs.contains(target)
+            {
+                redo.insert(index as u32);
+            }
+        }
+    }
 }
 
 /// The shared "keep only these step indices, remapping `depends_on` onto

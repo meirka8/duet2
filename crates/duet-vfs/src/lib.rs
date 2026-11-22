@@ -21,6 +21,7 @@ mod watch;
 mod write_opts;
 
 pub mod archive;
+pub mod failpoint;
 pub mod local;
 pub mod remote;
 

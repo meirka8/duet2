@@ -24,6 +24,12 @@ futures-util.workspace = true
 rustix.workspace = true
 rayon.workspace = true
 
+[features]
+# T-10.2.1: compiles `failpoint::hit` into a real, env-selected SIGKILL
+# instead of an empty inline function. Off in every shipped build; only
+# `duet-ops`'s test builds enable it (see `src/failpoint.rs`).
+failpoints = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "io-util"] }
 tempfile = "3.12"
