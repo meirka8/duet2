@@ -31,10 +31,16 @@
 //! trivial: a torn tail -- a final line with no trailing `\n`, or a run of
 //! unparseable lines at the very end -- just gets dropped. Records are
 //! appended in *batches* ([`Journal::append_batch`]: one `write`, one
-//! `fsync`), so a `SIGKILL` (the page cache survives the process) persists
-//! a whole batch or none of it, and only a power loss mid-writeback can
-//! leave a prefix of a batch ending in garbage. Either way the damage is
-//! confined to the tail: [`JournalReader::scan`] treats an unparseable line
+//! `fsync`). A batch is **not** all-or-nothing, even under `SIGKILL`: the
+//! kernel copies a large `write(2)` into the page cache a page at a time
+//! and a fatal signal arriving partway cuts it short, leaving a prefix of
+//! the batch that ends mid-record (this was assumed impossible until the
+//! data-safety suite, T-10.2.1, produced it); a power loss mid-writeback
+//! does the same. Nothing in a torn batch was acknowledged -- its reply
+//! is only sent after the whole batch is fsync'd -- so no step ever
+//! proceeded on it. Either way the damage is confined to the tail, and
+//! [`Journal::open`] cuts a torn tail off before anything is appended
+//! after it: [`JournalReader::scan`] treats an unparseable line
 //! *followed by a valid one* as real corruption (a hard error), never as a
 //! recoverable gap, because an append-only file cannot produce that shape
 //! by crashing.
@@ -172,12 +178,78 @@ pub struct RecoveryReport {
     /// "discard" should clean up and "resume" should either continue
     /// writing to or replace.
     pub orphaned_partials: Vec<(u32, String)>,
+    /// Steps whose durable `Completion` is [`StepOutcome::Failed`] or
+    /// [`StepOutcome::Skipped`]: finished as far as Intent/Completion
+    /// pairing goes, so absent from `incomplete_steps`, but *without having
+    /// had their effect*. Sorted ascending.
+    ///
+    /// A resume must know these. A step still dangling at the crash may be
+    /// gated (`depends_on`) on one of them -- the `Remove` of a
+    /// cross-device move's source, whose copy failed a moment before the
+    /// process died. Treating that dependency as satisfied merely because
+    /// it has a `Completion` would delete a source that was never copied;
+    /// see [`crate::recovery::prepare_resume`].
+    ///
+    /// `#[serde(default)]`: reports serialised before this field existed
+    /// deserialise as "none", which is what they could express.
+    #[serde(default)]
+    pub unsuccessful_steps: Vec<u32>,
+    /// Steps of `plan` the journal holds no record for at all -- neither
+    /// `Intent` nor `Completion`: the part of the job that had not been
+    /// reached when the journal ends. Sorted ascending.
+    ///
+    /// For a job with no `JobFinished` record this is most of "the exact
+    /// remaining work": a process killed at file 300 of 10 000 has a few
+    /// dozen dangling intents and nine thousand steps it never got to.
+    /// `incomplete_steps` alone names only the former, so a resume built
+    /// from it alone would finish the in-flight handful and report the job
+    /// done. See [`Self::remaining_steps`].
+    ///
+    /// For a job that *did* reach `JobFinished` (cancelled, aborted on a
+    /// conflict) these are steps it deliberately never ran, and they are
+    /// not remaining work.
+    #[serde(default)]
+    pub not_started_steps: Vec<u32>,
     /// `None` if the journal has no `JobFinished` record at all (the job
     /// was mid-execution when the process died); `Some` if it reached a
     /// terminal state but, e.g., a `Completion` for the last step and the
     /// `JobFinished` record were written non-atomically and only one
     /// landed before the crash.
     pub last_outcome: Option<JobOutcome>,
+}
+
+impl RecoveryReport {
+    /// `true` when the journal has no `JobFinished` record: the process
+    /// died (or the journal became unwritable) while the job was running.
+    pub fn was_interrupted(&self) -> bool {
+        self.last_outcome.is_none()
+    }
+
+    /// Every step that still has to run for the job to be what its plan
+    /// says, ascending: the dangling intents, plus -- for a job that never
+    /// reached `JobFinished` -- everything it had not got to yet *and*
+    /// everything that had failed or been skipped. Those last ones were
+    /// only ever reported in the job's in-memory report, which died with
+    /// the process; unless they count as outstanding, a job that hit an
+    /// error and was then killed would look finished and nobody would
+    /// ever be told about the error.
+    pub fn remaining_steps(&self) -> Vec<u32> {
+        let mut remaining = self.incomplete_steps.clone();
+        if self.was_interrupted() {
+            remaining.extend(self.not_started_steps.iter().copied());
+            remaining.extend(self.unsuccessful_steps.iter().copied());
+        }
+        remaining.sort_unstable();
+        remaining.dedup();
+        remaining
+    }
+
+    /// Whether a startup recovery pass has anything to offer for this job:
+    /// work left to finish, or scratch files left to clean up. A job that
+    /// ran to a terminal state and left nothing dangling does not.
+    pub fn needs_attention(&self) -> bool {
+        !self.remaining_steps().is_empty() || !self.orphaned_partials.is_empty()
+    }
 }
 
 /// Handle to a single job's append-only, fsync'd journal file, conventionally
@@ -227,6 +299,9 @@ impl Journal {
         let path = dir.join(format!("{}.journal", job_id.0));
 
         let existed = path.exists();
+        if existed {
+            Self::repair_torn_tail(&path)?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -241,6 +316,68 @@ impl Journal {
         }
 
         Ok(Journal { job_id, path, file })
+    }
+
+    /// Makes an existing journal safe to append to.
+    ///
+    /// A crash can leave the file ending mid-record: a `SIGKILL` that
+    /// lands while `write(2)` is copying a large batch into the page cache
+    /// interrupts it with part of the buffer written (observed by the
+    /// data-safety suite, T-10.2.1 -- a batch is *not* all-or-nothing
+    /// under `SIGKILL`), and a power loss can persist a prefix of one.
+    /// [`JournalReader::scan`] reads past such a tail. But appending to it
+    /// -- which is what [`Journal::resolve`] does to close an interrupted
+    /// job out -- would glue the first new record onto the fragment,
+    /// producing an unparseable line *followed by valid ones*: exactly the
+    /// shape the reader rejects as corruption, and one corrupt journal
+    /// fails the whole startup scan.
+    ///
+    /// So before the first append: a trailing run of unparseable lines is
+    /// cut off (none of it was ever acknowledged as durable -- the batch
+    /// it belonged to never got its reply), and a final record that is
+    /// whole but lost only its newline gets the newline. A bad line that
+    /// already has valid records after it is real corruption, not a crash
+    /// artifact, and is left exactly as found for the reader to report.
+    fn repair_torn_tail(path: &Path) -> Result<()> {
+        let contents = std::fs::read(path).map_err(io_error)?;
+        let mut valid_end = 0usize;
+        let mut offset = 0usize;
+        let mut unparseable_from: Option<usize> = None;
+        let mut missing_newline = false;
+        for line in contents.split_inclusive(|byte| *byte == b'\n') {
+            let terminated = line.ends_with(b"\n");
+            let body = if terminated {
+                &line[..line.len() - 1]
+            } else {
+                line
+            };
+            let parses = body.is_empty() || serde_json::from_slice::<JournalRecord>(body).is_ok();
+            if parses {
+                if unparseable_from.is_some() {
+                    // Valid data after bad data: not a torn tail.
+                    return Ok(());
+                }
+                valid_end = offset + line.len();
+                missing_newline = !terminated && !body.is_empty();
+            } else {
+                unparseable_from.get_or_insert(offset);
+            }
+            offset += line.len();
+        }
+        if unparseable_from.is_none() && !missing_newline {
+            return Ok(());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(io_error)?;
+        file.set_len(valid_end as u64).map_err(io_error)?;
+        if missing_newline {
+            use std::io::Seek as _;
+            file.seek(std::io::SeekFrom::End(0)).map_err(io_error)?;
+            file.write_all(b"\n").map_err(io_error)?;
+        }
+        file.sync_all().map_err(io_error)
     }
 
     /// The path this journal is (or will be) written at.
@@ -277,11 +414,12 @@ impl Journal {
     /// record in the batch is on disk.
     ///
     /// Crash semantics of a batch: the bytes go down in a single `write`,
-    /// so a `SIGKILL` (the page cache survives) persists all of them or
-    /// none; only a power loss mid-writeback can leave a *prefix* of the
-    /// batch, ending in a torn line -- which [`JournalReader::scan`]
-    /// tolerates as long as nothing parseable follows it (see the module
-    /// doc comment's "Wire format" section).
+    /// but neither a `SIGKILL` landing mid-`write` nor a power loss
+    /// mid-writeback is all-or-nothing -- either can leave a *prefix* of
+    /// the batch, ending in a torn line. [`JournalReader::scan`] tolerates
+    /// that as long as nothing parseable follows it, and [`Journal::open`]
+    /// removes it before the next append (see the module doc comment's
+    /// "Wire format" section).
     ///
     /// # Errors
     /// As [`Self::append`]. On error nothing about the batch is promised;
@@ -456,6 +594,10 @@ impl JournalReader {
         let mut intents: std::collections::HashMap<u32, Option<String>> =
             std::collections::HashMap::new();
         let mut completed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // Last `Completion` wins: a step retried after a recovery, or
+        // closed out by `Journal::resolve`, is whatever its final record
+        // says it is.
+        let mut succeeded: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
         let mut last_outcome = None;
 
         for record in &records[1..] {
@@ -467,8 +609,12 @@ impl JournalReader {
                 } => {
                     intents.insert(*step_index, partial_name.clone());
                 }
-                JournalRecord::Completion { step_index, .. } => {
+                JournalRecord::Completion {
+                    step_index,
+                    outcome,
+                } => {
                     completed.insert(*step_index);
+                    succeeded.insert(*step_index, matches!(outcome, StepOutcome::Succeeded));
                 }
                 JournalRecord::JobFinished { outcome, .. } => {
                     last_outcome = Some(*outcome);
@@ -493,12 +639,25 @@ impl JournalReader {
             .collect();
         orphaned_partials.sort_unstable();
 
+        let not_started_steps: Vec<u32> = (0..plan.steps.len() as u32)
+            .filter(|ix| !intents.contains_key(ix) && !completed.contains(ix))
+            .collect();
+
+        let mut unsuccessful_steps: Vec<u32> = succeeded
+            .iter()
+            .filter(|(_, ok)| !**ok)
+            .map(|(ix, _)| *ix)
+            .collect();
+        unsuccessful_steps.sort_unstable();
+
         Ok(Some(RecoveryReport {
             job_id: *job_id,
             kind: *kind,
             plan: plan.clone(),
             incomplete_steps,
             orphaned_partials,
+            unsuccessful_steps,
+            not_started_steps,
             last_outcome,
         }))
     }
@@ -527,6 +686,122 @@ mod tests {
         assert!(journal.path().exists());
         assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), 0);
         assert_eq!(journal.job_id(), JobId(1));
+    }
+
+    fn started(job: u64) -> JournalRecord {
+        JournalRecord::JobStarted {
+            job_id: JobId(job),
+            started_at: Timestamp::EPOCH,
+            plan: Plan::new(Vec::new(), PlanOptions::default()),
+            kind: JobKind::Copy,
+        }
+    }
+
+    fn finished() -> JournalRecord {
+        JournalRecord::JobFinished {
+            outcome: JobOutcome::Cancelled,
+            finished_at: Timestamp::EPOCH,
+        }
+    }
+
+    /// T-10.2.1: a kill that lands inside the `write(2)` of a batch leaves
+    /// the file ending mid-record. Appending after that fragment (which is
+    /// what closing an interrupted job out does) used to glue the new
+    /// record onto it and turn a recoverable journal into one the reader
+    /// rejects as corrupt -- failing the whole startup scan.
+    #[test]
+    fn appending_after_a_torn_tail_does_not_corrupt_the_journal() {
+        let dir = TempDir::new().unwrap();
+        let path = {
+            let mut journal = Journal::open(JobId(7), dir.path()).unwrap();
+            journal.append(&started(7)).unwrap();
+            journal.path().to_path_buf()
+        };
+        // Half a record, no newline: the torn write.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(br#"{"Intent":{"step_index":3,"step":{"Rem"#)
+            .unwrap();
+        drop(file);
+        assert_eq!(JournalReader::scan(dir.path()).unwrap().len(), 1);
+
+        Journal::open(JobId(7), dir.path())
+            .unwrap()
+            .append(&finished())
+            .unwrap();
+
+        let reports =
+            JournalReader::scan(dir.path()).expect("the journal must still scan after the append");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].last_outcome, Some(JobOutcome::Cancelled));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "the fragment is gone: {text:?}");
+    }
+
+    /// The tear can also fall exactly between a record and its newline:
+    /// the record is whole and the reader counts it, so it must be kept,
+    /// not glued to the next one.
+    #[test]
+    fn appending_after_a_record_that_lost_only_its_newline_keeps_both() {
+        let dir = TempDir::new().unwrap();
+        let path = {
+            let mut journal = Journal::open(JobId(8), dir.path()).unwrap();
+            journal.append(&started(8)).unwrap();
+            journal.path().to_path_buf()
+        };
+        let intact = serde_json::to_string(&JournalRecord::Completion {
+            step_index: 0,
+            outcome: StepOutcome::Succeeded,
+        })
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(intact.as_bytes()).unwrap();
+        drop(file);
+
+        Journal::open(JobId(8), dir.path())
+            .unwrap()
+            .append(&finished())
+            .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 3, "{text:?}");
+        assert!(
+            text.lines()
+                .all(|line| serde_json::from_str::<JournalRecord>(line).is_ok())
+        );
+        assert_eq!(JournalReader::scan(dir.path()).unwrap().len(), 1);
+    }
+
+    /// A bad line with valid records already after it is not a crash
+    /// artifact; reopening must not quietly "repair" it away.
+    #[test]
+    fn reopening_leaves_real_corruption_for_the_reader_to_report() {
+        let dir = TempDir::new().unwrap();
+        let path = {
+            let mut journal = Journal::open(JobId(9), dir.path()).unwrap();
+            journal.append(&started(9)).unwrap();
+            journal.path().to_path_buf()
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"this is not a record\n").unwrap();
+        file.write_all(serde_json::to_string(&finished()).unwrap().as_bytes())
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+
+        drop(Journal::open(JobId(9), dir.path()).unwrap());
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(JournalReader::scan(dir.path()).is_err());
     }
 
     #[test]

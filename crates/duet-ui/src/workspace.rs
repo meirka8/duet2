@@ -5601,8 +5601,10 @@ fn load_session_with_notice(path: &Path) -> (Option<duet_config::Session>, Optio
 
 /// T-5.2.5's startup recovery scan (FR-OPS-07): every [`RecoveryReport`]
 /// `JournalReader::scan` finds under `dir` that still "needs attention" --
-/// `!incomplete_steps.is_empty() || !orphaned_partials.is_empty()`,
-/// deliberately **not** filtered on `last_outcome`. A journal whose last
+/// [`RecoveryReport::needs_attention`]: work left to finish (a dangling
+/// intent, or -- for a job that never reached `JobFinished` -- a step it
+/// had not got to) or an orphaned partial to clean up. Deliberately
+/// **not** a plain filter on `last_outcome`. A journal whose last
 /// record is `JobFinished { outcome: Completed, .. }` can still carry a
 /// real orphaned partial (`JournalReader::scan`'s own doc comment: a crash
 /// landing between that `Completion`/`JobFinished` pair and the last
@@ -5627,7 +5629,7 @@ fn scan_startup_recovery_reports(dir: &Path) -> (Vec<RecoveryReport>, Option<Str
         Ok(reports) => {
             let needing_attention = reports
                 .into_iter()
-                .filter(|r| !r.incomplete_steps.is_empty() || !r.orphaned_partials.is_empty())
+                .filter(RecoveryReport::needs_attention)
                 .collect();
             (needing_attention, None)
         }
@@ -12098,20 +12100,25 @@ mod tests {
                 // format" section), which an append-only file cannot
                 // produce by crashing.
                 use std::io::Write as _;
+                //
+                // Written raw, in one go: since T-10.2.1 `Journal::open`
+                // repairs a torn tail before appending (that is how the
+                // product itself used to manufacture this very shape, by
+                // closing out a journal a kill had torn), so reopening
+                // the journal to append the valid record would simply
+                // remove the garbage first.
                 {
                     let mut file = std::fs::OpenOptions::new()
                         .append(true)
                         .open(&path)
                         .unwrap();
                     writeln!(file, "not valid json at all").unwrap();
-                }
-                Journal::open(job_id, state_dir)
-                    .unwrap()
-                    .append(&JournalRecord::Completion {
-                        step_index: 0,
-                        outcome: duet_ops::StepOutcome::Succeeded,
-                    })
+                    writeln!(
+                        file,
+                        r#"{{"Completion":{{"step_index":0,"outcome":"Succeeded"}}}}"#
+                    )
                     .unwrap();
+                }
             },
             |workspace, vcx, _data_dir| {
                 let _ = vcx.update(|window, cx| window.draw(cx));

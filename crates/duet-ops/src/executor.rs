@@ -328,6 +328,32 @@ struct ExecutorContext {
     /// `execute()` call even if the same `resolver` `Arc` is reused across
     /// both (T-5.1.9's AC: "no policy leaks between jobs").
     sticky_conflict: Arc<Mutex<Option<ConflictResolution>>>,
+    /// `true` when this plan destroys a source on the strength of a copy
+    /// (a `Remove` gated on another step -- a cross-device move). Every
+    /// copy in such a plan is `fsync`'d before it is published and its
+    /// directory entry `fsync`'d after, so the gated `Remove` can never
+    /// run while the only other copy of the data still lives in the page
+    /// cache (design.md §9.3: "copy, verify, `fsync`, then unlink source.
+    /// Never unlink before the destination is durable"). Plain copies
+    /// leave this `false` and pay no `fsync` -- see [`needs_durable_publish`].
+    durable_publish: bool,
+}
+
+/// Whether `plan` contains a step that removes something *because* another
+/// step succeeded -- the shape `mover::plan_move` emits for every entry of
+/// a cross-device move. Derived from the plan rather than from `JobKind`
+/// so that a resumed or re-run remainder of such a job (whose plan still
+/// carries the gated `Remove`s) gets the same treatment as the original.
+fn needs_durable_publish(plan: &Plan) -> bool {
+    plan.steps.iter().any(|step| {
+        matches!(
+            step,
+            Step::Remove {
+                depends_on: Some(_),
+                ..
+            }
+        )
+    })
 }
 
 /// The raw, non-atomic-across-fields counters a job's [`ProgressSnapshot`]
@@ -736,6 +762,7 @@ pub async fn execute(
         default_conflict,
         resolver,
         sticky_conflict: Arc::new(Mutex::new(None)),
+        durable_publish: needs_durable_publish(&plan),
     };
 
     let (total_small_files, total_large_bytes) = regime_totals(&plan.steps);
@@ -826,6 +853,7 @@ pub async fn execute(
                 let step = &plan.steps[index + i];
                 match run_step_with_retry(&ctx, step_index, step, Some(partial_name)).await {
                     StepRun::Done(outcome) => apply_outcome(&mut report, step_index, step, outcome),
+                    StepRun::FollowsSkip => {}
                     StepRun::Cancelled => {
                         cancelled = true;
                         break 'steps;
@@ -843,6 +871,7 @@ pub async fn execute(
             StepRun::Done(outcome) => {
                 apply_outcome(&mut report, step_index, &plan.steps[index], outcome)
             }
+            StepRun::FollowsSkip => {}
             StepRun::Cancelled => {
                 cancelled = true;
                 break;
@@ -1011,6 +1040,7 @@ async fn run_batch(
         let (step_index, step, outcome) = handle.await.expect("worker task panicked");
         match outcome {
             StepRun::Done(outcome) => apply_outcome(report, step_index, &step, outcome),
+            StepRun::FollowsSkip => {}
             StepRun::Cancelled => cancelled = true,
         }
     }
@@ -1027,6 +1057,16 @@ async fn run_batch(
 #[derive(Debug)]
 enum StepRun {
     Done(StepOutcome),
+    /// The step was not run because the step it is gated on was itself
+    /// *skipped* -- the metadata step, the source removal, the hardlink
+    /// that follow a copy the user (or the job's policy) skipped. It is
+    /// journaled and recorded as `Skipped` like any other, so that
+    /// whatever is gated on *it* stays blocked too, but it is not listed
+    /// in the job's report: "skipped a.txt" is one decision about one
+    /// file, and showing it as three skips would be reporting the
+    /// engine's bookkeeping, not what happened. A re-run picks these up
+    /// again by following the dependency (`plan_from_report`).
+    FollowsSkip,
     Cancelled,
 }
 
@@ -1051,10 +1091,22 @@ async fn run_step_with_retry(
     // pause/resume episode or a pause/cancel-interrupted retry) -- see
     // `retry_backoff`'s own doc comment for the bound.
     let mut retryable_attempts = 0u32;
+    // Staging names used by this step's earlier, abandoned attempts. Every
+    // attempt stages through a fresh name and cleans up after itself when
+    // it gives up -- but that cleanup is one more call to a backend that
+    // has just failed, and when it fails too (the connection that dropped
+    // mid-transfer is still down a moment later) the file stays, named by
+    // nothing: the retry succeeds under a new name and the job reports a
+    // clean finish over a stray `.duet-partial-*` (found by the
+    // data-safety suite, T-10.2.1). So they are remembered here and
+    // removed again before each new attempt and once the step is decided.
+    let mut abandoned_partials: Vec<String> = Vec::new();
     loop {
         if wait_out_pause(ctx).await == ControlState::Cancelled {
+            remove_abandoned_partials(ctx, step, &mut abandoned_partials).await;
             return StepRun::Cancelled;
         }
+        remove_abandoned_partials(ctx, step, &mut abandoned_partials).await;
 
         let partial_name = match journaled_intent.take() {
             Some(partial_name) => partial_name,
@@ -1085,12 +1137,19 @@ async fn run_step_with_retry(
             kind: step.kind(),
         });
 
-        let outcome = if let Some(reason) = dependency_block_reason(ctx, step) {
+        let blocked = dependency_block_reason(ctx, step);
+        let follows_skip = blocked.as_ref().is_some_and(|blocked| blocked.follows_skip);
+        let outcome = if let Some(blocked) = blocked {
             // Short-circuit before ever calling `dispatch` -- a
             // dependency-blocked step performs no side effect at all, so
             // there's nothing to attempt.
-            StepOutcome::Skipped { reason }
+            StepOutcome::Skipped {
+                reason: blocked.reason,
+            }
         } else {
+            // T-10.2.1 crash point: this step's `Intent` is durable and
+            // nothing of the step itself has happened yet.
+            duet_vfs::failpoint::hit("step.before_effect", u64::from(step_index));
             let attempt = dispatch(ctx, step_index, step, partial_name.as_deref()).await;
             match attempt {
                 // Several `StepFailure`s built deep inside `dispatch` (e.g.
@@ -1105,7 +1164,11 @@ async fn run_step_with_retry(
                     StepOutcome::Failed(failure)
                 }
                 Ok(StepAttempt::Done(outcome)) => outcome,
-                Ok(StepAttempt::Interrupted) => continue, // pause/cancel mid-copy -- retry
+                Ok(StepAttempt::Interrupted) => {
+                    // pause/cancel mid-copy -- retry
+                    abandoned_partials.extend(partial_name);
+                    continue;
+                }
                 Err(e) if e.kind() == ErrorKind::Space => {
                     // T-5.1.10: ENOSPC/EDQUOT -- pause (the same primitive
                     // a user-initiated pause uses) and retry this step
@@ -1118,13 +1181,16 @@ async fn run_step_with_retry(
                     let _ = ctx
                         .events
                         .send(JobEvent::QueuePausedForSpace { job_id: ctx.job_id });
+                    abandoned_partials.extend(partial_name);
                     continue;
                 }
                 Err(e)
                     if e.kind().is_retryable() && retryable_attempts < RETRYABLE_MAX_ATTEMPTS =>
                 {
                     retryable_attempts += 1;
+                    abandoned_partials.extend(partial_name);
                     if retry_backoff(ctx, retryable_attempts).await == ControlState::Cancelled {
+                        remove_abandoned_partials(ctx, step, &mut abandoned_partials).await;
                         return StepRun::Cancelled;
                     }
                     continue;
@@ -1137,6 +1203,11 @@ async fn run_step_with_retry(
                 }),
             }
         };
+        remove_abandoned_partials(ctx, step, &mut abandoned_partials).await;
+        // T-10.2.1 crash point: the step's side effect is finished (or was
+        // skipped/failed) and its `Completion` has not been handed to the
+        // journal yet.
+        duet_vfs::failpoint::hit("step.after_effect", u64::from(step_index));
         ctx.outcomes
             .lock()
             .unwrap()
@@ -1180,8 +1251,49 @@ async fn run_step_with_retry(
                 });
             }
         }
-        return StepRun::Done(outcome);
+        return if follows_skip {
+            StepRun::FollowsSkip
+        } else {
+            StepRun::Done(outcome)
+        };
     }
+}
+
+/// Best-effort removal of the staging files `step`'s earlier attempts
+/// could not clean up themselves (see `run_step_with_retry`'s
+/// `abandoned_partials`). A name is forgotten once its file is known to be
+/// gone; one that still cannot be removed is kept for the next try.
+async fn remove_abandoned_partials(ctx: &ExecutorContext, step: &Step, names: &mut Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    let (Step::CopyFile { dest, .. } | Step::Reflink { dest, .. }) = step else {
+        names.clear();
+        return;
+    };
+    let Some(parent) = dest.parent() else {
+        names.clear();
+        return;
+    };
+    let mut still_there = Vec::new();
+    for name in names.drain(..) {
+        let Ok(path) = parent.join(&name) else {
+            continue;
+        };
+        let removed = match ctx.fs.remove(&path, RemoveKind::File).await {
+            Ok(()) => true,
+            Err(e) => e.kind() == ErrorKind::NotFound,
+        };
+        // The buffered fallback stages through the backend's own sibling
+        // of this name; an abort that failed leaves that behind instead.
+        let swept = crate::recovery::remove_staging_siblings(&*ctx.fs, &parent, &name)
+            .await
+            .is_ok();
+        if !(removed && swept) {
+            still_there.push(name);
+        }
+    }
+    *names = still_there;
 }
 
 fn apply_outcome(report: &mut JobReport, step_index: u32, step: &Step, outcome: StepOutcome) {
@@ -1239,37 +1351,66 @@ fn step_depends_on(step: &Step) -> Option<u32> {
 
 /// `Some(reason)` if `step` has an unmet [`step_depends_on`] dependency and
 /// must be skipped without ever being dispatched; `None` if it's clear to
-/// proceed (no dependency at all, or the dependency's own outcome wasn't
-/// `Failed`).
+/// proceed (no dependency at all, or the dependency `Succeeded` in this
+/// run).
 ///
-/// Deliberately gates on "not `Failed`", not on "`Succeeded`": a fresh
-/// `execute()` call resuming a previously-interrupted job re-walks
-/// `plan.steps` from the top and re-attempts everything, including steps
-/// that already durably succeeded before the interruption -- per this
-/// module's own "resume restarts the step" scope note, a `CopyFile` step
-/// whose destination was already fully written last time re-runs into
-/// `ErrorKind::Conflict` and is (correctly, safely) recorded `Skipped`,
-/// not `Succeeded`, on the second run. Gating a dependent `Remove` on
-/// strict `Succeeded` would treat that perfectly-fine resumed copy as
-/// unmet and strand the move forever, unable to ever remove a source
-/// whose destination has been correct since the *first* run. `Skipped`
-/// carries no information about *why* -- design.md's conflict-resolution
-/// story (T-5.1.9, not built yet) is what would eventually distinguish
-/// "already correctly there" from "a totally unrelated file happens to
-/// occupy this path" -- but refusing to proceed only on a definite,
-/// unambiguous `Failed` is the safe, conservative choice available today:
-/// it never blocks a legitimate resume, and it never lets a `Remove`
-/// through when its prerequisite is *known* to have gone wrong.
-fn dependency_block_reason(ctx: &ExecutorContext, step: &Step) -> Option<String> {
+/// Gates on **`Succeeded`, nothing less** (T-10.2.1). Every dependent step
+/// a planner emits is written on the assumption that its prerequisite
+/// *happened*: apply the source's metadata to the copy, hardlink a second
+/// name to the copy, remove the source now that the copy exists. A
+/// prerequisite that was `Skipped` did not happen -- the usual reason is a
+/// name conflict resolved as "skip", meaning some *other* file occupies
+/// the destination -- and running the dependents anyway
+///
+/// - deleted the source of a cross-device move whose copy had been
+///   skipped (the user's file gone, an unrelated file in its place), and
+/// - stamped the skipped source's mode and timestamps onto the unrelated
+///   file that was already there.
+///
+/// This used to gate on "not `Failed`", so that re-running a whole plan
+/// over a half-finished earlier run (where the redone copy collides with
+/// its own earlier output and is `Skipped`) would still remove the
+/// sources. That case no longer needs the loophole: a resume goes through
+/// [`crate::recovery::prepare_resume`], which recognises a copy that is
+/// already in place *by content* and leaves it out of the plan, so the
+/// dependency is cleared rather than left pointing at a skip. "Skipped"
+/// alone carries no evidence that the destination is the right file, and
+/// a destructive step must not proceed on no evidence.
+///
+/// A dependency with no recorded outcome (it never ran in this
+/// `execute()` call) blocks for the same reason.
+fn dependency_block_reason(ctx: &ExecutorContext, step: &Step) -> Option<Blocked> {
     let dep = step_depends_on(step)?;
     let outcomes = ctx.outcomes.lock().unwrap();
     match outcomes.get(&dep) {
-        Some(StepOutcome::Failed(failure)) => Some(format!(
-            "prerequisite step {dep} failed ({}), refusing to proceed",
-            failure.message
-        )),
-        _ => None,
+        Some(StepOutcome::Succeeded) => None,
+        Some(StepOutcome::Failed(failure)) => Some(Blocked {
+            reason: format!(
+                "prerequisite step {dep} failed ({}), refusing to proceed",
+                failure.message
+            ),
+            follows_skip: false,
+        }),
+        Some(StepOutcome::Skipped { reason }) => Some(Blocked {
+            reason: format!(
+                "prerequisite step {dep} was skipped ({reason}), so this step does not apply"
+            ),
+            follows_skip: true,
+        }),
+        None => Some(Blocked {
+            reason: format!("prerequisite step {dep} did not run, refusing to proceed"),
+            follows_skip: false,
+        }),
     }
+}
+
+/// Why a gated step must not run -- see [`dependency_block_reason`].
+struct Blocked {
+    reason: String,
+    /// The prerequisite was skipped rather than failed, so this step is a
+    /// consequence of that one decision and not news in its own right
+    /// ([`StepRun::FollowsSkip`]).
+    follows_skip: bool,
 }
 
 /// The bound on how many times a `Retryable` failure gets retried before
@@ -2000,6 +2141,8 @@ async fn write_trash_info_step(
         let _ = writer.abort().await;
         return Err(Box::new(VfsError::from_io(e)));
     }
+    // T-10.2.1 crash point: the sidecar's bytes are staged, not published.
+    duet_vfs::failpoint::hit("trashinfo.before_commit", 0);
     writer.commit().await?;
     Ok(StepAttempt::Done(StepOutcome::Succeeded))
 }
@@ -2090,6 +2233,8 @@ async fn hash_file(
             break;
         }
         hasher.update(&buf[..n]);
+        // T-10.2.1 crash point: part of one side has been read and hashed.
+        duet_vfs::failpoint::hit("verify.mid_hash", 0);
     }
     Ok(HashAttempt::Done(hasher.finalize()))
 }
@@ -2253,6 +2398,11 @@ async fn copy_file_step(
                     .large_bytes_done
                     .fetch_add(bytes, Ordering::Relaxed);
             }
+            // T-10.2.1 crash point: the partial exists and holds a strict
+            // prefix of the source.
+            if credited_this_attempt.load(Ordering::Relaxed) < expected_size {
+                duet_vfs::failpoint::hit("copy.mid_write", u64::from(step_index));
+            }
         }
         ctx.control.state() != ControlState::Running
     };
@@ -2316,6 +2466,10 @@ async fn copy_file_step(
             &on_progress,
         ))
     });
+    // Set when the backend declined and the buffered fallback did the
+    // copy; it accounts for its bytes exactly, where the accelerated path
+    // is topped up to `expected_size`.
+    let mut is_fallback_copy = false;
     match outcome {
         Ok(duet_vfs::CopyOutcome::Copied { .. }) => {
             // Top up to `expected_size` for whatever this rung didn't (or
@@ -2336,6 +2490,26 @@ async fn copy_file_step(
                         .large_bytes_done
                         .fetch_add(remainder, Ordering::Relaxed);
                 }
+            }
+            // `server_side_copy` leaves what it wrote in the page cache.
+            // When a later step will destroy the source on the strength of
+            // this copy, make the bytes durable *before* they are
+            // published (the naive fallback below needs no such call: its
+            // `AsyncWriteCommit::commit` already `fsync`s what it staged).
+            if ctx.durable_publish
+                && let Err(e) = ctx.fs.sync(&partial).await
+            {
+                let credited = expected_size.max(credited_this_attempt.load(Ordering::Relaxed));
+                ctx.counters
+                    .bytes_done
+                    .fetch_sub(credited, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(credited, Ordering::Relaxed);
+                }
+                let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
+                return Err(e);
             }
         }
         Ok(duet_vfs::CopyOutcome::Unsupported) => {
@@ -2358,9 +2532,10 @@ async fn copy_file_step(
             // Best-effort cleanup of any zero-byte artifact the failed
             // acceleration attempt may have left before falling back.
             let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
-            match naive_copy(ctx, source, &partial, expected_size).await? {
-                StepAttempt::Done(StepOutcome::Succeeded) => {}
-                other => return Ok(other),
+            is_fallback_copy = true;
+            match naive_copy(ctx, step_index, source, &partial, expected_size).await? {
+                NaiveCopy::Copied(bytes) => credited_this_attempt.store(bytes, Ordering::Relaxed),
+                NaiveCopy::Interrupted => return Ok(StepAttempt::Interrupted),
             }
         }
         Ok(duet_vfs::CopyOutcome::Interrupted) => {
@@ -2410,8 +2585,60 @@ async fn copy_file_step(
         }
     }
 
+    // Everything this attempt has credited to the job's progress so far --
+    // what has to be taken back if the publish below does not happen.
+    let credited_total = if is_fallback_copy {
+        credited_this_attempt.load(Ordering::Relaxed)
+    } else {
+        expected_size.max(credited_this_attempt.load(Ordering::Relaxed))
+    };
+
+    // T-10.2.1 crash point: the partial holds the complete content and has
+    // not been renamed onto the destination yet.
+    duet_vfs::failpoint::hit("copy.before_publish", u64::from(step_index));
     let attempt =
-        rename_with_conflict_resolution(ctx, step_index, conflict, source, &partial, dest).await?;
+        match rename_with_conflict_resolution(ctx, step_index, conflict, source, &partial, dest)
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(e) => {
+                // The publish itself failed (an I/O error on the rename, or on
+                // the `stat`s conflict resolution needs). The staged copy is
+                // complete but will never be published by this attempt -- a
+                // retry stages afresh, a failure is final -- so it must not
+                // stay behind as a full-size scratch file nothing names
+                // (found by the data-safety suite, T-10.2.1). Same cleanup
+                // and progress rollback as a failed transfer.
+                ctx.counters
+                    .bytes_done
+                    .fetch_sub(credited_total, Ordering::Relaxed);
+                if is_large {
+                    ctx.counters
+                        .large_bytes_done
+                        .fetch_sub(credited_total, Ordering::Relaxed);
+                }
+                let _ = ctx.fs.remove(&partial, RemoveKind::File).await;
+                return Err(e);
+            }
+        };
+    if ctx.durable_publish
+        && matches!(attempt, StepAttempt::Done(StepOutcome::Succeeded))
+        && let Err(e) = ctx.fs.sync(&parent).await
+    {
+        // The content is durable and published, but the directory entry
+        // naming it is not known to be. Reported as a failure, never
+        // retried (a redo would only collide with the file just
+        // published): the gated source removal then does not run, which
+        // is the whole point.
+        return Ok(StepAttempt::Done(StepOutcome::Failed(StepFailure {
+            step_index,
+            path: Some(dest.clone()),
+            kind: e.kind(),
+            message: format!(
+                "{dest} was written but its directory entry could not be made durable: {e}"
+            ),
+        })));
+    }
     match &attempt {
         StepAttempt::Done(StepOutcome::Succeeded) => {
             ctx.counters.files_done.fetch_add(1, Ordering::Relaxed);
@@ -2446,6 +2673,13 @@ async fn copy_file_step(
     Ok(attempt)
 }
 
+/// How [`naive_copy`] ended: it staged the whole file (and credited that
+/// many bytes to the job's progress), or a pause/cancel cut it short.
+enum NaiveCopy {
+    Copied(u64),
+    Interrupted,
+}
+
 /// The naive fallback copy loop: plain buffered `open_read`/`open_write`,
 /// no `fadvise`, no sparse-file awareness -- rung 3 of design.md's copy
 /// -strategy ladder (T-5.1.4) is what upgrades this. Checks `ctx.control`
@@ -2464,10 +2698,11 @@ async fn copy_file_step(
 /// abandoned) file would have finished.
 async fn naive_copy(
     ctx: &ExecutorContext,
+    step_index: u32,
     from: &VPath,
     to: &VPath,
     expected_size: u64,
-) -> Result<StepAttempt> {
+) -> Result<NaiveCopy> {
     let mut reader = ctx.fs.open_read(from).await?;
     let mut writer = ctx
         .fs
@@ -2492,7 +2727,7 @@ async fn naive_copy(
                     .large_bytes_done
                     .fetch_sub(copied, Ordering::Relaxed);
             }
-            return Ok(StepAttempt::Interrupted);
+            return Ok(NaiveCopy::Interrupted);
         }
         let n = match reader.read(&mut buf).await {
             Ok(n) => n,
@@ -2536,9 +2771,24 @@ async fn naive_copy(
                 .large_bytes_done
                 .fetch_add(n as u64, Ordering::Relaxed);
         }
+        // T-10.2.1 crash point: the staged file holds a strict prefix of
+        // the source.
+        if copied < expected_size {
+            duet_vfs::failpoint::hit("copy.mid_write", u64::from(step_index));
+        }
     }
-    writer.commit().await?;
-    Ok(StepAttempt::Done(StepOutcome::Succeeded))
+    if let Err(e) = writer.commit().await {
+        // Nothing was published; take this attempt's credit back so a
+        // retry does not count the file twice.
+        ctx.counters.bytes_done.fetch_sub(copied, Ordering::Relaxed);
+        if !is_small_file(expected_size) {
+            ctx.counters
+                .large_bytes_done
+                .fetch_sub(copied, Ordering::Relaxed);
+        }
+        return Err(e);
+    }
+    Ok(NaiveCopy::Copied(copied))
 }
 
 /// Owns a [`Journal`] on a dedicated blocking thread and serializes access
@@ -2592,11 +2842,13 @@ impl JournalHandle {
                     }
                 }
                 let (records, replies): (Vec<JournalRecord>, Vec<_>) = batch.into_iter().unzip();
+                journal_failpoints(&records, JournalMoment::BeforeWrite);
                 if poisoned.is_none()
                     && let Err(e) = journal.append_batch(&records)
                 {
                     poisoned = Some((e.kind(), e.to_string()));
                 }
+                journal_failpoints(&records, JournalMoment::AfterFsync);
                 for reply in replies.into_iter().flatten() {
                     let _ = reply.send(match &poisoned {
                         None => Ok(()),
@@ -2647,6 +2899,54 @@ impl JournalHandle {
         // A dead writer is reported by the next awaited append; nothing to
         // do about it from here.
         let _ = self.tx.send((record, None));
+    }
+}
+
+/// Which side of a batch's `write`+`fsync` a journal crash point sits on.
+#[derive(Clone, Copy)]
+enum JournalMoment {
+    BeforeWrite,
+    AfterFsync,
+}
+
+/// T-10.2.1 crash points around one journal batch: one per record in it,
+/// keyed by step index, so a test can ask to die "before the `Intent` for
+/// step 3 reaches the file" or "once the `Completion` for step 3 is
+/// durable". Compiles to nothing without the `failpoints` feature.
+fn journal_failpoints(records: &[JournalRecord], moment: JournalMoment) {
+    if !cfg!(feature = "failpoints") {
+        return;
+    }
+    for record in records {
+        let (before, after, key) = match record {
+            JournalRecord::JobStarted { .. } => (
+                "journal.job_started.before_write",
+                "journal.job_started.after_fsync",
+                0,
+            ),
+            JournalRecord::Intent { step_index, .. } => (
+                "journal.intent.before_write",
+                "journal.intent.after_fsync",
+                u64::from(*step_index),
+            ),
+            JournalRecord::Completion { step_index, .. } => (
+                "journal.completion.before_write",
+                "journal.completion.after_fsync",
+                u64::from(*step_index),
+            ),
+            JournalRecord::JobFinished { .. } => (
+                "journal.job_finished.before_write",
+                "journal.job_finished.after_fsync",
+                0,
+            ),
+        };
+        duet_vfs::failpoint::hit(
+            match moment {
+                JournalMoment::BeforeWrite => before,
+                JournalMoment::AfterFsync => after,
+            },
+            key,
+        );
     }
 }
 
@@ -3588,7 +3888,9 @@ mod tests {
             1,
             "CreateDir must succeed silently (merging into an already-existing directory is \
              normal, not a conflict -- T-5.1.9's own fix); only CopyFile (file already exists) \
-             should skip"
+             is reported as skipped -- the SetMeta gated on it does not run either \
+             (T-10.2.1), but that is a consequence of the same skip, not a second one: {:?}",
+            report.skipped
         );
         assert_eq!(
             std::fs::read_to_string(dst.path().join(src_name).join("a.txt")).unwrap(),
@@ -5113,6 +5415,7 @@ mod tests {
             default_conflict: ConflictPolicy::Skip,
             resolver: None,
             sticky_conflict: Arc::new(Mutex::new(None)),
+            durable_publish: false,
         };
 
         let step = Step::CopyFile {
@@ -5177,6 +5480,7 @@ mod tests {
         match outcome {
             StepRun::Done(StepOutcome::Succeeded) => {}
             StepRun::Done(other) => panic!("expected the step to succeed, got {other:?}"),
+            StepRun::FollowsSkip => panic!("expected the step to succeed, got FollowsSkip"),
             StepRun::Cancelled => panic!("expected the step to succeed, got Cancelled"),
         }
 
@@ -5656,6 +5960,7 @@ mod tests {
             default_conflict: ConflictPolicy::Skip,
             resolver: None,
             sticky_conflict: Arc::new(Mutex::new(None)),
+            durable_publish: false,
         };
 
         let step1 = Step::CopyFile {
@@ -5887,11 +6192,13 @@ mod tests {
             default_conflict: ConflictPolicy::Skip,
             resolver: Some(resolver),
             sticky_conflict: Arc::new(Mutex::new(None)),
+            durable_publish: false,
         };
         let mut report = JobReport::default();
         for (i, step) in steps.iter().enumerate() {
             match run_step_with_retry(&ctx, i as u32, step, None).await {
                 StepRun::Done(outcome) => apply_outcome(&mut report, i as u32, step, outcome),
+                StepRun::FollowsSkip => {}
                 StepRun::Cancelled => panic!("no step in this test cancels the job"),
             }
         }

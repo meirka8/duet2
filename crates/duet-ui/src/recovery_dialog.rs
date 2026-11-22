@@ -136,11 +136,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use duet_ops::{
-    ConflictResolver, JobId, Journal, QueueManager, RecoveryReport, Step, orphaned_partial_path,
-    plan_from_recovery,
+    ConflictResolver, JobId, Journal, QueueManager, RecoveryReport, Step,
+    discard_orphaned_partials, prepare_resume,
 };
-use duet_types::{ErrorKind, VPath};
-use duet_vfs::{FileSystem, LocalFs, RemoveKind};
+use duet_types::VPath;
+use duet_vfs::{FileSystem, LocalFs};
 use duet_widgets::theme::TokenPalette;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -333,17 +333,38 @@ impl RecoveryDialogState {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tokio_handle.spawn(async move {
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
-            let plan = plan_from_recovery(&report);
-            let new_job_id = queue.enqueue(
-                report.kind,
-                plan,
-                0,
-                fs,
-                state_dir.clone(),
-                JOB_CONCURRENCY,
-                Some(resolver),
-            );
-            let reason = format!("resumed as job #{}", new_job_id.0);
+            // `prepare_resume` (T-10.2.1), not a bare `plan_from_recovery`:
+            // it removes the interrupted attempt's orphaned partials (the
+            // resumed copies stage through fresh names, so nothing else
+            // ever would), leaves out the steps whose effect already made
+            // it to disk before the crash, and re-gates anything that
+            // depended on a step the journal recorded as failed. A partial
+            // that cannot be removed aborts before anything is enqueued or
+            // resolved, exactly as it does for discard.
+            let resume = match prepare_resume(&*fs, &report).await {
+                Ok(resume) => resume,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let reason = if resume.plan.steps.is_empty() {
+                // Every dangling step had in fact finished; only its
+                // `Completion` record was lost with the process.
+                "nothing left to resume: every interrupted step had already taken effect"
+                    .to_string()
+            } else {
+                let new_job_id = queue.enqueue(
+                    report.kind,
+                    resume.plan,
+                    0,
+                    fs,
+                    state_dir.clone(),
+                    JOB_CONCURRENCY,
+                    Some(resolver),
+                );
+                format!("resumed as job #{}", new_job_id.0)
+            };
             let resolved = Journal::open(job_id, &state_dir)
                 .and_then(|journal| journal.resolve(&report, &reason));
             let _ = tx.send(resolved);
@@ -382,21 +403,9 @@ impl RecoveryDialogState {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tokio_handle.spawn(async move {
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFs);
-            for (step_index, partial_name) in &report.orphaned_partials {
-                let Some(path) = orphaned_partial_path(&report, *step_index, partial_name) else {
-                    // Stale/foreign step index -- degrades safely per
-                    // `orphaned_partial_path`'s own doc comment: nothing to
-                    // delete for this entry.
-                    continue;
-                };
-                match fs.remove(&path, RemoveKind::File).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
+            if let Err(e) = discard_orphaned_partials(&*fs, &report).await {
+                let _ = tx.send(Err(e));
+                return;
             }
             let resolved = Journal::open(job_id, &state_dir)
                 .and_then(|journal| journal.resolve(&report, "discarded at startup recovery"));
@@ -501,9 +510,20 @@ fn plural(count: usize) -> &'static str {
 fn report_summary(report: &RecoveryReport) -> String {
     let steps = report.incomplete_steps.len();
     let partials = report.orphaned_partials.len();
+    // What the job had not finished when it died, beyond the steps caught
+    // mid-flight (T-10.2.1): the ones it never reached, and the ones that
+    // had failed or been skipped -- whose report died with the process. A
+    // resume does all of them.
+    let outstanding = report.remaining_steps().len().saturating_sub(steps);
     let mut parts = Vec::new();
     if steps > 0 {
         parts.push(format!("{steps} step{} interrupted", plural(steps)));
+    }
+    if outstanding > 0 {
+        parts.push(format!(
+            "{outstanding} step{} still to do",
+            plural(outstanding)
+        ));
     }
     if partials > 0 {
         parts.push(format!("{partials} orphaned partial{}", plural(partials)));
@@ -695,7 +715,7 @@ fn render_inspect_detail(report: &RecoveryReport, tokens: &TokenPalette) -> impl
                 .text_color(tokens.color.statusbar_fg)
                 .child(format!(
                     "{} of {} steps remaining",
-                    report.incomplete_steps.len(),
+                    report.remaining_steps().len(),
                     report.plan.steps.len()
                 )),
         )
@@ -739,6 +759,8 @@ mod tests {
             ),
             incomplete_steps: incomplete,
             orphaned_partials: partials,
+            unsuccessful_steps: Vec::new(),
+            not_started_steps: Vec::new(),
             last_outcome: None,
         }
     }
