@@ -202,6 +202,22 @@ impl FileSystem for LocalFs {
     ) -> Result<CopyOutcome> {
         super::probe::accelerated_copy(from, to, on_progress)
     }
+
+    async fn sync(&self, p: &VPath) -> Result<()> {
+        super::guard::assert_not_ui_thread();
+        let path = real_path(p);
+        // `O_NOFOLLOW`: sync the entry named, never whatever a symlink
+        // there points at. `O_RDONLY` is enough for `fsync(2)` on Linux,
+        // for a regular file and a directory alike.
+        let fd = rustix::fs::openat(
+            CWD,
+            &path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            RustixMode::empty(),
+        )
+        .map_err(|e| super::pathutil::rustix_err("openat(sync)", p, e))?;
+        rustix::fs::fsync(&fd).map_err(|e| super::pathutil::rustix_err("fsync", p, e))
+    }
 }
 
 #[cfg(test)]
