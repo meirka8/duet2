@@ -11,12 +11,21 @@
 //! - **A device that goes away mid-transfer** (`dm` `error` target): every
 //!   read and write fails with `EIO` from the block layer up, the job
 //!   ends in errors, the device comes back and is remounted.
-//! - **Power loss** (`dm-flakey` `drop_writes`): from some instant every
-//!   write is silently discarded, then the process is killed and the
-//!   filesystem remounted. This is the one fault `SIGKILL` cannot stand
-//!   in for, because it also loses whatever was written and not flushed
-//!   -- it is what tests that a source is never unlinked before its copy
-//!   is *durable*, and that the journal survives its own torn tail.
+//! - **Power loss** (`dm-flakey` `drop_writes`): the process is killed and,
+//!   before anything it left in the page cache can be written back, the
+//!   device starts discarding every write; then the filesystem is
+//!   remounted. This is the one fault `SIGKILL` cannot stand in for,
+//!   because it also loses whatever was written and not flushed -- it is
+//!   what tests that a source is never unlinked before its copy is
+//!   *durable*, and that the journal survives losing its unflushed tail.
+//!
+//!   The order matters. A power cut stops the process and the disk at the
+//!   same instant. Switching the device to `drop_writes` while the process
+//!   is still running models something else -- a disk that acknowledges
+//!   `fsync` and keeps nothing -- which no program can defend against, and
+//!   which the first CI run of this file duly "failed" (every `fsync`
+//!   returned success in microseconds, the job finished, all forty sources
+//!   were unlinked, and the remount showed an empty destination).
 //!
 //! # Why these are `#[ignore]`d, and why that is not a loophole
 //!
@@ -314,19 +323,89 @@ fn dm_error_device_disappearing_mid_move_loses_no_file() {
     }
 }
 
+/// What the test itself writes to the device around the power cut, to
+/// prove the rig did what the test's name says. Without these a remount
+/// that lost *nothing* (the device never dropped a write) or *everything*
+/// (the filesystem came back empty) could not be told from a pass or a
+/// failure of the engine.
+struct Canaries {
+    before: PathBuf,
+    after: PathBuf,
+    content: Vec<u8>,
+}
+
+impl Canaries {
+    fn new(mnt: &Path) -> Canaries {
+        Canaries {
+            before: mnt.join("canary-synced-before-the-cut"),
+            after: mnt.join("canary-written-after-the-cut"),
+            content: pattern(9001, 256 * 1024),
+        }
+    }
+
+    /// Written and `fsync`'d, file and directory -- the same thing the
+    /// engine does for a copy it is about to rely on.
+    fn write_durably(path: &Path, content: &[u8]) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(content).unwrap();
+        file.sync_all().unwrap();
+        std::fs::File::open(path.parent().unwrap())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    /// While the device still works.
+    fn before_the_cut(&self) {
+        Self::write_durably(&self.before, &self.content);
+    }
+
+    /// Once the device is discarding writes. `drop_writes` acknowledges
+    /// everything, `fsync` included; the results are ignored all the same,
+    /// because what is being established is only that none of it lasts.
+    fn after_the_cut(&self) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::File::create(&self.after) {
+            let _ = file.write_all(&self.content);
+            let _ = file.sync_all();
+        }
+    }
+
+    #[track_caller]
+    fn assert_power_was_cut(&self, context: &str) {
+        assert_eq!(
+            std::fs::read(&self.before).ok().as_deref(),
+            Some(self.content.as_slice()),
+            "{context}: a file fsync'd before the cut did not survive the remount -- the rig \
+             loses more than a power cut does, so this run proves nothing"
+        );
+        assert_ne!(
+            std::fs::read(&self.after).ok().as_deref(),
+            Some(self.content.as_slice()),
+            "{context}: a file written after the cut survived the remount -- the device never \
+             dropped a write, so this run proves nothing"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs root (loop device / dm-flakey): run by CI's data-safety (privileged) job"]
 fn dm_flakey_power_loss_mid_move_loses_no_file_and_leaves_a_recoverable_journal() {
-    // Power is cut at five different depths into the job. The journal
-    // lives on the same device as the destination, so it loses its
-    // unflushed tail exactly as the data does.
-    for records in [10, 40, 80, 130, 200] {
+    // Power is cut at five different depths into the job, given as a
+    // share of the journal records the whole job writes (an intent and a
+    // completion per step). The journal lives on the same device as the
+    // destination, so it loses its unflushed tail exactly as the data
+    // does.
+    for percent in [5, 20, 40, 65, 90] {
         let fs = FlakeyFs::new(64);
         let world = World::new();
         let state = fs.mnt.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let (scenario, dst) = move_onto(&world, &fs.mnt);
+        let records = (2 * scenario.plan.steps.len() * percent / 100).max(2);
         let before = world.capture();
+        let canaries = Canaries::new(&fs.mnt);
         let spec = ChildSpec {
             state_dir: state.clone(),
             concurrency: 2,
@@ -335,17 +414,20 @@ fn dm_flakey_power_loss_mid_move_loses_no_file_and_leaves_a_recoverable_journal(
         };
         let mut child = Child::spawn(&world, &spec, None);
         wait_for_journal(&state, records);
-        // From here on nothing reaches the platter...
-        fs.mode("drop");
-        // ...while the process carries on for a moment, removing sources
-        // whose copies it believes are safe...
-        std::thread::sleep(Duration::from_millis(150));
-        // ...and then the lights go out.
+        canaries.before_the_cut();
+        // The lights go out: the process stops mid-syscall...
         child.kill();
         assert!(matches!(child.wait(), ChildEnd::Killed));
+        // ...and nothing it left in the page cache ever reaches the
+        // platter. (Whatever the kernel wrote back on its own between the
+        // two lines is what a power cut a few milliseconds later would
+        // have kept too.)
+        fs.mode("drop");
+        canaries.after_the_cut();
         fs.remount();
 
-        let context = format!("power lost after {records} journal records");
+        let context = format!("power lost {percent}% in, after {records} journal records");
+        canaries.assert_power_was_cut(&context);
         assert_every_file_survives(&before, &world, &dst, &context);
 
         // The journal came back with a torn or missing tail; it must
