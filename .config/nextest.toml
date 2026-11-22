@@ -41,3 +41,17 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'package(duet-ops) & (test(accelerated_copy_reports_incremental_progress_and_survives_pause_resume) | test(plans_100k_files_within_two_seconds_with_accurate_totals) | test(copying_a_mixed_corpus_reports_a_real_eta_before_finishing))'
 threads-required = "num-cpus"
+
+# The data-safety suite (T-10.2.1, `crates/duet-ops/tests/data_safety`) is
+# the release gate for file operations: "100%, no exceptions, no 'flaky'
+# annotations". A retry that turns a failure into a pass is exactly such
+# an annotation, so this binary gets none -- the first intermittent
+# failure it ever had was a real journal-corruption bug, found only
+# because a retry was not allowed to hide it. Its sweeps spawn hundreds of
+# short-lived child processes each, hence the larger share of the
+# scheduler.
+[[profile.default.overrides]]
+filter = 'binary(data_safety)'
+retries = 0
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 3 }
