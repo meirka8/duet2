@@ -94,7 +94,7 @@ Alt+F8,cmdline.history,tools,panel,Show the command line's recall history as a d
 Ctrl+N,ftp.new_connection,tools,panel,Open the 'New FTP/SFTP connection' dialog,uncertain,Recalled loosely from the Net menu; default accelerator not confidently verified
 F1,help.show,menu_equiv,global,Open context-sensitive help,known,
 F10,menu.activate,menu_equiv,global,Activate/focus the main menu bar (standard Win32 system accelerator -- same mechanism as pressing Alt; not TC application code),known,See design.md Appendix A -- explicit conflict discussion vs Linux terminal-emulator F10 usage and the mc-lineage 'F10=Quit' convention
-F9,tbd.f9_unverified,menu_equiv,panel,Default TC 11 behaviour for bare F9 could not be confidently recalled -- historically sometimes unused on the function-key bar,uncertain,Explicitly flagged gap rather than guessed; needs hands-on verification
+F9,menu.source_panel,menu_equiv,panel,Activate the menu above the source panel (left or right),known,TC help 'Keyboard layout': 'Activate menu above source window (left or right)'; Duet has no menu bar and gives F9 to tool.search instead -- design.md Appendix A.4
 Alt+F4,app.quit,menu_equiv,global,Quit Total Commander,known,
 Alt,menu.activate,menu_equiv,global,Activate/focus the main menu bar (alternate to F10),known,
 Shift+F10,menu.context,menu_equiv,global,"Open the context menu for the item under cursor (Windows-standard 'Application key' equivalent, not TC-specific)",known,

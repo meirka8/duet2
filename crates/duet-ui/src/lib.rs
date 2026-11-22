@@ -40,6 +40,7 @@ pub mod panel;
 mod path_bar;
 mod recovery_dialog;
 mod rename_dialog;
+mod search_dialog;
 mod theme_controller;
 mod trash_dialog;
 mod tree_view;
